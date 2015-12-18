@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // This file defines some macros for compile-time configurations.
 // (Like many projects on *nix that using autotools.)
 
@@ -36,4 +36,8 @@
 // These should be defined if the compiler supports these platforms, otherwise run-time OS checks may be inaccurate.
 #define CONFIG_WIN9X
 #define CONFIG_WINNT4
+#endif
+
+#ifndef _WIN64
+#define CONFIG_WIN2K
 #endif

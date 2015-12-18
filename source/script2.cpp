@@ -1,4 +1,4 @@
-/*
+ï»¿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -29,7 +29,10 @@ GNU General Public License for more details.
 #undef _WIN32_WINNT // v1.1.10.01: Redefine this just for these APIs, to avoid breaking some other commands on Win XP (such as Process Close).
 #define _WIN32_WINNT 0x0600 // Windows Vista
 #include <mmdeviceapi.h> // for SoundSet/SoundGet.
+#pragma warning(push)
+#pragma warning(disable:4091) // Work around a bug in the SDK used by the v140_xp toolset.
 #include <endpointvolume.h> // for SoundSet/SoundGet.
+#pragma warning(pop)
 
 #define PCRE_STATIC             // For RegEx. PCRE_STATIC tells PCRE to declare its functions for normal, static
 #include "lib_pcre/pcre/pcre.h" // linkage rather than as functions inside an external DLL.
@@ -633,7 +636,10 @@ ResultType Line::Splash(LPTSTR aOptions, LPTSTR aSubText, LPTSTR aMainText, LPTS
 			small_icon = (LPARAM)g_script.mCustomIconSmall; // Should always be non-NULL when mCustomIcon is non-NULL.
 		}
 		else
-			big_icon = small_icon = (LPARAM)LoadImage(g_hInstance, MAKEINTRESOURCE(IDI_MAIN), IMAGE_ICON, 0, 0, LR_SHARED); // Use LR_SHARED to conserve memory (since the main icon is loaded for so many purposes).
+		{
+			big_icon = (LPARAM)g_IconLarge;
+			small_icon = (LPARAM)g_IconSmall;
+		}
 
 		if (style & WS_SYSMENU)
 			SendMessage(splash.hwnd, WM_SETICON, ICON_SMALL, small_icon);
@@ -1021,8 +1027,8 @@ ResultType Line::Transform(LPTSTR aCmd, LPTSTR aValue1, LPTSTR aValue2)
 		// It's possible that using just the &#number convention (e.g. &#128 through &#255;) would be
 		// more appropriate for some users, but that mode can be added in the future if it is ever
 		// needed (by passing a mode setting for aValue2):
-		// €‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿
-		// ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ
+		// â‚¬Ââ€šÆ’â€žâ€¦â€ â€¡Ë†â€°Å â€¹Å’ÂÅ½ÂÂâ€˜â€™â€œâ€â€¢â€“â€”Ëœâ„¢Å¡â€ºÅ“ÂÅ¾Å¸Â Â¡Â¢Â£Â¤Â¥Â¦Â§Â¨Â©ÂªÂ«Â¬Â­Â®Â¯Â°Â±Â²Â³Â´ÂµÂ¶Â·Â¸Â¹ÂºÂ»Â¼Â½Â¾Â¿
+		// Ã€ÃÃ‚ÃƒÃ„Ã…Ã†Ã‡ÃˆÃ‰ÃŠÃ‹ÃŒÃÃŽÃÃÃ‘Ã’Ã“Ã”Ã•Ã–Ã—Ã˜Ã™ÃšÃ›ÃœÃÃžÃŸÃ Ã¡Ã¢Ã£Ã¤Ã¥Ã¦Ã§Ã¨Ã©ÃªÃ«Ã¬Ã­Ã®Ã¯Ã°Ã±Ã²Ã³Ã´ÃµÃ¶Ã·Ã¸Ã¹ÃºÃ»Ã¼Ã½Ã¾Ã¿
 		static const LPTSTR sHtml[] = { // v1.0.40.02: Removed leading '&' and trailing ';' to reduce code size.
 #ifndef UNICODE
 			  _T("euro"), _T("#129"), _T("sbquo"), _T("fnof"), _T("bdquo"), _T("hellip"), _T("dagger"), _T("Dagger")
@@ -1458,6 +1464,62 @@ ResultType Line::Input()
 	// active input prior to us didn't fail and it it needs to know how its input
 	// was terminated):
 	g_input.status = INPUT_OFF;
+	
+	//////////////////////////////////////////
+	// Set default options and parse aOptions:
+	//////////////////////////////////////////
+	g_input.BackspaceIsUndo = true;
+	g_input.CaseSensitive = false;
+	g_input.IgnoreAHKInput = false;
+	g_input.TranscribeModifiedKeys = false;
+	g_input.Visible = false;
+	g_input.FindAnywhere = false;
+	g_input.BufferLengthMax = INPUT_BUFFER_SIZE - 1;
+	int timeout = 0;
+	bool endchar_mode = false;
+	for (LPTSTR cp = aOptions; *cp; ++cp)
+	{
+		switch(ctoupper(*cp))
+		{
+		case 'B':
+			g_input.BackspaceIsUndo = false;
+			break;
+		case 'C':
+			g_input.CaseSensitive = true;
+			break;
+		case 'I':
+			g_input.IgnoreAHKInput = true;
+			break;
+		case 'M':
+			g_input.TranscribeModifiedKeys = true;
+			break;
+		case 'L':
+			// Use atoi() vs. ATOI() to avoid interpreting something like 0x01C as hex
+			// when in fact the C was meant to be an option letter:
+			g_input.BufferLengthMax = _ttoi(cp + 1);
+			if (g_input.BufferLengthMax > INPUT_BUFFER_SIZE - 1)
+				g_input.BufferLengthMax = INPUT_BUFFER_SIZE - 1;
+			break;
+		case 'T':
+			// Although ATOF() supports hex, it's been documented in the help file that hex should
+			// not be used (see comment above) so if someone does it anyway, some option letters
+			// might be misinterpreted:
+			timeout = (int)(ATOF(cp + 1) * 1000);
+			break;
+		case 'V':
+			g_input.Visible = true;
+			break;
+		case '*':
+			g_input.FindAnywhere = true;
+			break;
+		case 'E':
+			// Interpret single-character keys as characters rather than converting them to VK codes.
+			// This tends to work better when using multiple keyboard layouts, but changes behaviour:
+			// for instance, an end char of "." cannot be triggered while holding Alt.
+			endchar_mode = true;
+			break;
+		}
+	}
 
 	//////////////////////////////////////////////
 	// Set up sparse arrays according to aEndKeys:
@@ -1468,23 +1530,23 @@ ResultType Line::Input()
 	vk_type vk;
 	sc_type sc = 0;
 	modLR_type modifiersLR;
-	size_t key_text_length;
+	size_t key_text_length, single_char_count = 0;
 	TCHAR *end_pos, single_char_string[2];
 	single_char_string[1] = '\0'; // Init its second character once, since the loop only changes the first char.
 
-	for (; *aEndKeys; ++aEndKeys) // This a modified version of the processing loop used in SendKeys().
+	for (TCHAR *end_key = aEndKeys; *end_key; ++end_key) // This a modified version of the processing loop used in SendKeys().
 	{
 		vk = 0; // Set default.  Not strictly necessary but more maintainable.
 		*single_char_string = '\0';  // Set default as "this key name is not a single-char string".
 
-		switch (*aEndKeys)
+		switch (*end_key)
 		{
 		case '}': continue;  // Important that these be ignored.
 		case '{':
 		{
-			if (   !(end_pos = _tcschr(aEndKeys + 1, '}'))   )
+			if (   !(end_pos = _tcschr(end_key + 1, '}'))   )
 				continue;  // Do nothing, just ignore the unclosed '{' and continue.
-			if (   !(key_text_length = end_pos - aEndKeys - 1)   )
+			if (   !(key_text_length = end_pos - end_key - 1)   )
 			{
 				if (end_pos[1] == '}') // The string "{}}" has been encountered, which is interpreted as a single "}".
 				{
@@ -1494,30 +1556,40 @@ ResultType Line::Input()
 				else // Empty braces {} were encountered.
 					continue;  // do nothing: let it proceed to the }, which will then be ignored.
 			}
+			if (key_text_length == 1) // A single-char key name, such as {.} or {{}.
+			{
+				if (endchar_mode) // Handle this single-char key name by char code, not by VK.
+				{
+					// Although it might be sometimes useful to treat "x" as a character and "{x}" as a key,
+					// "{{}" and "{}}" can't be included without the extra braces.  {vkNN} can still be used
+					// to handle the key by VK instead of by character.
+					single_char_count++;
+					continue; // It will be processed by another section.
+				}
+				*single_char_string = end_key[1]; // Only used when vk != 0.
+			}
 
 			*end_pos = '\0';  // temporarily terminate the string here.
 
-			// v1.0.45: Fixed this section to differentiate between } and ] (and also { and [, as well as
-			// anything else enclosed in {} that requires END_KEY_WITH_SHIFT/END_KEY_WITHOUT_SHIFT consideration.
 			modifiersLR = 0;  // Init prior to below.
-			if (vk = TextToVK(aEndKeys + 1, &modifiersLR, true))
-			{
-				if (key_text_length == 1)
-					*single_char_string = aEndKeys[1];
-				//else leave it at its default of "not a single-char key-name".
-			}
-			else // No virtual key, so try to find a scan code.
-				if (sc = TextToSC(aEndKeys + 1))
+			if (  !(vk = TextToVK(end_key + 1, &modifiersLR, true))  )
+				// No virtual key, so try to find a scan code.
+				if (sc = TextToSC(end_key + 1))
 					end_sc[sc] = END_KEY_ENABLED;
 
 			*end_pos = '}';  // undo the temporary termination
 
-			aEndKeys = end_pos;  // In prep for aEndKeys++ at the bottom of the loop.
+			end_key = end_pos;  // In prep for ++end_key at the top of the loop.
 			break; // Break out of the switch() and do the vk handling beneath it (if there is a vk).
 		}
 
 		default:
-			*single_char_string = *aEndKeys;
+			if (endchar_mode)
+			{
+				single_char_count++;
+				continue; // It will be processed by another section.
+			}
+			*single_char_string = *end_key;
 			modifiersLR = 0;  // Init prior to below.
 			vk = TextToVK(single_char_string, &modifiersLR, true);
 		} // switch()
@@ -1526,9 +1598,7 @@ ResultType Line::Input()
 		{
 			end_vk[vk] |= END_KEY_ENABLED; // Use of |= is essential for cases such as ";:".
 			// Insist the shift key be down to form genuinely different symbols --
-			// namely punctuation marks -- but not for alphabetic chars.  In the
-			// future, an option can be added to the Options param to treat
-			// end chars as case sensitive (if there is any demand for that):
+			// namely punctuation marks -- but not for alphabetic chars.
 			if (*single_char_string && !IsCharAlpha(*single_char_string)) // v1.0.46.05: Added check for "*single_char_string" so that non-single-char strings like {F9} work as end keys even when the Shift key is being held down (this fixes the behavior to be like it was in pre-v1.0.45).
 			{
 				// Now we know it's not alphabetic, and it's not a key whose name
@@ -1543,6 +1613,34 @@ ResultType Line::Input()
 			}
 		}
 	} // for()
+
+	g_input.EndChars = _T("");
+	if (single_char_count)
+	{
+		// See single_char_count++ above for comments.
+		g_input.EndChars = talloca(single_char_count + 1);
+		TCHAR *dst, *src;
+		for (dst = g_input.EndChars, src = aEndKeys; *src; ++src)
+		{
+			switch (*src)
+			{
+			case '{':
+				if (end_pos = _tcschr(src + 1, '}'))
+				{
+					if (end_pos == src + 1 && end_pos[1] == '}') // {}}
+						end_pos++;
+					if (end_pos == src + 2)
+						*dst++ = src[1]; // Copy the single character from between the braces.
+					src = end_pos; // Skip '{key'.  Loop does ++src to skip the '}'.
+				}
+				// Otherwise, just ignore the '{'.
+			case '}':
+				continue;
+			}
+			*dst++ = *src;
+		}
+		*dst = '\0';
+	}
 
 	/////////////////////////////////////////////////
 	// Parse aMatchList into an array of key phrases:
@@ -1653,56 +1751,11 @@ ResultType Line::Input()
 	//////////////////////////////////////////////////////////////
 	// Initialize buffers and state variables for use by the hook:
 	//////////////////////////////////////////////////////////////
-	// Set the defaults that will be in effect unless overridden by an item in aOptions:
-	g_input.BackspaceIsUndo = true;
-	g_input.CaseSensitive = false;
-	g_input.IgnoreAHKInput = false;
-	g_input.TranscribeModifiedKeys = false;
-	g_input.Visible = false;
-	g_input.FindAnywhere = false;
-	int timeout = 0;  // Set default.
 	TCHAR input_buf[INPUT_BUFFER_SIZE] = _T(""); // Will contain the actual input from the user.
 	g_input.buffer = input_buf;
 	g_input.BufferLength = 0;
-	g_input.BufferLengthMax = INPUT_BUFFER_SIZE - 1;
+	// g_input.BufferLengthMax was set in the option parsing section.
 
-	for (LPTSTR cp = aOptions; *cp; ++cp)
-	{
-		switch(ctoupper(*cp))
-		{
-		case 'B':
-			g_input.BackspaceIsUndo = false;
-			break;
-		case 'C':
-			g_input.CaseSensitive = true;
-			break;
-		case 'I':
-			g_input.IgnoreAHKInput = true;
-			break;
-		case 'M':
-			g_input.TranscribeModifiedKeys = true;
-			break;
-		case 'L':
-			// Use atoi() vs. ATOI() to avoid interpreting something like 0x01C as hex
-			// when in fact the C was meant to be an option letter:
-			g_input.BufferLengthMax = _ttoi(cp + 1);
-			if (g_input.BufferLengthMax > INPUT_BUFFER_SIZE - 1)
-				g_input.BufferLengthMax = INPUT_BUFFER_SIZE - 1;
-			break;
-		case 'T':
-			// Although ATOF() supports hex, it's been documented in the help file that hex should
-			// not be used (see comment above) so if someone does it anyway, some option letters
-			// might be misinterpreted:
-			timeout = (int)(ATOF(cp + 1) * 1000);
-			break;
-		case 'V':
-			g_input.Visible = true;
-			break;
-		case '*':
-			g_input.FindAnywhere = true;
-			break;
-		}
-	}
 	// Point the global addresses to our memory areas on the stack:
 	g_input.EndVK = end_vk;
 	g_input.EndSC = end_sc;
@@ -1748,7 +1801,12 @@ ResultType Line::Input()
 	case INPUT_TERMINATED_BY_ENDKEY:
 	{
 		TCHAR key_name[128] = _T("EndKey:");
-		if (g_input.EndingRequiredShift)
+		if (g_input.EndingChar)
+		{
+			key_name[7] = g_input.EndingChar;
+			key_name[8] = '\0';
+		}
+		else if (g_input.EndingRequiredShift)
 		{
 			// Since the only way a shift key can be required in our case is if it's a key whose name
 			// is a single char (such as a shifted punctuation mark), use a diff. method to look up the
@@ -1767,8 +1825,15 @@ ResultType Line::Input()
 			*(key_name + 7 + count) = '\0';  // Terminate the string.
 		}
 		else
+		{
 			g_input.EndedBySC ? SCtoKeyName(g_input.EndingSC, key_name + 7, _countof(key_name) - 7)
 				: VKtoKeyName(g_input.EndingVK, key_name + 7, _countof(key_name) - 7);
+			// For partial backward-compatibility, keys A-Z are upper-cased when handled by VK,
+			// but only if they actually correspond to those characters.  If this wasn't done,
+			// the character would always be lowercase since the shift state is not considered.
+			if (key_name[7] >= 'a' && key_name[7] <= 'z')
+				key_name[7] -= 32;
+		}
 		g_ErrorLevel->Assign(key_name);
 		break;
 	}
@@ -2219,6 +2284,7 @@ ResultType Line::ControlClick(vk_type aVK, int aClickCount, LPTSTR aOptions, LPT
 		// whether aControl contains X and Y coordinates.  That way, if a control class happens to be
 		// named something like "X1 Y1", it will still be found by giving precedence to class names.
 		point_and_hwnd_type pah = {0};
+		pah.ignore_disabled_controls = true; // v1.1.20: Ignore disabled controls.
 		// Parse the X an Y coordinates in a strict way to reduce ambiguity with control names and also
 		// to keep the code simple.
 		LPTSTR cp = omit_leading_whitespace(aControl);
@@ -2517,22 +2583,14 @@ ResultType Line::ControlGetFocus(LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTit
 	if (!target_window)
 		goto error;
 
-	// Unlike many of the other Control commands, this one requires AttachThreadInput().
-	ATTACH_THREAD_INPUT
-
-	class_and_hwnd_type cah;
-	cah.hwnd = GetFocus();  // Do this now that our thread is attached to the target window's.
-
-	// Very important to detach any threads whose inputs were attached above,
-	// prior to returning, otherwise the next attempt to attach thread inputs
-	// for these particular windows may result in a hung thread or other
-	// undesirable effect:
-	DETACH_THREAD_INPUT
-
-	if (!cah.hwnd)
+	GUITHREADINFO guithreadInfo;
+	guithreadInfo.cbSize = sizeof(GUITHREADINFO);
+	if (!GetGUIThreadInfo(GetWindowThreadProcessId(target_window, NULL), &guithreadInfo))
 		goto error;
 
+	class_and_hwnd_type cah;
 	TCHAR class_name[WINDOW_CLASS_SIZE];
+	cah.hwnd = guithreadInfo.hwndFocus;
 	cah.class_name = class_name;
 	if (!GetClassName(cah.hwnd, class_name, _countof(class_name) - 5)) // -5 to allow room for sequence number.
 		goto error;
@@ -2829,7 +2887,7 @@ ResultType Line::ControlGetListView(Var &aOutputVar, HWND aHwnd, LPTSTR aOptions
 		// Subtract 1 because of that nagging doubt about size vs. length. Some MSDN examples subtract one,
 		// such as TabCtrl_GetItem()'s cchTextMax:
 		local_lvi.i32.cchTextMax = LV_REMOTE_BUF_SIZE - 1; // Note that LVM_GETITEM doesn't update this member to reflect the new length.
-		local_lvi.i32.pszText = (UINT)p_remote_text; 
+		local_lvi.i32.pszText = (UINT)(UINT_PTR)p_remote_text; // Extra cast avoids a truncation warning (C4311).
 	}
 
 	LRESULT i, next, length, total_length;
@@ -5062,7 +5120,7 @@ LRESULT CALLBACK MainWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lPar
 
 	// See GuiWindowProc() for details about this first section:
 	LRESULT msg_reply;
-	if (g_MsgMonitorCount // Count is checked here to avoid function-call overhead.
+	if (g_MsgMonitor.Count() // Count is checked here to avoid function-call overhead.
 		&& (!g->CalledByIsDialogMessageOrDispatch || g->CalledByIsDialogMessageOrDispatchMsg != iMsg) // v1.0.44.11: If called by IsDialog or Dispatch but they changed the message number, check if the script is monitoring that new number.
 		&& MsgMonitor(hWnd, iMsg, wParam, lParam, NULL, msg_reply))
 		return msg_reply; // MsgMonitor has returned "true", indicating that this message should be omitted from further processing.
@@ -5461,8 +5519,8 @@ LRESULT CALLBACK MainWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lPar
 
 	case WM_CLIPBOARDUPDATE: // For Vista and later.
 	case WM_DRAWCLIPBOARD:
-		if (g_script.mOnClipboardChangeLabel) // In case it's a bogus msg, it's our responsibility to avoid posting the msg if there's no label to launch.
-			PostMessage(g_hWnd, AHK_CLIPBOARD_CHANGE, 0, 0); // It's done this way to buffer it when the script is uninterruptible, etc.  v1.0.44: Post to g_hWnd vs. NULL so that notifications aren't lost when script is displaying a MsgBox or other dialog.
+		if (g_script.mOnClipboardChangeLabel || g_script.mOnClipboardChange.Count()) // In case it's a bogus msg, it's our responsibility to avoid posting the msg if there's no label to launch.
+			PostMessage(g_hWnd, AHK_CLIPBOARD_CHANGE, !g_script.mIsReadyToExecute, 0); // It's done this way to buffer it when the script is uninterruptible, etc.  v1.0.44: Post to g_hWnd vs. NULL so that notifications aren't lost when script is displaying a MsgBox or other dialog.
 		if (g_script.mNextClipboardViewer) // Will be NULL if there are no other windows in the chain, or if we're on Vista or later and used AddClipboardFormatListener instead of SetClipboardViewer (in which case iMsg should be WM_CLIPBOARDUPDATE).
 			SendMessageTimeout(g_script.mNextClipboardViewer, iMsg, wParam, lParam, SMTO_ABORTIFHUNG, 2000, &dwTemp);
 		return 0;
@@ -5577,14 +5635,29 @@ LRESULT CALLBACK MainWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lPar
 
 
 
+void LaunchAutoHotkeyUtil(LPTSTR aFile)
+{
+    TCHAR buf_temp[2048];
+	// ActionExec()'s CreateProcess() is currently done in a way that prefers enclosing double quotes:
+	*buf_temp = '"';
+	// Try GetAHKInstallDir() first so that compiled scripts running on machines that happen
+	// to have AHK installed will still be able to fetch the help file and Window Spy:
+	if (!GetAHKInstallDir(buf_temp + 1))
+		// Even if this is the self-contained version (AUTOHOTKEYSC), attempt to launch anyway in
+		// case the user has put a copy of the file in the same dir with the compiled script:
+		_tcscpy(buf_temp + 1, g_script.mOurEXEDir);
+	sntprintfcat(buf_temp, _countof(buf_temp), _T("\\%s\""), aFile);
+	// Attempt to run the file:
+	if (!g_script.ActionExec(buf_temp, _T(""), NULL, false)) // Use "" vs. NULL to specify that there are no params at all.
+		MsgBox(buf_temp, 0, _T("Could not launch file:"));
+}
+
 bool HandleMenuItem(HWND aHwnd, WORD aMenuItemID, HWND aGuiHwnd)
 // See if an item was selected from the tray menu or main menu.  Note that it is possible
 // for one of the standard menu items to be triggered from a GUI menu if the menu or one of
 // its submenus was modified with the "menu, MenuName, Standard" command.
 // Returns true if the message is fully handled here, false otherwise.
 {
-    TCHAR buf_temp[2048];  // For various uses.
-
 	switch (aMenuItemID)
 	{
 	case ID_TRAY_OPEN:
@@ -5601,43 +5674,11 @@ bool HandleMenuItem(HWND aHwnd, WORD aMenuItemID, HWND aGuiHwnd)
 		return true;
 	case ID_TRAY_WINDOWSPY:
 	case ID_FILE_WINDOWSPY:
-		// ActionExec()'s CreateProcess() is currently done in a way that prefers enclosing double quotes:
-		*buf_temp = '"';
-		// Try GetAHKInstallDir() first so that compiled scripts running on machines that happen
-		// to have AHK installed will still be able to fetch the help file:
-		if (GetAHKInstallDir(buf_temp + 1))
-			sntprintfcat(buf_temp, _countof(buf_temp), _T("\\AU3_Spy.exe\""));
-		else
-			// Mostly this ELSE is here in case AHK isn't installed (i.e. the user just
-			// copied the files over without running the installer).  But also:
-			// Even if this is the self-contained version (AUTOHOTKEYSC), attempt to launch anyway in
-			// case the user has put a copy of WindowSpy in the same dir with the compiled script:
-			// ActionExec()'s CreateProcess() is currently done in a way that prefers enclosing double quotes:
-			sntprintfcat(buf_temp, _countof(buf_temp), _T("%sAU3_Spy.exe\""), g_script.mOurEXEDir);
-		if (!g_script.ActionExec(buf_temp, _T(""), NULL, false))
-			MsgBox(buf_temp, 0, _T("Could not launch Window Spy:"));
+		LaunchAutoHotkeyUtil(_T("AU3_Spy.exe"));
 		return true;
 	case ID_TRAY_HELP:
 	case ID_HELP_USERMANUAL:
-		// ActionExec()'s CreateProcess() is currently done in a way that prefers enclosing double quotes:
-		*buf_temp = '"';
-		// Try GetAHKInstallDir() first so that compiled scripts running on machines that happen
-		// to have AHK installed will still be able to fetch the help file:
-		if (GetAHKInstallDir(buf_temp + 1))
-			sntprintfcat(buf_temp, _countof(buf_temp), _T("\\AutoHotkey.chm\""));
-		else
-			// Even if this is the self-contained version (AUTOHOTKEYSC), attempt to launch anyway in
-			// case the user has put a copy of the help file in the same dir with the compiled script:
-			// Also, for this one I saw it report failure once on Win98SE even though the help file did
-			// wind up getting launched.  Couldn't repeat it.  So in response to that try explicit "hh.exe":
-			sntprintfcat(buf_temp, _countof(buf_temp), _T("%sAutoHotkey.chm\""), g_script.mOurEXEDir);
-		if (!g_script.ActionExec(_T("hh.exe"), buf_temp, NULL, false))
-		{
-			// Try it without the hh.exe in case .CHM is associate with some other application
-			// in some OSes:
-			if (!g_script.ActionExec(buf_temp, _T(""), NULL, false)) // Use "" vs. NULL to specify that there are no params at all.
-				MsgBox(buf_temp, 0, _T("Could not launch help file:"));
-		}
+		LaunchAutoHotkeyUtil(_T("AutoHotkey.chm"));
 		return true;
 	case ID_TRAY_SUSPEND:
 	case ID_FILE_SUSPEND:
@@ -5946,7 +5987,7 @@ INT_PTR CALLBACK InputBoxProc(HWND hWndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 {
 	// See GuiWindowProc() for details about this first part:
 	LRESULT msg_reply;
-	if (g_MsgMonitorCount // Count is checked here to avoid function-call overhead.
+	if (g_MsgMonitor.Count() // Count is checked here to avoid function-call overhead.
 		&& (!g->CalledByIsDialogMessageOrDispatch || g->CalledByIsDialogMessageOrDispatchMsg != uMsg) // v1.0.44.11: If called by IsDialog or Dispatch but they changed the message number, check if the script is monitoring that new number.
 		&& MsgMonitor(hWndDlg, uMsg, wParam, lParam, NULL, msg_reply))
 		return (BOOL)msg_reply; // MsgMonitor has returned "true", indicating that this message should be omitted from further processing.
@@ -6030,7 +6071,10 @@ INT_PTR CALLBACK InputBoxProc(HWND hWndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 			small_icon = (LPARAM)g_script.mCustomIconSmall; // Should always be non-NULL when mCustomIcon is non-NULL.
 		}
 		else
-			big_icon = small_icon = (LPARAM)LoadImage(g_hInstance, MAKEINTRESOURCE(IDI_MAIN), IMAGE_ICON, 0, 0, LR_SHARED); // Use LR_SHARED to conserve memory (since the main icon is loaded for so many purposes).
+		{
+			big_icon = (LPARAM)g_IconLarge;
+			small_icon = (LPARAM)g_IconSmall;
+		}
 
 		SendMessage(hWndDlg, WM_SETICON, ICON_SMALL, small_icon);
 		SendMessage(hWndDlg, WM_SETICON, ICON_BIG, big_icon);
@@ -6389,7 +6433,8 @@ BOOL CALLBACK EnumChildFindPoint(HWND aWnd, LPARAM lParam)
 // the specified point (the point should be in screen coordinates).
 {
 	point_and_hwnd_type &pah = *(point_and_hwnd_type *)lParam;  // For performance and convenience.
-	if (!IsWindowVisible(aWnd)) // Omit hidden controls, like Window Spy does.
+	if (!IsWindowVisible(aWnd) // Omit hidden controls, like Window Spy does.
+		|| (pah.ignore_disabled_controls && !IsWindowEnabled(aWnd))) // For ControlClick, also omit disabled controls, since testing shows that the OS doesn't post mouse messages to them.
 		return TRUE;
 	RECT rect;
 	if (!GetWindowRect(aWnd, &rect))
@@ -7253,6 +7298,42 @@ return_empty_string:
 
 
 
+BIF_DECL(BIF_StrReplace)
+{
+	TCHAR old_buf[MAX_NUMBER_SIZE], new_buf[MAX_NUMBER_SIZE];
+	// Must use aResultToken.buf for source in case StrReplace() performs no replacements:
+	LPTSTR source = ParamIndexToString(0, aResultToken.buf);	// Parameter #1: Haystack
+	size_t length = ParamIndexLength(0, source);
+	LPTSTR oldstr = ParamIndexToString(1, old_buf);				// Parameter #2: SearchText
+	LPTSTR newstr = ParamIndexToOptionalString(2, new_buf);		// Parameter #3: ReplaceText
+	Var *output_var_count = ParamIndexToOptionalVar(3);			// Parameter #4: OutputVarCount
+	UINT replacement_limit = (UINT)ParamIndexToOptionalInt64(4, UINT_MAX); // Parameter #5: Limit
+
+	LPTSTR dest;
+	UINT found_count = StrReplace(source, oldstr, newstr, (StringCaseSenseType)g->StringCaseSense
+		, replacement_limit, -1, &dest, &length);
+
+	if (!dest) // Failure due to out of memory.
+	{
+		aResult = g_script.ScriptError(ERR_OUTOFMEM);
+		return;
+	}
+
+	aResultToken.symbol = SYM_STRING;
+	aResultToken.marker = dest;
+
+	if (dest != source) // StrReplace() allocated new memory rather than returning "source" to us unaltered.
+	{
+		aResultToken.mem_to_free = dest; // Let caller know it needs to be freed.
+		aResultToken.marker_length = length; // Must always be set if using mem_to_free.
+	}
+
+	if (output_var_count)
+		output_var_count->Assign((DWORD)found_count);
+}
+
+
+
 ResultType Line::SplitPath(LPTSTR aFileSpec)
 {
 	Var *output_var_name = ARGVAR2;  // i.e. Param #2. Ok if NULL.
@@ -7991,8 +8072,6 @@ ResultType Line::DriveSpace(LPTSTR aPath, bool aGetFreeSpace)
 		buf[length] = '\0';
 	}
 
-	SetErrorMode(SEM_FAILCRITICALERRORS); // If target drive is a floppy, this avoids a dialog prompting to insert a disk.
-
 	// The program won't launch at all on Win95a (original Win95) unless the function address is resolved
 	// at runtime:
 	typedef BOOL (WINAPI *GetDiskFreeSpaceExType)(LPCTSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
@@ -8096,7 +8175,6 @@ ResultType Line::Drive(LPTSTR aCmd, LPTSTR aValue, LPTSTR aValue2) // aValue not
 
 	case DRIVE_CMD_LABEL: // Note that it is possible and allowed for the new label to be blank.
 		DRIVE_SET_PATH
-		SetErrorMode(SEM_FAILCRITICALERRORS);  // So that a floppy drive doesn't prompt for a disk
 		return SetErrorLevelOrThrowBool(!SetVolumeLabel(path, aValue2));
 
 	} // switch()
@@ -8207,7 +8285,6 @@ ResultType Line::DriveGet(LPTSTR aCmd, LPTSTR aValue)
 	if (drive_get_cmd == DRIVEGET_CMD_SETLABEL) // The is retained for backward compatibility even though the Drive cmd is normally used.
 	{
 		DRIVE_SET_PATH
-		SetErrorMode(SEM_FAILCRITICALERRORS); // If drive is a floppy, prevents pop-up dialog prompting to insert disk.
 		LPTSTR new_label = omit_leading_whitespace(aCmd + 9);  // Example: SetLabel:MyLabel
 		return g_ErrorLevel->Assign(SetVolumeLabel(path, new_label) ? ERRORLEVEL_NONE : ERRORLEVEL_ERROR);
 	}
@@ -8244,8 +8321,6 @@ ResultType Line::DriveGet(LPTSTR aCmd, LPTSTR aValue)
 		UCHAR letter;
 		TCHAR buf[128], *buf_ptr;
 
-		SetErrorMode(SEM_FAILCRITICALERRORS); // If drive is a floppy, prevents pop-up dialog prompting to insert disk.
-
 		for (found_drives_count = 0, letter = 'A'; letter <= 'Z'; ++letter)
 		{
 			buf_ptr = buf;
@@ -8271,7 +8346,6 @@ ResultType Line::DriveGet(LPTSTR aCmd, LPTSTR aValue)
 		TCHAR volume_name[256];
 		TCHAR file_system[256];
 		DRIVE_SET_PATH
-		SetErrorMode(SEM_FAILCRITICALERRORS); // If drive is a floppy, prevents pop-up dialog prompting to insert disk.
 		DWORD serial_number, max_component_length, file_system_flags;
 		if (!GetVolumeInformation(path, volume_name, _countof(volume_name) - 1, &serial_number, &max_component_length
 			, &file_system_flags, file_system, _countof(file_system) - 1))
@@ -8288,7 +8362,6 @@ ResultType Line::DriveGet(LPTSTR aCmd, LPTSTR aValue)
 	case DRIVEGET_CMD_TYPE:
 	{
 		DRIVE_SET_PATH
-		SetErrorMode(SEM_FAILCRITICALERRORS); // If drive is a floppy, prevents pop-up dialog prompting to insert disk.
 		switch (GetDriveType(path))
 		{
 		case DRIVE_UNKNOWN:   output_var.Assign(_T("Unknown")); break;
@@ -8306,7 +8379,6 @@ ResultType Line::DriveGet(LPTSTR aCmd, LPTSTR aValue)
 	case DRIVEGET_CMD_STATUS:
 	{
 		DRIVE_SET_PATH
-		SetErrorMode(SEM_FAILCRITICALERRORS); // If drive is a floppy, prevents pop-up dialog prompting to insert disk.
 		DWORD sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters;
 		switch (GetDiskFreeSpace(path, &sectors_per_cluster, &bytes_per_sector, &free_clusters, &total_clusters)
 			? ERROR_SUCCESS : GetLastError())
@@ -9841,18 +9913,20 @@ ResultType Line::FileAppend(LPTSTR aFilespec, LPTSTR aBuf, LoopReadFileStruct *a
 	bool open_as_binary = (*aFilespec == '*');
 	if (open_as_binary)
 	{
-		// Do not do this because it's possible for filenames to start with a space
-		// (even though Explorer itself won't let you create them that way):
-		//write_filespec = omit_leading_whitespace(write_filespec + 1);
-		// Instead just do this:
-		++aFilespec;
-		if (!*aFilespec) // Naked "*" means write to stdout.
-#ifndef CONFIG_DEBUGGER
-			// Avoid puts() in case it bloats the code in some compilers. i.e. _fputts() is already used,
-			// so using it again here shouldn't bloat it:
-			return SetErrorsOrThrow(_fputts(aBuf, stdout) == TEOF); // "returns a nonnegative value if it is successful. On an error, fputs returns EOF, and fputws returns WEOF."
-#else
-			return SetErrorsOrThrow(!g_Debugger.FileAppendStdOut(aBuf));
+		if (aFilespec[1] && (aFilespec[1] != '*' || !aFilespec[2])) // i.e. it's not just * (stdout) or ** (stderr).
+		{
+			// Do not do this because it's possible for filenames to start with a space
+			// (even though Explorer itself won't let you create them that way):
+			//write_filespec = omit_leading_whitespace(write_filespec + 1);
+			// Instead just do this:
+			++aFilespec;
+		}
+#ifdef CONFIG_DEBUGGER
+		else if (!aFilespec[1] && g_Debugger.FileAppendStdOut(aBuf))
+		{
+			// StdOut has been redirected to the debugger, so return.
+			return SetErrorsOrThrow(false, 0);
+		}
 #endif
 	}
 	else if (!file_was_already_open) // As of 1.0.25, auto-detect binary if that mode wasn't explicitly specified.
@@ -9975,7 +10049,8 @@ ResultType Line::WriteClipboardToFile(LPTSTR aFilespec, Var *aBinaryClipVar)
 	g->LastError = GetLastError(); // Always done, for simplicity.  Must be called before CloseHandle().
 	if (hfile != INVALID_HANDLE_VALUE)
 		CloseHandle(hfile); // Close file.
-	free(data); // Free ClipboardAll data.  Can be NULL.
+	if (!aBinaryClipVar)
+		free(data); // Free ClipboardAll data.  Can be NULL.
 
 	return SetErrorLevelOrThrowBool(!success); // Set ErrorLevel based on result.
 }
@@ -10111,7 +10186,7 @@ ResultType Line::FileInstall(LPTSTR aSource, LPTSTR aDest, LPTSTR aFlag)
 	HRSRC res;
 	HGLOBAL res_load;
 	LPVOID res_lock;
-	if ( (res = FindResource(NULL, source, MAKEINTRESOURCE(RT_RCDATA)))
+	if ( (res = FindResource(NULL, source, RT_RCDATA))
 	  && (res_load = LoadResource(NULL, res))
 	  && (res_lock = LockResource(res_load))  )
 	{
@@ -10646,7 +10721,7 @@ ResultType Line::FileGetSize(LPTSTR aFilespec, LPTSTR aGranularity)
 	if (!aFilespec || !*aFilespec)
 		return SetErrorsOrThrow(true, ERROR_INVALID_PARAMETER); // Let ErrorLevel indicate an error, since this is probably not what the user intended.
 	
-	BOOL got_file_size;
+	BOOL got_file_size = false;
 	__int64 size;
 
 	// Try CreateFile() and GetFileSizeEx() first, since they can be more accurate. 
@@ -11330,6 +11405,8 @@ VarSizeType BIV_IconNumber(LPTSTR aBuf, LPTSTR aVarName)
 	return (VarSizeType)_tcslen(UTOA(g_script.mCustomIconNumber, target_buf));
 }
 
+
+
 VarSizeType BIV_PriorKey(LPTSTR aBuf, LPTSTR aVarName)
 {
 	const int bufSize = 32;
@@ -11358,7 +11435,9 @@ VarSizeType BIV_PriorKey(LPTSTR aBuf, LPTSTR aVarName)
 	return (VarSizeType)_tcslen(aBuf);
 }
 
-VarSizeType BIV_ExitReason(LPTSTR aBuf, LPTSTR aVarName)
+
+
+LPTSTR GetExitReasonString(ExitReasons aExitReason)
 {
 	LPTSTR str;
 	switch(g_script.mExitReason)
@@ -11380,6 +11459,12 @@ VarSizeType BIV_ExitReason(LPTSTR aBuf, LPTSTR aVarName)
 	default:  // EXIT_NONE or unknown value (unknown would be considered a bug if it ever happened).
 		str = _T("");
 	}
+	return str;
+}
+
+VarSizeType BIV_ExitReason(LPTSTR aBuf, LPTSTR aVarName)
+{
+	LPTSTR str = GetExitReasonString(g_script.mExitReason);
 	if (aBuf)
 		_tcscpy(aBuf, str);
 	return (VarSizeType)_tcslen(str);
@@ -11467,7 +11552,7 @@ VarSizeType BIV_OSType(LPTSTR aBuf, LPTSTR aVarName)
 
 VarSizeType BIV_OSVersion(LPTSTR aBuf, LPTSTR aVarName)
 {
-	LPCTSTR version = _T("");  // Init for maintainability.
+	LPCTSTR version = g_os.Version();  // Init for new or unrecognized OSes.
 	if (g_os.IsWinNT()) // "NT" includes all NT-kernel OSes: NT4/2000/XP/2003/Vista/7/8/etc.
 	{
 		if (g_os.IsWinXP())
@@ -11518,26 +11603,10 @@ VarSizeType BIV_Is64bitOS(LPTSTR aBuf, LPTSTR aVarName)
 }
 
 VarSizeType BIV_Language(LPTSTR aBuf, LPTSTR aVarName)
-// Registry locations from J-Paul Mesnage.
 {
-	TCHAR buf[MAX_PATH];
-	VarSizeType length;
-	if (g_os.IsWinNT())  // NT/2k/XP+
-		length = g_os.IsWin2000orLater()
-			? ReadRegString(HKEY_LOCAL_MACHINE, _T("SYSTEM\\CurrentControlSet\\Control\\Nls\\Language"), _T("InstallLanguage"), buf, MAX_PATH)
-			: ReadRegString(HKEY_LOCAL_MACHINE, _T("SYSTEM\\CurrentControlSet\\Control\\Nls\\Language"), _T("Default"), buf, MAX_PATH); // NT4
-	else // Win9x
-	{
-		length = ReadRegString(HKEY_USERS, _T(".DEFAULT\\Control Panel\\Desktop\\ResourceLocale"), _T(""), buf, MAX_PATH);
-		if (length > 3)
-		{
-			length -= 4;
-			memmove(buf, buf + 4, length + 1); // +1 to include the zero terminator.
-		}
-	}
 	if (aBuf)
-		_tcscpy(aBuf, buf); // v1.0.47: Must be done as a separate copy because passing a size of MAX_PATH for aBuf can crash when aBuf is actually smaller than that (even though it's large enough to hold the string).
-	return length;
+		_stprintf(aBuf, _T("%04hX"), GetSystemDefaultUILanguage());
+	return 4;
 }
 
 VarSizeType BIV_UserName_ComputerName(LPTSTR aBuf, LPTSTR aVarName)
@@ -11683,7 +11752,7 @@ VarSizeType BIV_Caret(LPTSTR aBuf, LPTSTR aVarName)
 	// of where the caret was at one precise instant in time.  This is because the X and Y vars are resolved
 	// separately by the script, and due to split second timing, they might otherwise not be accurate with
 	// respect to each other.  This method also helps performance since it avoids unnecessary calls to
-	// ATTACH_THREAD_INPUT.
+	// GetGUIThreadInfo().
 	static HWND sForeWinPrev = NULL;
 	static DWORD sTimestamp = GetTickCount();
 	static POINT sPoint;
@@ -11702,17 +11771,19 @@ VarSizeType BIV_Caret(LPTSTR aBuf, LPTSTR aVarName)
 	if (target_window != sForeWinPrev || now_tick - sTimestamp > 5) // Different window or too much time has passed.
 	{
 		// Otherwise:
-		ATTACH_THREAD_INPUT
-		sResult = GetCaretPos(&sPoint);
-		HWND focused_control = GetFocus();  // Also relies on threads being attached.
-		DETACH_THREAD_INPUT
+		GUITHREADINFO info;
+		info.cbSize = sizeof(GUITHREADINFO);
+		sResult = GetGUIThreadInfo(GetWindowThreadProcessId(target_window, NULL), &info) // Got info okay...
+			&& info.hwndCaret; // ...and there is a caret.
 		if (!sResult)
 		{
 			*aBuf = '\0';
 			return 0;
 		}
+		sPoint.x = info.rcCaret.left;
+		sPoint.y = info.rcCaret.top;
 		// Unconditionally convert to screen coordinates, for simplicity.
-		ClientToScreen(focused_control ? focused_control : target_window, &sPoint);
+		ClientToScreen(info.hwndCaret, &sPoint);
 		// Now convert back to whatever is expected for the current mode.
 		POINT origin = {0};
 		CoordToScreen(origin, COORD_MODE_CARET);
@@ -12162,10 +12233,8 @@ VarSizeType BIV_ThisMenuItem(LPTSTR aBuf, LPTSTR aVarName)
 	return (VarSizeType)_tcslen(g_script.mThisMenuItemName);
 }
 
-VarSizeType BIV_ThisMenuItemPos(LPTSTR aBuf, LPTSTR aVarName)
+UINT Script::ThisMenuItemPos()
 {
-	if (!aBuf) // To avoid doing possibly high-overhead calls twice, merely return a conservative estimate for the first pass.
-		return MAX_INTEGER_LENGTH;
 	// The menu item's position is discovered through this process -- rather than doing
 	// something higher performance such as storing the menu handle or pointer to menu/item
 	// object in g_script -- because those things tend to be volatile.  For example, a menu
@@ -12173,25 +12242,22 @@ VarSizeType BIV_ThisMenuItemPos(LPTSTR aBuf, LPTSTR aVarName)
 	// time this variable is referenced in the script.  Thus, by definition, this variable
 	// contains the CURRENT position of the most recently selected menu item within its
 	// CURRENT menu.
-	if (*g_script.mThisMenuName && *g_script.mThisMenuItemName)
-	{
-		UserMenu *menu = g_script.FindMenu(g_script.mThisMenuName);
-		if (menu)
-		{
-			// If the menu does not physically exist yet (perhaps due to being destroyed as a result
-			// of DeleteAll, Delete, or some other operation), create it so that the position of the
-			// item can be determined.  This is done for consistency in behavior.
-			if (!menu->mMenu)
-				menu->Create();
-			UINT menu_item_pos = menu->GetItemPos(g_script.mThisMenuItemName);
-			if (menu_item_pos < UINT_MAX) // Success
-				return (VarSizeType)_tcslen(UTOA(menu_item_pos + 1, aBuf)); // +1 to convert from zero-based to 1-based.
-		}
-	}
+	UserMenu *menu = FindMenu(mThisMenuName);
+	return menu ? menu->GetItemPos(mThisMenuItemName) : UINT_MAX;
+}
+
+VarSizeType BIV_ThisMenuItemPos(LPTSTR aBuf, LPTSTR aVarName)
+{
+	if (!aBuf) // To avoid doing possibly high-overhead calls twice, merely return a conservative estimate for the first pass.
+		return MAX_INTEGER_LENGTH;
+	UINT menu_item_pos = g_script.ThisMenuItemPos();
+	if (menu_item_pos < UINT_MAX) // Success
+		return (VarSizeType)_tcslen(UTOA(menu_item_pos + 1, aBuf)); // +1 to convert from zero-based to 1-based.
 	// Otherwise:
 	*aBuf = '\0';
 	return 0;
 }
+
 
 VarSizeType BIV_ThisMenu(LPTSTR aBuf, LPTSTR aVarName)
 {
@@ -12293,7 +12359,7 @@ VarSizeType BIV_Gui(LPTSTR aBuf, LPTSTR aVarName)
 		break;
 	case '\0': // A_Gui
 		if (!*g->GuiWindow->mName) // v1.1.04: Anonymous GUI.
-			return _stprintf(target_buf, _T("0x%Ix"), g->GuiWindow->mHwnd);
+			return _stprintf(target_buf, _T("0x%Ix"), (UINT_PTR)g->GuiWindow->mHwnd);
 		if (aBuf)
 			_tcscpy(aBuf, g->GuiWindow->mName);
 		return _tcslen(g->GuiWindow->mName);
@@ -12369,18 +12435,8 @@ VarSizeType BIV_GuiEvent(LPTSTR aBuf, LPTSTR aVarName)
 	}
 
 	// Otherwise, this event is not GUI_EVENT_DROPFILES, so use standard modes of operation.
-	static LPTSTR sNames[] = GUI_EVENT_NAMES;
-	if (!aBuf)
-		return (g.GuiEvent < GUI_EVENT_FIRST_UNNAMED) ? (VarSizeType)_tcslen(sNames[g.GuiEvent]) : 1;
-	// Otherwise:
-	if (g.GuiEvent < GUI_EVENT_FIRST_UNNAMED)
-		return (VarSizeType)_tcslen(_tcscpy(aBuf, sNames[g.GuiEvent]));
-	else // g.GuiEvent is assumed to be an ASCII value, such as a digit.  This supports Slider controls.
-	{
-		*aBuf++ = (TCHAR)(UCHAR)g.GuiEvent;
-		*aBuf = '\0';
-		return 1;
-	}
+	LPTSTR event_string = GuiType::ConvertEvent(g.GuiEvent);
+	return (VarSizeType)_tcslen(aBuf ? _tcscpy(aBuf, event_string) : event_string);
 }
 
 
@@ -12399,6 +12455,7 @@ VarSizeType BIV_TimeIdle(LPTSTR aBuf, LPTSTR aVarName) // Called by multiple cal
 {
 	if (!aBuf) // IMPORTANT: Conservative estimate because tick might change between 1st & 2nd calls.
 		return MAX_INTEGER_LENGTH;
+#ifdef CONFIG_WIN9X
 	*aBuf = '\0';  // Set default.
 	if (g_os.IsWin2000orLater()) // Checked in case the function is present in the OS but "not implemented".
 	{
@@ -12414,6 +12471,15 @@ VarSizeType BIV_TimeIdle(LPTSTR aBuf, LPTSTR aVarName) // Called by multiple cal
 				ITOA64(GetTickCount() - lii.dwTime, aBuf);
 		}
 	}
+#else
+	// Not Win9x: Calling it directly should (in theory) produce smaller code size.
+	LASTINPUTINFO lii;
+	lii.cbSize = sizeof(lii);
+	if (GetLastInputInfo(&lii))
+		ITOA64(GetTickCount() - lii.dwTime, aBuf);
+	else
+		*aBuf = '\0';
+#endif
 	return (VarSizeType)_tcslen(aBuf);
 }
 
@@ -15138,12 +15204,20 @@ BIF_DECL(BIF_RegEx)
 
 
 
-BIF_DECL(BIF_Asc)
+BIF_DECL(BIF_Ord)
 {
 	// Result will always be an integer (this simplifies scripts that work with binary zeros since an
 	// empty string yields zero).
 	// Caller has set aResultToken.symbol to a default of SYM_INTEGER, so no need to set it here.
-	aResultToken.value_int64 = (TBYTE)*ParamIndexToString(0, aResultToken.buf);
+	LPTSTR cp = ParamIndexToString(0, aResultToken.buf);
+#ifndef UNICODE
+	// Always return a single byte in ANSI mode.
+#else
+	if (toupper(*aResultToken.marker) == 'O' && IS_SURROGATE_PAIR(cp[0], cp[1])) // Ord().
+		aResultToken.value_int64 = ((cp[0] - 0xd800) << 10) + (cp[1] - 0xdc00) + 0x10000;
+	else
+#endif
+		aResultToken.value_int64 = (TBYTE)*cp;
 }
 
 
@@ -15152,8 +15226,17 @@ BIF_DECL(BIF_Chr)
 {
 	int param1 = ParamIndexToInt(0); // Convert to INT vs. UINT so that negatives can be detected.
 	LPTSTR cp = aResultToken.buf; // If necessary, it will be moved to a persistent memory location by our caller.
-	if (param1 < 0 || param1 > TRANS_CHAR_MAX)
+	if (param1 < 0 || param1 > UorA(0x10FFFF, UCHAR_MAX))
 		*cp = '\0'; // Empty string indicates both Chr(0) and an out-of-bounds param1.
+#ifdef UNICODE
+	else if (param1 >= 0x10000)
+	{
+		param1 -= 0x10000;
+		cp[0] = 0xd800 + ((param1 >> 10) & 0x3ff);
+		cp[1] = 0xdc00 + ( param1        & 0x3ff);
+		cp[2] = '\0';
+	}
+#endif
 	else
 	{
 		cp[0] = param1;
@@ -15269,6 +15352,162 @@ BIF_DECL(BIF_NumGet)
 			aResultToken.value_int64 = *(char *)target;
 		else
 			aResultToken.value_int64 = *(unsigned char *)target;
+	}
+}
+
+
+
+BIF_DECL(BIF_Format)
+{
+	LPCTSTR fmt = ParamIndexToString(0), lit, cp, cp_end, cp_spec;
+	LPTSTR target = NULL;
+	int size = 0, spec_len;
+	int param, last_param;
+	TCHAR number_buf[MAX_NUMBER_SIZE];
+	TCHAR spec[12+MAX_INTEGER_LENGTH*2];
+	TCHAR custom_format;
+	ExprTokenType value;
+	*spec = '%';
+
+	for (;;)
+	{
+		last_param = 0;
+
+		for (lit = cp = fmt;; )
+		{
+			// Find next placeholder.
+			for (cp_end = cp; *cp_end && *cp_end != '{'; ++cp_end);
+			if (cp_end > lit)
+			{
+				// Handle literal text to the left of the placeholder.
+				if (target)
+					tmemcpy(target, lit, cp_end - lit), target += cp_end - lit;
+				else
+					size += int(cp_end - lit);
+				lit = cp_end; // Mark this as the next literal character (to be overridden below if it's a valid placeholder).
+			}
+			cp = cp_end;
+			if (!*cp)
+				break;
+			// else: Implies *cp == '{'.
+			++cp;
+			if ((*cp == '{' || *cp == '}') && cp[1] == '}') // {{} or {}}
+			{
+				if (target)
+					*target++ = *cp;
+				else
+					++size;
+				cp += 2;
+				lit = cp; // Mark this as the next literal character.
+				continue;
+			}
+			
+			// Index.
+			for (cp_end = cp; *cp_end >= '0' && *cp_end <= '9'; ++cp_end);
+			if (cp_end > cp)
+				param = ATOI(cp), cp = cp_end;
+			else
+				param = last_param + 1;
+			if (param >= aParamCount) // Invalid parameter index.
+				continue;
+
+			custom_format = 0; // Set default.
+
+			// Optional format specifier.
+			if (*cp == ':')
+			{
+				cp_spec = ++cp;
+				// Skip valid format specifier options.
+				for (cp = cp_spec; *cp && _tcschr(_T("-+0 #"), *cp); ++cp); // flags
+				for ( ; *cp >= '0' && *cp <= '9'; ++cp); // width
+				if (*cp == '.') do ++cp; while (*cp >= '0' && *cp <= '9'); // .precision
+				spec_len = int(cp - cp_spec);
+				// For now, size specifiers (h | l | ll | w | I | I32 | I64) are not supported.
+				
+				if (spec_len + 4 >= _countof(spec)) // Format specifier too long (probably invalid).
+					continue;
+				// Copy options, if any (+1 to leave the leading %).
+				tmemcpy(spec + 1, cp_spec, spec_len);
+				++spec_len; // Include the leading %.
+
+				if (_tcschr(_T("diouxX"), *cp))
+				{
+					spec[spec_len++] = 'I';
+					spec[spec_len++] = '6';
+					spec[spec_len++] = '4';
+					// Integer value; apply I64 prefix to avoid truncation.
+					value.value_int64 = ParamIndexToInt64(param);
+					spec[spec_len++] = *cp++;
+				}
+				else if (_tcschr(_T("eEfgGaA"), *cp))
+				{
+					value.value_double = ParamIndexToDouble(param);
+					spec[spec_len++] = *cp++;
+				}
+				else if (_tcschr(_T("cCp"), *cp))
+				{
+					// Input is an integer or pointer, but I64 prefix should not be applied.
+					value.value_int64 = ParamIndexToInt64(param);
+					spec[spec_len++] = *cp++;
+				}
+				else
+				{
+					spec[spec_len++] = 's'; // Default to string if not specified.
+					if (_tcschr(_T("ULlTt"), *cp))
+						custom_format = toupper(*cp++);
+					if (*cp == 's')
+						++cp;
+				}
+			}
+			else
+			{
+				// spec[0] contains '%'.
+				spec[1] = 's';
+				spec_len = 2;
+			}
+			if (spec[spec_len - 1] == 's')
+			{
+				value.marker = ParamIndexToString(param, number_buf);
+			}
+			spec[spec_len] = '\0';
+			
+			if (*cp != '}') // Syntax error.
+				continue;
+			++cp;
+			lit = cp; // Mark this as the next literal character.
+
+			// Now that validation is complete, set last_param for use by the next {} or {:fmt}.
+			last_param = param;
+			
+			if (target)
+			{
+				int len = _stprintf(target, spec, value.value_int64);
+				switch (custom_format)
+				{
+				case 0: break; // Might help performance to list this first.
+				case 'U': CharUpper(target); break;
+				case 'L': CharLower(target); break;
+				case 'T': StrToTitleCase(target); break;
+				}
+				target += len;
+			}
+			else
+				size += _sctprintf(spec, value.value_int64);
+		}
+		if (target)
+		{
+			// Finished second pass.
+			*target = '\0';
+			return;
+		}
+		// Finished first pass (calculating required size).
+		if (!TokenSetResult(aResultToken, NULL, size))
+		{
+			aResult = FAIL;
+			return;
+		}
+		aResultToken.symbol = SYM_STRING;
+		target = aResultToken.marker;
 	}
 }
 
@@ -16197,55 +16436,83 @@ BIF_DECL(BIF_OnMessage)
 	// Load-time validation has ensured there's at least one parameter for use here:
 	UINT specified_msg = (UINT)ParamIndexToInt64(0); // Parameter #1
 
-	Func *func = NULL;           // Set defaults.
-	bool mode_is_delete = false; //
-	if (!ParamIndexIsOmitted(1)) // Parameter #2 is present.
+	// Set defaults:
+	IObject *callback = NULL;
+	bool mode_is_delete = false;
+	bool legacy_mode = true;
+	int max_instances = 1;
+	bool call_it_last = true;
+
+	if (!ParamIndexIsOmitted(2)) // Parameter #3 is present.
 	{
-		LPTSTR func_name = ParamIndexToString(1, buf); // Resolve parameter #2.
-		if (*func_name)
+		max_instances = (int)ParamIndexToInt64(2);
+		// For backward-compatibility, values between MAX_INSTANCES+1 and SHORT_MAX must be supported.
+		if (max_instances > MsgMonitorStruct::MAX_INSTANCES) // MAX_INSTANCES >= MAX_THREADS_LIMIT.
+			max_instances = MsgMonitorStruct::MAX_INSTANCES;
+		if (max_instances < 0) // MaxThreads < 0 is a signal to assign this monitor the lowest priority.
 		{
-			if (   !(func = g_script.FindFunc(func_name))   ) // Nonexistent function.
-				return; // Yield the default return value set earlier.
-			// If too many formal parameters or any are ByRef/optional, indicate failure.
-			// This helps catch bugs in scripts that are assigning the wrong function to a monitor.
-			// It also preserves additional parameters for possible future use (i.e. avoids breaking
-			// existing scripts if more formal parameters are supported in a future version).
-			// Lexikos: The flexibility of allowing ByRef and optional parameters seems to outweigh
-			// the small chance that these checks will actually catch an error and the even smaller
-			// chance that any parameters will be added in future.  For instance, a function may be
-			// called directly by the script to set or retrieve static vars which are used when the
-			// message monitor calls the function.  For these checks to actually catch an error, the
-			// author must have typed the name of the wrong function (i.e. probably not a typo), and
-			// that function must accept more than four parameters or have optional/ByRef parameters:
-			//if (func->mIsBuiltIn || func->mParamCount > 4 || func->mMinParams < func->mParamCount) // Too many params, or some are optional.
-			if (func->mIsBuiltIn || func->mMinParams > 4) // Requires too many params.
-				return; // Yield the default return value set earlier.
-			//for (int i = 0; i < func->mParamCount; ++i) // Check if any formal parameters are ByRef.
-			//	if (func->mParam[i].is_byref)
-			//		return; // Yield the default return value set earlier.
+			call_it_last = false; // Call it after any older monitors.  No effect if already registered.
+			max_instances = -max_instances; // Convert to positive.
 		}
-		else // Explicitly blank function name ("") means delete this item.  By contrast, an omitted second parameter means "give me current function of this message".
+		else if (max_instances == 0) // It would never be called, so this is used as a signal to delete the item.
 			mode_is_delete = true;
 	}
 
-	// If this is the first use of the g_MsgMonitor array, create it now rather than later to reduce code size
-	// and help the maintainability of sections further below. The following relies on short-circuit boolean order:
-	if (!g_MsgMonitor && !(g_MsgMonitor = (MsgMonitorStruct *)malloc(sizeof(MsgMonitorStruct) * MAX_MSG_MONITORS)))
-		return; // Yield the default return value set earlier.
+	if (!ParamIndexIsOmitted(1)) // Parameter #2 is present.
+	{
+		Func *func; // Func for validation of parameters, where possible.
+		if (TokenIsEmptyString(*aParam[1])) // Explicitly blank function name ("") means delete this item.  By contrast, an omitted second parameter means "give me current function of this message".
+		{
+			mode_is_delete = true;
+			func = NULL;
+		}
+		else if (callback = TokenToObject(*aParam[1]))
+		{
+			func = dynamic_cast<Func *>(callback);
+			legacy_mode = false; // Since the caller passed a reference, use the new mode.
+		}
+		else
+		{
+			callback = func = g_script.FindFunc(TokenToString(*aParam[1]));
+		}
+		// Notes about func validation: ByRef and optional parameters are allowed for flexibility.
+		// For example, a function may be called directly by the script to set static vars which
+		// are used when a message arrives.  Raising an error might help catch bugs, but only in
+		// very rare cases where a valid but wrong function name is given *and* that function has
+		// ByRef or optional parameters.
+		// If the parameter was not an empty string, an object or a valid function...
+		if (!mode_is_delete && (!callback || func && (func->mIsBuiltIn || func->mMinParams > 4)))
+		{
+			if (!legacy_mode)
+				aResult = g_script.ScriptError(ERR_PARAM2_INVALID);
+			return; // Yield the default return value set earlier.
+		}
+	}
 
 	// Check if this message already exists in the array:
-	int msg_index;
-	for (msg_index = 0; msg_index < g_MsgMonitorCount; ++msg_index)
-		if (g_MsgMonitor[msg_index].msg == specified_msg)
-			break;
-	bool item_already_exists = (msg_index < g_MsgMonitorCount);
-	MsgMonitorStruct &monitor = g_MsgMonitor[msg_index == MAX_MSG_MONITORS ? 0 : msg_index]; // The 0th item is just a placeholder.
+	MsgMonitorStruct *pmonitor = g_MsgMonitor.Find(specified_msg, callback, legacy_mode);
+	bool item_already_exists = (pmonitor != NULL);
+	if (!item_already_exists)
+	{
+		if (!callback || mode_is_delete) // Delete or report function-name of a non-existent item.
+			return; // Yield the default return value set earlier (an empty string).
+		// From this point on, it is certain that an item will be added to the array.
+		if (  !(pmonitor = g_MsgMonitor.Add(specified_msg, callback, legacy_mode, call_it_last))  )
+		{
+			if (!legacy_mode)
+				aResult = g_script.ScriptError(ERR_OUTOFMEM);
+			// Otherwise, indicate failure by yielding the default return value set earlier.
+			return;
+		}
+	}
+
+	MsgMonitorStruct &monitor = *pmonitor;
 
 	if (item_already_exists)
 	{
-		// In all cases, yield the OLD function's name as the return value:
-		_tcscpy(buf, monitor.func->mName); // Caller has ensured that buf large enough to support max function name.
-		aResultToken.marker = buf;
+		if (legacy_mode) // Implies monitor.is_legacy_monitor, which means a Func was registered by name.
+			// In all cases, yield the OLD function's name as the return value:
+			aResultToken.marker = ((Func *)monitor.func)->mName;
 		if (mode_is_delete)
 		{
 			// The msg-monitor is deleted from the array for two reasons:
@@ -16258,43 +16525,167 @@ BIF_DECL(BIF_OnMessage)
 			// The main disadvantage to deleting message filters from the array is that the deletion might
 			// occur while the monitor is currently running, which requires more complex handling within
 			// MsgMonitor() (see its comments for details).
-			--g_MsgMonitorCount;  // Must be done prior to the below.
-			if (msg_index < g_MsgMonitorCount) // An element other than the last is being removed. Shift the array to cover/delete it.
-				MoveMemory(g_MsgMonitor+msg_index, g_MsgMonitor+msg_index+1, sizeof(MsgMonitorStruct)*(g_MsgMonitorCount-msg_index));
+			g_MsgMonitor.Remove(pmonitor);
 			return;
 		}
 		if (aParamCount < 2) // Single-parameter mode: Report existing item's function name.
-			return; // Everything was already set up above to yield the proper return value.
+			return;
 		// Otherwise, an existing item is being assigned a new function or MaxThreads limit.
 		// Continue on to update this item's attributes.
 	}
-	else // This message doesn't exist in array yet.
+	else // This message was newly added to the array.
 	{
-		if (!func) // Delete or report function-name of a non-existent item.
-			return; // Yield the default return value set earlier (an empty string).
-		// Since above didn't return, the message is to be added as a new element. The above already
-		// verified that func is not NULL.
-		if (msg_index == MAX_MSG_MONITORS) // No room in array.
-			return; // Indicate failure by yielding the default return value set earlier.
-		// Otherwise, the message is to be added, so increment the total:
-		++g_MsgMonitorCount;
-		_tcscpy(buf, func->mName); // Yield the NEW name as an indicator of success. Caller has ensured that buf large enough to support max function name.
-		aResultToken.marker = buf;
+		// The above already verified that callback is not NULL and there is room in the array.
+		if (legacy_mode)
+			// For backward-compatibility, return the function's name on success:
+			aResultToken.marker = ((Func *)callback)->mName;
 		monitor.instance_count = 0; // Reset instance_count only for new items since existing items might currently be running.
-		monitor.msg = specified_msg;
 		// Continue on to the update-or-create logic below.
 	}
 
 	// Since above didn't return, above has ensured that msg_index is the index of the existing or new
 	// MsgMonitorStruct in the array.  In addition, it has set the proper return value for us.
 	// Update those struct attributes that get the same treatment regardless of whether this is an update or creation.
-	if (func) // i.e. not OnMessage(Msg,,MaxThreads).
-		monitor.func = func;
-	if (!ParamIndexIsOmitted(2))
-		monitor.max_instances = (short)ParamIndexToInt64(2); // No validation because it seems harmless if it's negative or some huge number.
-	else // Unspecified, so if this item is being newly created fall back to the default.
-		if (!item_already_exists)
-			monitor.max_instances = 1;
+	if (callback && callback != monitor.func) // Callback is being registered or changed.
+	{
+		callback->AddRef(); // Keep the object alive while it's in g_MsgMonitor.
+		if (monitor.func)
+			monitor.func->Release();
+		monitor.func = callback;
+	}
+	if (!item_already_exists || !ParamIndexIsOmitted(2))
+		monitor.max_instances = max_instances;
+	// Otherwise, the parameter was omitted so leave max_instances at its current value.
+}
+
+
+MsgMonitorStruct *MsgMonitorList::Find(UINT aMsg, IObject *aCallback, bool aIsLegacyMode)
+{
+	for (int i = 0; i < mCount; ++i)
+		if (mMonitor[i].msg == aMsg
+			&& (aIsLegacyMode ? mMonitor[i].is_legacy_monitor : mMonitor[i].func == aCallback))
+			return mMonitor + i;
+	return NULL;
+}
+
+
+MsgMonitorStruct *MsgMonitorList::Add(UINT aMsg, IObject *aCallback, bool aIsLegacyMode, bool aAppend)
+{
+	if (mCount == mCountMax)
+	{
+		int new_count = mCountMax ? mCountMax * mCountMax : 16;
+		void *new_array = realloc(mMonitor, new_count * sizeof(MsgMonitorStruct));
+		if (!new_array)
+			return NULL;
+		mMonitor = (MsgMonitorStruct *)new_array;
+		mCountMax = new_count;
+	}
+	MsgMonitorStruct *new_mon;
+	if (!aAppend)
+	{
+		for (MsgMonitorInstance *inst = mTop; inst; inst = inst->previous)
+		{
+			inst->index++; // Correct the index of each running monitor.
+			inst->count++; // Iterate the same set of items which existed before.
+			// By contrast, count isn't adjusted when adding at the end because we do not
+			// want new items to be called by messages received before they were registered.
+		}
+		// Shift existing items to make room.
+		memmove(mMonitor + 1, mMonitor, mCount * sizeof(MsgMonitorStruct));
+		new_mon = mMonitor;
+	}
+	else
+		new_mon = mMonitor + mCount;
+
+	++mCount;
+	aCallback->AddRef();
+	new_mon->func = aCallback;
+	new_mon->msg = aMsg;
+	//new_mon->instance_count = 0;
+	//new_mon->max_instances = 1;
+	new_mon->is_legacy_monitor = aIsLegacyMode;
+	return new_mon;
+}
+
+
+void MsgMonitorList::Remove(MsgMonitorStruct *aMonitor)
+{
+	ASSERT(aMonitor >= mMonitor && aMonitor < mMonitor + mCount);
+
+	int mon_index = int(aMonitor - mMonitor);
+	// Adjust the index of any active message monitors affected by this deletion.  This allows a
+	// message monitor to delete older message monitors while still allowing any remaining monitors
+	// of that message to be called (when there are multiple).
+	for (MsgMonitorInstance *inst = mTop; inst; inst = inst->previous)
+	{
+		if (inst->index >= mon_index && inst->index >= 0)
+			inst->index--; // So index+1 is the next item.
+		inst->count--;
+	}
+	// Remove the item from the array.
+	--mCount;  // Must be done prior to the below.
+	IObject *release_me = aMonitor->func;
+	if (mon_index < mCount) // An element other than the last is being removed. Shift the array to cover/delete it.
+		memmove(aMonitor, aMonitor + 1, (mCount - mon_index) * sizeof(MsgMonitorStruct));
+	release_me->Release(); // Must be called after the above in case it calls a __delete() meta-function.
+}
+
+
+BIF_DECL(BIF_OnExitOrClipboard)
+{
+	bool is_onexit = toupper(aResultToken.marker[2]) == 'E';
+	aResultToken.SetValue(_T("")); // In all cases there is no return value.
+	MsgMonitorList &handlers = is_onexit ? g_script.mOnExit : g_script.mOnClipboardChange;
+
+	IObject *callback;
+	if (callback = TokenToFunc(*aParam[0]))
+	{
+		// Ensure this function is a valid one.
+		if (((Func *)callback)->mMinParams > 2)
+			callback = NULL;
+	}
+	else
+		callback = TokenToObject(*aParam[0]);
+	if (!callback)
+	{
+		aResult = g_script.ScriptError(ERR_PARAM1_INVALID);
+		return;
+	}
+	
+	int mode = 1; // Default.
+	if (!ParamIndexIsOmitted(1))
+		mode = ParamIndexToInt(1);
+
+	MsgMonitorStruct *existing = handlers.Find(0, callback, false);
+
+	switch (mode)
+	{
+	case  1:
+	case -1:
+		if (existing)
+			return;
+		if (!is_onexit)
+		{
+			// Do this before adding the handler so that it won't be called as a result of the
+			// SetClipboardViewer() call on Windows XP.  This won't cause existing handlers to
+			// be called because in that case the clipboard listener is already enabled.
+			g_script.EnableClipboardListener(true);
+		}
+		if (!handlers.Add(0, callback, false, mode == 1))
+			aResult = g_script.ScriptError(ERR_OUTOFMEM);
+		break;
+	case  0:
+		if (existing)
+			handlers.Remove(existing);
+		break;
+	default:
+		aResult = g_script.ScriptError(ERR_PARAM2_INVALID);
+		break;
+	}
+	// In case the above enabled the clipboard listener but failed to add the handler,
+	// do this even if mode != 0:
+	if (!is_onexit && !g_script.mOnClipboardChangeLabel && !handlers.Count())
+		g_script.EnableClipboardListener(false);
 }
 
 
@@ -16371,7 +16762,7 @@ UINT_PTR CALLBACK RegisterCallbackCStub(UINT_PTR *params, char *address) // Used
 		// See MsgSleep() for comments about the following section.
 		tcslcpy(ErrorLevel_saved, g_ErrorLevel->Contents(), _countof(ErrorLevel_saved));
 		InitNewThread(0, false, true, func.mJumpToLine->mActionType);
-		DEBUGGER_STACK_PUSH(func.mJumpToLine, func.mName)
+		DEBUGGER_STACK_PUSH(_T("Callback"))
 	}
 	else // Backup/restore only A_EventInfo. This avoids callbacks changing A_EventInfo for the current thread/context (that would be counterintuitive and a source of script bugs).
 	{
@@ -18145,26 +18536,22 @@ BIF_DECL(BIF_Exception)
 	{
 #ifdef CONFIG_DEBUGGER
 		int offset = TokenIsPureNumeric(*aParam[1]) ? ParamIndexToInt(1) : 0;
-		if (offset < 0)
+		if (offset < 0 && offset >= (g_Debugger.mStack.mBottom - g_Debugger.mStack.mTop)) // (mBottom - mTop) is safe against overflow, unlike (se >= mBottom). 
 		{
 			DbgStack::Entry *se = g_Debugger.mStack.mTop + offset;
-			if (se >= g_Debugger.mStack.mBottom)
+			// Self-contained loop to ensure the entry belongs to the current thread
+			// (below also relies on this loop to verify se[1].type != SE_Thread):
+			while (++offset <= 0 && g_Debugger.mStack.mTop[offset].type != DbgStack::SE_Thread); // Relies on short-circuit evaluation.
+			if (offset == 1)
 			{
-				// Self-contained loop to ensure the entry belongs to the current thread
-				// (below also relies on this loop to verify se[1].type != SE_Thread):
-				while (++offset <= 0 && g_Debugger.mStack.mTop[offset].type != DbgStack::SE_Thread); // Relies on short-circuit evaluation.
-				if (offset == 1)
-				{
-					line = se->line;
-					// se->line contains the line at the given offset from the top of the stack.
-					// Rather than returning the name of the function or sub which contains that
-					// line, return the name of the function or sub which that line called.
-					// In other words, an offset of -1 gives the name of the current function and
-					// the file and number of the line which it was called from.
-					what = se[1].type == DbgStack::SE_Func ? se[1].func->mName : se[1].sub->mName;
-				}
+				line = se->line;
+				// se->line contains the line at the given offset from the top of the stack.
+				// Rather than returning the name of the function or sub which contains that
+				// line, return the name of the function or sub which that line called.
+				// In other words, an offset of -1 gives the name of the current function and
+				// the file and number of the line which it was called from.
+				what = se[1].type == DbgStack::SE_Func ? se[1].func->mName : se[1].sub->mName;
 			}
-			// Otherwise, not a valid offset.
 		}
 #endif
 		if (!what)
@@ -18244,6 +18631,9 @@ BOOL LegacyVarToBOOL(Var &aVar)
 
 BOOL TokenToBOOL(ExprTokenType &aToken, SymbolType aTokenIsNumber)
 {
+	if (aTokenIsNumber == SYM_INVALID) // Omitted.
+		aTokenIsNumber = TokenIsPureNumeric(aToken);
+
 	switch (aTokenIsNumber)
 	{
 	case PURE_INTEGER: // Probably the most common; e.g. both sides of "if (x>3 and x<6)" are the number 1/0.
@@ -18798,8 +19188,12 @@ DWORD GetProcessName(DWORD aProcessID, LPTSTR aBuf, DWORD aBufSize, bool aGetNam
 		: GetModuleFileNameEx(hproc, NULL, aBuf, aBufSize);
 
 	typedef DWORD (WINAPI *MyGetName)(HANDLE, LPTSTR, DWORD);
+#ifdef CONFIG_WIN2K
 	// This must be loaded dynamically or the program will probably not launch at all on Win2k:
 	static MyGetName lpfnGetName = (MyGetName)GetProcAddress(GetModuleHandle(_T("psapi")), "GetProcessImageFileName" WINAPI_SUFFIX);;
+#else
+	static MyGetName lpfnGetName = &GetProcessImageFileName;
+#endif
 
 	if (!buf_length && lpfnGetName)
 	{

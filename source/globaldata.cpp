@@ -1,4 +1,4 @@
-/*
+﻿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -74,6 +74,7 @@ HHOOK g_MouseHook = NULL;
 HHOOK g_PlaybackHook = NULL;
 bool g_ForceLaunch = false;
 bool g_WinActivateForce = false;
+bool g_RunStdIn = false;
 WarnMode g_Warn_UseUnsetLocal = WARNMODE_OFF;		// Used by #Warn directive.
 WarnMode g_Warn_UseUnsetGlobal = WARNMODE_OFF;		//
 WarnMode g_Warn_UseEnv = WARNMODE_OFF;				//
@@ -152,8 +153,7 @@ SplashType g_SplashImage[MAX_SPLASHIMAGE_WINDOWS] = {{0}};
 GuiType **g_gui = NULL;
 int g_guiCount = 0, g_guiCountMax = 0;
 HWND g_hWndToolTip[MAX_TOOLTIPS] = {NULL};
-MsgMonitorStruct *g_MsgMonitor = NULL; // An array to be allocated upon first use (if any).
-int g_MsgMonitorCount = 0;
+MsgMonitorList g_MsgMonitor;
 
 // Init not needed for these:
 UCHAR g_SortCaseSensitive;
@@ -200,15 +200,8 @@ Script g_script;
 Clipboard g_clip;
 OS_Version g_os;  // OS version object, courtesy of AutoIt3.
 
-// THIS MUST BE DONE AFTER the g_os object is initialized above:
-// These are conditional because on these OSes, only standard-palette 16-color icons are supported,
-// which would cause the normal icons to look mostly gray when used with in the tray.  So we use
-// special 16x16x16 icons, but only for the tray because these OSes display the nicer icons okay
-// in places other than the tray.  Also note that the red icons look okay, at least on Win98,
-// because they are "red enough" not to suffer the graying effect from the palette shifting done
-// by the OS:
-int g_IconTray = (g_os.IsWinXPorLater() || g_os.IsWinMeorLater()) ? IDI_TRAY : IDI_TRAY_WIN9X;
-int g_IconTraySuspend = (g_IconTray == IDI_TRAY) ? IDI_SUSPEND : IDI_TRAY_WIN9X_SUSPEND;
+HICON g_IconSmall;
+HICON g_IconLarge;
 
 DWORD g_OriginalTimeout;
 
@@ -294,7 +287,7 @@ Action g_act[] =
 	, {_T("*="), 2, 2, 2, {2, 0}}
 	, {_T("/="), 2, 2, 2, {2, 0}}
 
-	, {_T("Else"), 0, 0, 0, NULL}
+	, {_T("Static"), 1, 1, 1, {1, 0}} // ACT_STATIC (used only at load time).
 
 	, {_T("in"), 2, 2, 2, NULL}, {_T("not in"), 2, 2, 2, NULL}
 	, {_T("contains"), 2, 2, 2, NULL}, {_T("not contains"), 2, 2, 2, NULL}  // Very similar to "in" and "not in"
@@ -322,6 +315,9 @@ Action g_act[] =
 	, {_T("IfNotExist"), 1, 1, 1, NULL} // File or directory.
 	// IfMsgBox must be physically adjacent to the other IFs in this array:
 	, {_T("IfMsgBox"), 1, 1, 1, NULL} // MsgBox result (e.g. OK, YES, NO)
+
+	, {_T("Else"), 0, 0, 0, NULL} // No args; it has special handling to support same-line ELSE-actions (e.g. "else if").
+
 	, {_T("MsgBox"), 0, 4, 3, NULL} // Text (if only 1 param) or: Mode-flag, Title, Text, Timeout.
 	, {_T("InputBox"), 1, 11, 11 H, {5, 6, 7, 8, 10, 0}} // Output var, title, prompt, hide-text (e.g. passwords), width, height, X, Y, Font (e.g. courier:8 maybe), Timeout, Default
 	, {_T("SplashTextOn"), 0, 4, 4, {1, 2, 0}} // Width, height, title, text
@@ -415,8 +411,8 @@ Action g_act[] =
 	, {_T("Break"), 0, 1, 1, NULL}, {_T("Continue"), 0, 1, 1, NULL}
 	, {_T("Try"), 0, 0, 0, NULL}
 	, {_T("Catch"), 0, 1, 0, NULL} // fincs: seems best to allow catch without a parameter
-	, {_T("Throw"), 0, 1, 1, {1, 0}}
 	, {_T("Finally"), 0, 0, 0, NULL}
+	, {_T("Throw"), 0, 1, 1, {1, 0}}
 	, {_T("{"), 0, 0, 0, NULL}, {_T("}"), 0, 0, 0, NULL}
 
 	, {_T("WinActivate"), 0, 4, 2, NULL} // Passing zero params results in activating the LastUsed window.
@@ -511,9 +507,8 @@ Action g_act[] =
 	, {_T("IniDelete"), 2, 3, 3, NULL} // Filespec, Section, Key
 
 	// These require so few parameters due to registry loops, which provide the missing parameter values
-	// automatically.  In addition, RegRead can't require more than 1 param since the 2nd param is
-	// an option/obsolete parameter:
-	, {_T("RegRead"), 1, 5, 5 H, NULL} // output var, (ValueType [optional]), RegKey, RegSubkey, ValueName
+	// automatically:
+	, {_T("RegRead"), 1, 4, 4 H, NULL} // OutputVar, RegKey, RegSubkey, ValueName
 	, {_T("RegWrite"), 0, 5, 5, NULL} // ValueType, RegKey, RegSubKey, ValueName, Value (set to blank if omitted?)
 	, {_T("RegDelete"), 0, 3, 3, NULL} // RegKey, RegSubKey, ValueName
 	, {_T("SetRegView"), 1, 1, 1, NULL}
@@ -556,6 +551,8 @@ Action g_act[] =
 	, {_T("Shutdown"), 1, 1, 1, {1, 0}} // Seems best to make the first param (the flag/code) mandatory.
 
 	, {_T("FileEncoding"), 0, 1, 1, NULL}
+
+	, {_T("#If"), 0, 1, 1, {1, 0}}
 };
 // Below is the most maintainable way to determine the actual count?
 // Due to C++ lang. restrictions, can't easily make this a const because constants

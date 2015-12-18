@@ -1,4 +1,4 @@
-/*
+﻿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -135,6 +135,8 @@ EXTERN_G;
 #define SC_RALT 0x138
 #define SC_LWIN 0x15B
 #define SC_RWIN 0x15C
+
+#define SC_APPSKEY 0x15D
 
 // UPDATE for v1.0.39: Changed sc_type to USHORT vs. UINT to save memory in structs such as sc_hotkey.
 // This saves 60K of memory in one place, and possibly there are other large savings too.
@@ -337,6 +339,7 @@ ResultType LayoutHasAltGr(HKL aLayout, ResultType aHasAltGr = LAYOUT_UNDETERMINE
 
 LPTSTR SCtoKeyName(sc_type aSC, LPTSTR aBuf, int aBufSize, bool aUseFallback = true);
 LPTSTR VKtoKeyName(vk_type aVK, LPTSTR aBuf, int aBufSize, bool aUseFallback = true);
+TCHAR VKtoChar(vk_type aVK, HKL aKeybdLayout = NULL);
 sc_type TextToSC(LPTSTR aText);
 vk_type TextToVK(LPTSTR aText, modLR_type *pModifiersLR = NULL, bool aExcludeThoseHandledByScanCode = false
 	, bool aAllowExplicitVK = true, HKL aKeybdLayout = GetKeyboardLayout(0));

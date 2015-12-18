@@ -1,4 +1,4 @@
-/*
+﻿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -36,11 +36,21 @@ HWND WinActivate(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR a
 	if (USE_FOREGROUND_WINDOW(aTitle, aText, aExcludeTitle, aExcludeText))
 	{
 		// User asked us to activate the "active" window, which by definition already is.
-		// However, if the active (foreground) window is hidden and DetectHiddenWindows is
-		// off, the below will set target_window to be NULL, which seems like the most
-		// consistent result to use:
 		SET_TARGET_TO_ALLOWABLE_FOREGROUND(aSettings.DetectHiddenWindows)
-		return target_window;
+		// The documented behavior is "If a matching window is already active, that window
+		// will be kept active"; however, if the active (foreground) window is hidden and
+		// DetectHiddenWindows is off, that window isn't a match and so we should search
+		// for a matching window.
+		if (target_window) // Added in v1.1.20.
+		{
+			// The window is already active, but might be minimized.  The behavior in
+			// v1.1.19 and earlier was to leave it minimized, but it seems more useful
+			// and intuitive to restore it.  The documentation says "If the window is
+			// minimized, it is automatically restored prior to being activated."
+			if (IsIconic(target_window))
+				ShowWindow(target_window, SW_RESTORE);
+			return target_window;
+		}
 	}
 
 	if (!aFindLastMatch && !*aTitle && !*aText && !*aExcludeTitle && !*aExcludeText)
@@ -1877,6 +1887,30 @@ bool DialogPrep()
 	bool thread_was_critical = g->ThreadIsCritical;
 	g->ThreadIsCritical = false;
 	g->AllowThreadToBeInterrupted = true;
+	if (g_KeybdHook) // Workaround added in v1.1.22.01.
+	{
+		// If a Control or Shift key is physically down, the dialog somehow recognizes this
+		// and acts as though the key is logically down even if it really isn't.  Logically
+		// releasing the key before or after the dialog is shown appears to work around the
+		// issue.  If one L/R modifier is logically down and the opposite side is physically
+		// down, the workaround isn't wanted/needed, because the dialog *should* act like
+		// the key is down, and it does so until the key is released.
+		modLR_type mods_not_to_release = ConvertModifiers(ConvertModifiersLR(g_modifiersLR_logical) & (MOD_CONTROL | MOD_SHIFT));
+		modLR_type mods_to_release = g_modifiersLR_physical & ~mods_not_to_release;
+		if (mods_to_release)
+		{
+			if (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN))
+			{
+				// Even though the Win key isn't being released, sending a Shift or Control key-up
+				// triggers the Start menu.  To prevent that, we send the mask key.  This has been
+				// confirmed to apply to #Control, #Shift and the left/right variants.
+				KeyEvent(KEYDOWNANDUP, g_MenuMaskKey, 0, NULL, false, KEY_IGNORE_ALL_EXCEPT_MODIFIER);
+				// Releasing the Win key now does not prevent it from being "masked" again later:
+				//mods_to_release |= (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN));
+			}
+			SetModifierLRState(0, mods_to_release, NULL, false, false);
+		}
+	}
 	if (HIWORD(GetQueueStatus(QS_ALLEVENTS))) // See DIALOG_PREP for explanation.
 		MsgSleep(-1);
 	return thread_was_critical; // Caller is responsible for using this to later restore g->ThreadIsCritical.

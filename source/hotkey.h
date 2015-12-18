@@ -1,4 +1,4 @@
-/*
+﻿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -76,7 +76,7 @@ struct HotkeyCriterion
 
 struct HotkeyVariant
 {
-	Label *mJumpToLabel;
+	LabelRef mJumpToLabel;
 	DWORD mRunAgainTime;
 	LPTSTR mHotWinTitle, mHotWinText;
 	int mHotExprIndex; // L4: g_HotExprLines index of the expression which controls whether this variant may activate.
@@ -152,7 +152,7 @@ private:
 
 	// For now, constructor & destructor are private so that only static methods can create new
 	// objects.  This allow proper tracking of which OS hotkey IDs have been used.
-	Hotkey(HotkeyIDType aID, Label *aJumpToLabel, HookActionType aHookAction, LPTSTR aName, bool aSuffixHasTilde, bool aUseErrorLevel);
+	Hotkey(HotkeyIDType aID, IObject *aJumpToLabel, HookActionType aHookAction, LPTSTR aName, bool aSuffixHasTilde, bool aUseErrorLevel);
 	~Hotkey() {if (mIsRegistered) Unregister();}
 
 public:
@@ -183,7 +183,9 @@ public:
 	bool mAllowExtraModifiers;  // False if the hotkey should not fire when extraneous modifiers are held down.
 	bool mKeyUp; // A hotkey that should fire on key-up.
 	bool mVK_WasSpecifiedByNumber; // A hotkey defined by something like "VK24::" or "Hotkey, VK24, ..."
+#ifdef CONFIG_WIN9X
 	bool mUnregisterDuringThread; // Win9x: Whether this hotkey should be unregistered during its own subroutine (to prevent its own Send command from firing itself).  Seems okay to apply this to all variants.
+#endif
 	bool mIsRegistered;  // Whether this hotkey has been successfully registered.
 	bool mParentEnabled; // When true, the individual variants' mEnabled flags matter. When false, the entire hotkey is disabled.
 	bool mConstructedOK;
@@ -207,11 +209,11 @@ public:
 	#define HOTKEY_EL_NOREG              _T("51")
 	#define HOTKEY_EL_MAXCOUNT           _T("98") // 98 allows room for other ErrorLevels to be added in between.
 	#define HOTKEY_EL_MEM                _T("99")
-	static ResultType Dynamic(LPTSTR aHotkeyName, LPTSTR aLabelName, LPTSTR aOptions, Label *aJumpToLabel);
+	static ResultType Dynamic(LPTSTR aHotkeyName, LPTSTR aLabelName, LPTSTR aOptions, IObject *aJumpToLabel);
 
-	static Hotkey *AddHotkey(Label *aJumpToLabel, HookActionType aHookAction, LPTSTR aName, bool aSuffixHasTilde, bool aUseErrorLevel);
+	static Hotkey *AddHotkey(IObject *aJumpToLabel, HookActionType aHookAction, LPTSTR aName, bool aSuffixHasTilde, bool aUseErrorLevel);
 	HotkeyVariant *FindVariant();
-	HotkeyVariant *AddVariant(Label *aJumpToLabel, bool aSuffixHasTilde);
+	HotkeyVariant *AddVariant(IObject *aJumpToLabel, bool aSuffixHasTilde);
 	static bool PrefixHasNoEnabledSuffixes(int aVKorSC, bool aIsSC);
 	HotkeyVariant *CriterionAllowsFiring(HWND *aFoundHWND = NULL);
 	static HotkeyVariant *CriterionAllowsFiring(HotkeyIDType aHotkeyID, HWND &aFoundHWND);
@@ -249,8 +251,8 @@ public:
 		// the number of currently active threads drops below the max.  But doing such
 		// might make "infinite key loops" harder to catch because the rate of incoming hotkeys
 		// would be slowed down to prevent the subroutines from running concurrently:
-		return aVariant.mExistingThreads < aVariant.mMaxThreads
-			|| (ACT_IS_ALWAYS_ALLOWED(aVariant.mJumpToLabel->mJumpToLine->mActionType)); // See below.
+		ActionTypeType act = aVariant.mJumpToLabel->TypeOfFirstLine();
+		return aVariant.mExistingThreads < aVariant.mMaxThreads || (ACT_IS_ALWAYS_ALLOWED(act)); // See below.
 		// Although our caller may have already called ACT_IS_ALWAYS_ALLOWED(), it was for a different reason.
 	}
 

@@ -1,4 +1,4 @@
-/*
+﻿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -70,6 +70,7 @@ extern HHOOK g_MouseHook;
 extern HHOOK g_PlaybackHook;
 extern bool g_ForceLaunch;
 extern bool g_WinActivateForce;
+extern bool g_RunStdIn;
 extern WarnMode g_Warn_UseUnsetLocal;
 extern WarnMode g_Warn_UseUnsetGlobal;
 extern WarnMode g_Warn_UseEnv;
@@ -128,8 +129,7 @@ extern SplashType g_SplashImage[MAX_SPLASHIMAGE_WINDOWS];
 extern GuiType **g_gui;
 extern int g_guiCount, g_guiCountMax;
 extern HWND g_hWndToolTip[MAX_TOOLTIPS];
-extern MsgMonitorStruct *g_MsgMonitor; // An array to be allocated upon first use (if any).
-extern int g_MsgMonitorCount;
+extern MsgMonitorList g_MsgMonitor;
 
 extern UCHAR g_SortCaseSensitive;
 extern bool g_SortNumeric;
@@ -168,8 +168,8 @@ EXTERN_SCRIPT;
 EXTERN_CLIPBOARD;
 EXTERN_OSVER;
 
-extern int g_IconTray;
-extern int g_IconTraySuspend;
+extern HICON g_IconSmall;
+extern HICON g_IconLarge;
 
 extern DWORD g_OriginalTimeout;
 

@@ -1,4 +1,4 @@
-/*
+ï»¿/*
 AutoHotkey
 
 Copyright 2003-2009 Chris Mallett (support@autohotkey.com)
@@ -65,8 +65,8 @@ EXTERN_G;  // For ITOA() and related functions' use of g->FormatIntAsHex
 // v1.0.43.04: The following are macros to avoid crash bugs caused by improper casting, namely a failure to cast
 // a signed char to UCHAR before promoting it to LPSTR, which crashes since CharLower/Upper would interpret
 // such a high unsigned value as an address rather than a single char.
-#define ltolower(ch) (TBYTE)CharLower((LPTSTR)(TBYTE)(ch))  // "L" prefix stands for "locale", like lstrcpy.
-#define ltoupper(ch) (TBYTE)CharUpper((LPTSTR)(TBYTE)(ch))  // For performance, some callers don't want return value cast to char.
+#define ltolower(ch) (TBYTE)(UINT_PTR)CharLower((LPTSTR)(TBYTE)(ch))  // "L" prefix stands for "locale", like lstrcpy.
+#define ltoupper(ch) (TBYTE)(UINT_PTR)CharUpper((LPTSTR)(TBYTE)(ch))  // For performance, some callers don't want return value cast to char.
 
 
 // Locale independent ctype (applied to the ASCII characters only)
@@ -601,7 +601,7 @@ inline LPTSTR HwndToString(HWND aHwnd, LPTSTR aBuf)
 
 
 // v1.0.43.03: The following macros support the new "StringCaseSense Locale" setting.  This setting performs
-// 1 to 10 times slower for most things, but has the benefit of seeing characters like ä and Ä as identical
+// 1 to 10 times slower for most things, but has the benefit of seeing characters like Ã¤ and Ã„ as identical
 // when insensitive.  MSDN implies that lstrcmpi() is the same as:
 //     CompareString(LOCALE_USER_DEFAULT, NORM_IGNORECASE, ...)
 // Note that when MSDN talks about the "word sort" vs. "string sort", it does not mean that strings like
@@ -736,6 +736,7 @@ int sntprintfcat(LPTSTR aBuf, int aBufSize, LPCTSTR aFormat, ...);
 //int tcslcmp (LPTSTR aBuf1, LPTSTR aBuf2, UINT aLength1 = UINT_MAX, UINT aLength2 = UINT_MAX);
 int tcslicmp(LPTSTR aBuf1, LPTSTR aBuf2, size_t aLength1 = -1, size_t aLength2 = -1);
 LPTSTR tcsrstr(LPTSTR aStr, size_t aStr_length, LPCTSTR aPattern, StringCaseSenseType aStringCaseSense, int aOccurrence = 1);
+LPTSTR ltcschr(LPCTSTR haystack, TCHAR ch);
 LPTSTR lstrcasestr(LPCTSTR phaystack, LPCTSTR pneedle);
 LPTSTR tcscasestr (LPCTSTR phaystack, LPCTSTR pneedle);
 UINT StrReplace(LPTSTR aHaystack, LPTSTR aOld, LPTSTR aNew, StringCaseSenseType aStringCaseSense
@@ -779,7 +780,7 @@ int CALLBACK FontEnumProc(ENUMLOGFONTEX *lpelfe, NEWTEXTMETRICEX *lpntme, DWORD 
 bool IsStringInList(LPTSTR aStr, LPTSTR aList, bool aFindExactMatch);
 LPTSTR InStrAny(LPTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundLen);
 
-int ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex); // L17: Find integer ID of resource from index. i.e. IconNumber -> resource ID.
+LPTSTR ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex); // L17: Find integer ID of resource from index. i.e. IconNumber -> resource ID.
 HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, int aHeight); // L17: Extract icon of the appropriate size from an executable (or compatible) file.
 
 #if defined(_MSC_VER) && defined(_DEBUG)

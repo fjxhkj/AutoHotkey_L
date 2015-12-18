@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #define INVOKE_TYPE			(aFlags & IT_BITMASK)
 #define IS_INVOKE_SET		(aFlags & IT_SET)
@@ -9,11 +9,18 @@
 
 #define INVOKE_NOT_HANDLED	CONDITION_FALSE
 
+enum ObjectMethodID { // Partially ported from v2 BuiltInFunctionID.  Used for code sharing.
+	FID_ObjInsertAt, FID_ObjDelete, FID_ObjRemoveAt, FID_ObjPush, FID_ObjPop, FID_ObjLength
+	, FID_ObjHasKey, FID_ObjGetCapacity, FID_ObjSetCapacity, FID_ObjGetAddress, FID_ObjClone
+	, FID_ObjNewEnum, FID_ObjMaxIndex, FID_ObjMinIndex, FID_ObjRemove, FID_ObjInsert
+};
+
+
 //
 // ObjectBase - Common base class, implements reference counting.
 //
 
-class DECLSPEC_NOVTABLE ObjectBase : public IObject
+class DECLSPEC_NOVTABLE ObjectBase : public IObjectComCompatible
 {
 protected:
 	ULONG mRefCount;
@@ -65,7 +72,7 @@ public:
 // EnumBase - Base class for enumerator objects following standard syntax.
 //
 
-class EnumBase : public ObjectBase
+class DECLSPEC_NOVTABLE EnumBase : public ObjectBase
 {
 public:
 	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
@@ -192,12 +199,13 @@ protected:
 	
 public:
 	static Object *Create(ExprTokenType *aParam[] = NULL, int aParamCount = 0);
+	static Object *CreateArray(ExprTokenType *aValue[] = NULL, int aValueCount = 0);
 
 	bool Append(LPTSTR aValue, size_t aValueLength = -1);
 
 	// Used by Func::Call() for variadic functions/function-calls:
 	Object *Clone(BOOL aExcludeIntegerKeys = false);
-	ResultType ArrayToParams(ExprTokenType *token, ExprTokenType **param_list, int extra_params, ExprTokenType **&aParam, int &aParamCount);
+	void ArrayToParams(ExprTokenType *token, ExprTokenType **param_list, int extra_params, ExprTokenType **aParam, int aParamCount);
 	ResultType ArrayToStrings(LPTSTR *aStrings, int &aStringCount, int aStringsMax);
 	
 	inline bool GetNextItem(ExprTokenType &aToken, INT_PTR &aOffset, INT_PTR &aKey)
@@ -207,6 +215,14 @@ public:
 		FieldType &field = mFields[aOffset];
 		aKey = field.key.i;
 		field.ToToken(aToken);
+		return true;
+	}
+
+	inline bool GetItemOffset(ExprTokenType &aToken, INT_PTR aOffset)
+	{
+		if (aOffset >= mKeyOffsetObject)
+			return false;
+		mFields[aOffset].ToToken(aToken);
 		return true;
 	}
 
@@ -231,19 +247,25 @@ public:
 		return true;
 	}
 	
-	bool SetItem(LPTSTR aKey, ExprTokenType &aValue)
+	bool SetItem(ExprTokenType &aKey, ExprTokenType &aValue)
 	{
-		KeyType key;
-		SymbolType key_type = IsPureNumeric(aKey, FALSE, FALSE, FALSE); // SYM_STRING or SYM_INTEGER.
-		if (key_type == SYM_INTEGER)
-			key.i = ATOI(aKey);
-		else
-			key.s = aKey;
 		IndexType insert_pos;
-		FieldType *field = FindField(key_type, key, insert_pos);
-		if (  !field && !(field = Insert(key_type, key, insert_pos))  ) // Relies on short-circuit boolean evaluation.
+		TCHAR buf[MAX_NUMBER_SIZE];
+		SymbolType key_type;
+		KeyType key;
+		FieldType *field = FindField(aKey, buf, key_type, key, insert_pos);
+		if (!field && !(field = Insert(key_type, key, insert_pos))) // Relies on short-circuit boolean evaluation.
 			return false;
 		return field->Assign(aValue);
+	}
+
+	bool SetItem(LPTSTR aKey, ExprTokenType &aValue)
+	{
+		ExprTokenType key;
+		key.symbol = SYM_OPERAND;
+		key.marker = aKey;
+		key.buf = NULL;
+		return SetItem(key, aValue);
 	}
 
 	bool SetItem(LPTSTR aKey, __int64 aValue)
@@ -294,11 +316,24 @@ public:
 	
 	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
 
+	int GetBuiltinID(LPCTSTR aName);
+	ResultType CallBuiltin(int aID, ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+
 	ResultType _Insert(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _InsertAt(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _Push(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	
+	enum RemoveMode { RM_RemoveKeyOrIndex, RM_RemoveKey, RM_RemoveAt, RM_Pop };
+	ResultType _Remove_impl(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount, RemoveMode aMode);
 	ResultType _Remove(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _Delete(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _RemoveAt(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _Pop(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	
 	ResultType _GetCapacity(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _SetCapacity(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _GetAddress(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _Length(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _MaxIndex(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _MinIndex(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _NewEnum(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
@@ -330,6 +365,27 @@ public:
 };
 
 extern MetaObject g_MetaObject;		// Defines "object" behaviour for non-object values.
+
+
+//
+// BoundFunc
+//
+
+class BoundFunc : public ObjectBase
+{
+	IObject *mFunc; // Future use: bind a BoundFunc or other object.
+	Object *mParams;
+	int mFlags;
+	BoundFunc(IObject *aFunc, Object *aParams, int aFlags)
+		: mFunc(aFunc), mParams(aParams), mFlags(aFlags)
+	{}
+
+public:
+	static BoundFunc *Bind(IObject *aFunc, ExprTokenType **aParam, int aParamCount, int aFlags);
+	~BoundFunc();
+
+	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
+};
 
 
 //
