@@ -49,6 +49,7 @@ freely, without restriction.
 #define DEBUGGER_E_BREAKPOINT_NO_CODE	203 // No code on breakpoint line.
 #define DEBUGGER_E_BREAKPOINT_STATE		204 // Invalid breakpoint state.
 #define DEBUGGER_E_BREAKPOINT_NOT_FOUND	205 // No such breakpoint.
+#define DEBUGGER_E_EVAL_FAIL			206
 
 #define DEBUGGER_E_UNKNOWN_PROPERTY		300
 #define DEBUGGER_E_INVALID_STACK_DEPTH	301
@@ -75,6 +76,8 @@ extern Debugger g_Debugger;
 extern CStringA g_DebuggerHost;
 extern CStringA g_DebuggerPort;
 
+extern LPCTSTR g_AutoExecuteThreadDesc;
+
 
 enum BreakpointTypeType {BT_Line, BT_Call, BT_Return, BT_Exception, BT_Conditional, BT_Watch};
 enum BreakpointStateType {BS_Disabled=0, BS_Enabled};
@@ -84,14 +87,18 @@ class Breakpoint
 public:
 	int id;
 	char type;
-	char state;
-	bool temporary;
-	
-	// Not yet supported: function, hit_count, hit_value, hit_condition, exception
+	char state = BS_Disabled;
+	bool temporary = false;
 
-	Breakpoint() : id(++sMaxId), type(BT_Line), state(BS_Enabled), temporary(false)
-	{
-	}
+	Line *line = nullptr;
+	Breakpoint *next = nullptr;
+	
+	// Not yet supported: function, hit_count, hit_value, hit_condition
+
+	Breakpoint(BreakpointTypeType aType = BT_Line, int aID = AllocateID())
+		: id(aID), type((char)aType) {}
+
+	static int AllocateID() { return ++sMaxId; }
 
 private:
 	static int sMaxId; // Highest used breakpoint ID.
@@ -100,23 +107,26 @@ private:
 
 // Forward-declarations (this file is included in script.h before these are declared).
 class Line;
-class Func;
-class Label;
+class NativeFunc;
+struct UDFCallInfo;
 
+template<typename T, int S> struct ScriptItemList;
+typedef ScriptItemList<Var, VARLIST_INITIAL_SIZE> VarList;
 
 struct DbgStack
 {
-	enum StackEntryType {SE_Thread, SE_Sub, SE_Func};
+	enum StackEntryType {SE_Thread, SE_BIF, SE_UDF};
 	struct Entry
 	{
 		Line *line;
 		union
 		{
-			TCHAR *desc; // SE_Thread -- "auto-exec", hotkey/hotstring name, "timer", etc.
-			Label *sub; // SE_Sub
-			Func *func; // SE_Func
+			LPCTSTR desc; // SE_Thread -- "auto-exec", hotkey/hotstring name, "timer", etc.
+			NativeFunc *func; // SE_BIF
+			UDFCallInfo *udf; // SE_UDF
 		};
 		StackEntryType type;
+		LPCTSTR Name();
 	};
 
 	Entry *mBottom, *mTop, *mTopBound;
@@ -158,15 +168,13 @@ struct DbgStack
 
 	Entry *Push();
 
-	void Pop()
-	{
-		ASSERT(mTop >= mBottom);
-		--mTop;
-	}
+	void Pop();
 
-	void Push(TCHAR *aDesc);
-	void Push(Label *aSub);
-	void Push(Func *aFunc);
+	void Push(LPCTSTR aDesc);
+	void Push(NativeFunc *aFunc);
+	void Push(UDFCallInfo *aRecurse);
+
+	void GetLocalVars(int aDepth, VarList *&aVars, VarList *&aStaticVars, VarBkp *&aBkp, VarBkp *&aBkpEnd);
 };
 
 #define DEBUGGER_STACK_PUSH(aWhat)	g_Debugger.mStack.Push(aWhat);
@@ -186,40 +194,25 @@ public:
 	inline bool IsStepping() { return mInternalState >= DIS_StepInto; }
 	inline bool HasStdErrHook() { return mStdErrMode != SR_Disabled; }
 	inline bool HasStdOutHook() { return mStdOutMode != SR_Disabled; }
+	inline bool BreakOnExceptionIsEnabled() { return mBreakOnException.state == BS_Enabled; }
 
-	inline void PostExecFunctionCall(Line *aExpressionLine)
-	{
-		// If the debugger is stepping into/over/out from a function call, we want to
-		// break at the line which called that function, since the next line to execute
-		// might be a line in some other function (i.e. because the line which called
-		// the function is "return func()" or calls another function after this one).
-		if ((mInternalState == DIS_StepInto
-			|| ((mInternalState == DIS_StepOut || mInternalState == DIS_StepOver)
-				// Always '<' since '<=' (for StepOver) shouldn't be possible,
-				// since we just returned from a function call:
-				&& mStack.Depth() < mContinuationDepth))
-			// The final check ensures we don't repeatedly break at a line containing
-			// multiple built-in function calls; i.e. don't break unless some script
-			// has been executed since we began evaluating aExpressionLine.  Something
-			// like "return recursivefunc()" should work if this is StepInto or StepOver
-			// since mCurrLine would probably be the '}' of that function:
-			&& mCurrLine != aExpressionLine)
-			PreExecLine(aExpressionLine);
-	}
+	LPCTSTR WhatThrew();
 
 	// Code flow notification functions:
 	int PreExecLine(Line *aLine); // Called before executing each line.
+	void LeaveFunction();
+	bool PreThrow(ExprTokenType *aException);
 	
 	// Receive and process commands. Returns when a continuation command is received.
-	int ProcessCommands();
-	int Break();
+	int ProcessCommands(LPCSTR aBreakReason = nullptr);
+	int Break(LPCSTR aReason = "ok");
 	
 	bool HasPendingCommand();
 
 	// Streams
 	int WriteStreamPacket(LPCTSTR aText, LPCSTR aType);
-	void OutputDebug(LPCTSTR aText);
-	bool FileAppendStdOut(LPCTSTR aText);
+	bool OutputStdErr(LPCTSTR aText);
+	bool OutputStdOut(LPCTSTR aText);
 
 	#define DEBUGGER_COMMAND(cmd)	int cmd(char **aArgV, int aArgCount, char *aTransactionId)
 	
@@ -261,30 +254,31 @@ public:
 	DEBUGGER_COMMAND(redirect_stderr);
 
 
-	Debugger() : mSocket(INVALID_SOCKET), mInternalState(DIS_Starting)
-		, mMaxPropertyData(1024), mContinuationTransactionId(""), mStdErrMode(SR_Disabled), mStdOutMode(SR_Disabled)
-		, mMaxChildren(20), mMaxDepth(2), mDisabledHooks(0)
-	{
-	}
+	Debugger() {}
 
 	
-	// Stack - keeps track of threads, function calls and gosubs.
+	// Stack - keeps track of threads and function calls.
 	DbgStack mStack;
+	friend struct DbgStack;
 
 private:
-	SOCKET mSocket;
-	Line *mCurrLine; // Similar to g_script.mCurrLine, but may be different when breaking post-function-call, before continuing expression evaluation.
+	SOCKET mSocket = INVALID_SOCKET;
+	Line *mCurrLine = nullptr; // Similar to g_script.mCurrLine, but may be different when breaking post-function-call, before continuing expression evaluation.
+	ExprTokenType *mThrownToken = nullptr; // The exception that triggered the current exception breakpoint.
+	// Linked list of breakpoints.  Using the exception breakpoint as the const head of the list simplifies
+	// some operations and reduces code size.  The first line breakpoint is always mFirstBreakpoint->next.
+	Breakpoint *const mFirstBreakpoint = &mBreakOnException, *mLastBreakpoint = &mBreakOnException;
+	Breakpoint mBreakOnException { BT_Exception, 0 }; // Supports a single catchall breakpoint exception.
 
 	class Buffer
 	{
 	public:
 		int Write(char *aData, size_t aDataSize=-1);
 		int WriteF(const char *aFormat, ...);
-		int WriteFileURI(const char *aPath);
 		int WriteEncodeBase64(const char *aData, size_t aDataSize, bool aSkipBufferSizeCheck = false);
 		int Expand();
 		int ExpandIfNecessary(size_t aRequiredSize);
-		void Remove(size_t aDataSize);
+		void Delete(size_t aDataSize);
 		void Clear();
 
 		Buffer() : mData(NULL), mDataSize(0), mDataUsed(0), mFailed(FALSE) {}
@@ -298,6 +292,9 @@ private:
 			if (mData)
 				free(mData);
 		}
+	private:
+		int EstimateFileURILength(LPCTSTR aPath);
+		void WriteFileURI(LPCWSTR aPath);
 	} mCommandBuf, mResponseBuf;
 
 	enum DebuggerInternalStateType {
@@ -308,83 +305,94 @@ private:
 		DIS_StepInto,
 		DIS_StepOver,
 		DIS_StepOut
-	} mInternalState;
+	} mInternalState = DIS_Starting;
 
 	enum StreamRedirectType {
 		SR_Disabled = 0,
 		SR_Copy = 1,
 		SR_Redirect = 2
-	} mStdErrMode, mStdOutMode;
+	} mStdErrMode = SR_Disabled, mStdOutMode = SR_Disabled;
 
-	int mContinuationDepth; // Stack depth at last continuation command, for step_into/step_over.
-	CStringA mContinuationTransactionId; // transaction_id of last continuation command.
+	int mContinuationDepth = 0; // Stack depth at last continuation command, for step_into/step_over.
+	CStringA mContinuationTransactionId {""}; // transaction_id of last continuation command.
 
-	int mMaxPropertyData, mMaxChildren, mMaxDepth;
+	int mMaxPropertyData = 1024, mMaxChildren = 1000, mMaxDepth = 1;
 
-	HookType mDisabledHooks;
+	HookType mDisabledHooks = 0;
+	bool mProcessingCommands;
+
+
+	enum PropertyType
+	{
+		PropNone = 0,
+		PropVar,
+		PropVarBkp,
+		PropValue, // Read-only (ExprTokenType)
+		PropEnum
+	};
+
+	struct PropertySource
+	{
+		PropertyType kind = PropNone;
+		Var *var;
+		VarBkp *bkp;
+		ResultToken value;
+		IObject *invokee = nullptr;
+		PropertySource(LPTSTR aResultBuf)
+		{
+			value.InitResult(aResultBuf);
+		}
+		~PropertySource()
+		{
+			value.Free();
+		}
+	};
+
+	struct PropertyInfo : PropertySource
+	{
+		LPCSTR name;
+		CStringA &fullname;
+		LPSTR facet; // Initialised during writing.
+		bool is_alias = false, is_builtin = false, is_static = false; // Facets.
+		int page = 0, pagesize; // Attributes which are also parameters.
+		int max_data; // Parameters.
+		int max_depth;
+
+		PropertyInfo(CStringA &aNameBuf, LPTSTR aResultBuf)
+			: PropertySource(aResultBuf), fullname(aNameBuf) {}
+	};
 
 	
 	struct PropertyWriter : public IDebugProperties
 	{
 		Debugger &mDbg;
-		IObject *mObject;
-		LPCSTR mName;
-		CStringA &mNameBuf;
+		PropertyInfo &mProp;
 		size_t mNameLength;
-		int mPage;
-		int mPageSize;
 		int mDepth;
-		int mMaxDepth;
-		int mMaxEncodedSize;
 		int mError;
 
-		PropertyWriter(Debugger &aDbg, IObject *aObject, LPCSTR aName, CStringA &aNameBuf, int aPage, int aPageSize, int aMaxDepth, int aMaxEncodedSize)
+		PropertyWriter(Debugger &aDbg, PropertyInfo &aProp)
 			: mDbg(aDbg)
-			, mObject(aObject)
-			, mName(aName)
-			, mNameBuf(aNameBuf)
-			, mNameLength(aNameBuf.GetLength())
-			, mPage(aPage)
-			, mPageSize(aPageSize)
+			, mProp(aProp)
+			, mNameLength(aProp.fullname.GetLength())
 			, mDepth(0)
-			, mMaxDepth(aMaxDepth)
-			, mMaxEncodedSize(aMaxEncodedSize)
 			, mError(0)
 		{
 		}
 
-		void WriteProperty(LPCSTR aName, LPTSTR aValue)
-		{
-			ExprTokenType value;
-			value.symbol = SYM_STRING;
-			value.marker = aValue;
-			WriteProperty(aName, value);
-		}
-
-		void WriteProperty(LPCSTR aName, __int64 aValue)
-		{
-			ExprTokenType value;
-			value.symbol = SYM_INTEGER;
-			value.value_int64 = aValue;
-			WriteProperty(aName, value);
-		}
-		
-		void WriteProperty(LPCSTR aName, IObject *aValue)
-		{
-			ExprTokenType value;
-			value.symbol = SYM_OBJECT;
-			value.object = aValue;
-			WriteProperty(aName, value);
-		}
-
 		void WriteProperty(LPCSTR aName, ExprTokenType &aValue);
-		void WriteProperty(INT_PTR aKey, ExprTokenType &aValue);
-		void WriteProperty(IObject *aKey, ExprTokenType &aValue);
+		void WriteProperty(LPCWSTR aName, ExprTokenType &aValue);
+		void WriteProperty(ExprTokenType &aKey, ExprTokenType &aValue);
+		void WriteBaseProperty(IObject *aBase);
+		void WriteDynamicProperty(LPTSTR aName);
+		void WriteEnumItems(IObject *aEnumerable, int aStart, int aEnd);
 
-		void _WriteProperty(ExprTokenType &aValue);
+		void _WriteProperty(ExprTokenType &aValue, IObject *aInvokee = nullptr);
 
 		void BeginProperty(LPCSTR aName, LPCSTR aType, int aNumChildren, DebugCookie &aCookie);
 		void EndProperty(DebugCookie aCookie);
+
+		ExprTokenType &ThisToken() { return mProp.value; }
 	};
 
 
@@ -392,28 +400,43 @@ private:
 	int ReceiveCommand(int *aCommandSize=NULL);
 
 	// Send XML response to debugger UI:
-	int SendResponse();
+	int SendResponse(size_t aStartOffset = 0);
 	int SendErrorResponse(char *aCommandName, char *aTransactionId, int aError=999, char *aExtraAttributes=NULL);
 	int SendStandardResponse(char *aCommandName, char *aTransactionId);
-	int SendContinuationResponse(char *aCommand=NULL, char *aStatus="break", char *aReason="ok");
+	int SendContinuationResponse(LPCSTR aCommand = nullptr, LPCSTR aStatus = "break", LPCSTR aReason = "ok");
 
-	int EnterBreakState();
+	int EnterBreakState(LPCSTR aReason = "ok");
 	void ExitBreakState();
 
-	int WriteBreakpointXml(Breakpoint *aBreakpoint, Line *aLine);
+	int WriteBreakpointXml(Breakpoint *aBreakpoint);
+	Line *FindFirstLineForBreakpoint(int file_index, UINT line_no);
+	void SetBreakpointForLineGroup(Line *line, Breakpoint *bp);
+	Breakpoint *CreateBreakpoint();
+	void DeleteBreakpoint(Breakpoint *aBp);
 
-	void AppendKeyName(CStringA &aNameBuf, size_t aParentNameLength, const char *aName);
+	void AppendPropertyName(CStringA &aNameBuf, size_t aParentNameLength, const char *aName);
+	void AppendStringKey(CStringA &aNameBuf, size_t aParentNameLength, const char *aKey);
 
-	int WritePropertyXml(Var &aVar, int aMaxEncodedSize, int aPage = 0);
-	int WritePropertyXml(IObject *aObject, const char *aName, CStringA &aNameBuf, int aPage, int aPageSize, int aDepthRemaining, int aMaxEncodedSize, char *aFacet = "");
-	int WritePropertyXml(ExprTokenType &aValue, const char *aName, CStringA &aNameBuf, int aPageSize, int aDepthRemaining, int aMaxEncodedSize);
-	int WritePropertyXml(Object::FieldType &aField, const char *aName, CStringA &aNameBuf, int aPageSize, int aDepthRemaining, int aMaxEncodedSize);
+	int GetPropertyInfo(Var &aVar, PropertyInfo &aProp);
+	int GetPropertyInfo(VarBkp &aBkp, PropertyInfo &aProp);
+	
+	int GetPropertyValue(Var &aVar, ResultToken &aValue);
+	int GetPropertyValue(VarBkp &aBkp, ResultToken &aValue);
+
+	int WritePropertyXml(PropertyInfo &aProp);
+	int WritePropertyXml(PropertyInfo &aProp, LPTSTR aName);
+	int WritePropertyObjectXml(PropertyInfo &aProp);
 
 	int WritePropertyData(LPCTSTR aData, size_t aDataSize, int aMaxEncodedSize);
-	int WritePropertyData(Var &aVar, int aMaxEncodedSize);
-	int WritePropertyData(Object::FieldType &aField, int aMaxEncodedSize);
+	int WritePropertyData(ExprTokenType &aValue, int aMaxEncodedSize);
 
-	int ParsePropertyName(const char *aFullName, int aVarScope, bool aVarMustExist, Var *&aVar, Object::FieldType *&aField);
+	int WriteEnumItems(PropertyInfo &aProp);
+
+	LPWSTR ParsePropertyKeyLiteral(LPWSTR aPtr, ExprTokenType &aKey);
+	int ParsePropertyName(LPCSTR aFullName, int aDepth, int aVarScope, ExprTokenType *aSetValue
+		, PropertySource &aResult);
+	int ParsePropertyName(LPWSTR aNamePtr, int aDepth, int aVarScope, ExprTokenType *aSetValue
+		, PropertySource &aResult);
 	int property_get_or_value(char **aArgV, int aArgCount, char *aTransactionId, bool aIsPropertyGet);
 	int redirect_std(char **aArgV, int aArgCount, char *aTransactionId, char *aCommandName);
 	int run_step(char **aArgV, int aArgCount, char *aTransactionId, char *aCommandName, DebuggerInternalStateType aNewState);
@@ -456,6 +479,12 @@ private:
 	// Fatal debugger error. Prompt user to terminate script or only disconnect debugger.
 	static int FatalError(LPCTSTR aMessage = DEBUGGER_ERR_INTERNAL DEBUGGER_ERR_DISCONNECT_PROMPT);
 };
+
+
+constexpr auto SCRIPT_STACK_BUF_SIZE = 2048; // Character limit for Error().Stack and stack traces generated by the error dialog.
+
+void GetScriptStack(LPTSTR aBuf, int aBufSize, DbgStack::Entry *aTop = nullptr);
+
 
 #endif
 #endif

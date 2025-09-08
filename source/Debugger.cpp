@@ -27,13 +27,14 @@ freely, without restriction.
 #define U4T(s) CStringUTF8FromTChar(s).GetString()
 
 #include <ws2tcpip.h>
-#include <wspiapi.h> // for getaddrinfo() on versions of Windows earlier than XP.
+#include <wspiapi.h> // for getaddrinfo()
 #include <stdarg.h>
-#include <typeinfo> // for typeid().
 
 Debugger g_Debugger;
 CStringA g_DebuggerHost;
 CStringA g_DebuggerPort;
+
+LPCTSTR g_AutoExecuteThreadDesc = _T("Auto-execute"); // This is used to reduce code size (allow comparing address vs. string).
 
 // The first breakpoint uses sMaxId + 1. Don't change this without also changing breakpoint_remove.
 int Breakpoint::sMaxId = 0;
@@ -78,6 +79,109 @@ Debugger::CommandDef Debugger::sCommands[] =
 };
 
 
+inline bool PreExecLineIsSlippery(Line *aLine)
+{
+	ActionTypeType act = aLine->mActionType;
+	// BLOCK_BEGIN: yes
+	// BLOCK_END: yes if !mAttribute (not a function-body)
+	// TRY, CATCH, FINALLY: yes
+	// THROW, SWITCH: no
+	// CASE: yes
+	return act >= ACT_TRY ? (act <= ACT_FINALLY || act == ACT_CASE)
+		: act == ACT_BLOCK_BEGIN || act == ACT_BLOCK_END && !aLine->mAttribute;
+}
+
+inline bool BreakpointLineIsSlippery(Line *aLine)
+{
+	ActionTypeType act = aLine->mActionType;
+	// BLOCK_BEGIN: yes
+	// BLOCK_END: no (can be used for "break-on-return"; also, doesn't make sense to slip to the next line?)
+	// ELSE: yes
+	// TRY, CATCH, FINALLY: yes
+	// THROW, SWITCH: no
+	// CASE: yes
+	return act >= ACT_TRY ? (act <= ACT_FINALLY || act == ACT_CASE)
+		: act == ACT_ELSE || act == ACT_BLOCK_BEGIN;
+}
+
+Line *Debugger::FindFirstLineForBreakpoint(int file_index, UINT line_no)
+{
+	Line *found_line = nullptr;
+	for (auto mod = g_script.mLastModule; mod; mod = mod->mPrev)
+	for (Line *line = mod->mFirstLine; line; line = line->mNextLine)
+	{
+		if (line->mFileIndex == file_index && line->mLineNumber >= line_no)
+		{
+			// ACT_ELSE and ACT_BLOCK_BEGIN generally don't cause PreExecLine() to be called,
+			// so any breakpoint set on one of those lines would never be hit.  Attempting to
+			// set a breakpoint on one of these should act like setting a breakpoint on a line
+			// which contains no code: put the breakpoint at the next line instead.
+			// ACT_CASE executes when the *previous* case reaches its end, so for that case
+			// we want to shift the breakpoint to the first Line after the ACT_CASE.
+			if (BreakpointLineIsSlippery(line))
+				continue;
+			// Use the first line of code at or after lineno, like Visual Studio.
+			// To display the breakpoint correctly, an IDE should use breakpoint_get.
+			if (!found_line || found_line->mLineNumber > line->mLineNumber)
+				found_line = line;
+			if (line->mLineNumber == line_no)
+				break;
+			//else must keep searching, since class var initializers can cause lines to be listed out of order.
+		}
+	}
+	return found_line;
+}
+
+Breakpoint *Debugger::CreateBreakpoint()
+{
+	auto bp = new Breakpoint();
+	mLastBreakpoint->next = bp;
+	mLastBreakpoint = bp;
+	return bp;
+}
+
+void Debugger::DeleteBreakpoint(Breakpoint *aBp)
+{
+	// aBp != mFirstBreakpoint, because that's currently always &mBreakOnException.
+	for (Breakpoint *p = mFirstBreakpoint;; p = p->next)
+	{
+		if (p->next == aBp)
+		{
+			p->next = aBp->next;
+			if (mLastBreakpoint == aBp)
+				mLastBreakpoint = p;
+			break;
+		}
+	}
+	delete aBp;
+}
+
+// Set Line::mBreakpoint for all executable lines that share the line's number,
+// such as an expression and any fat arrow function's it contains, or all param
+// default initializers in e.g. `Fn(a:=[], b:={}) {`.
+void Debugger::SetBreakpointForLineGroup(Line *line, Breakpoint *bp)
+{
+	auto line_no = line->mLineNumber;
+	auto file_no = line->mFileIndex;
+	line->mBreakpoint = bp;
+	for (int i = 0; i < g_script.mFuncs.mCount; ++i)
+	{
+		ASSERT(dynamic_cast<UserFunc*>(g_script.mFuncs.mItem[i]));
+		auto &func = *(UserFunc *)g_script.mFuncs.mItem[i];
+		auto fl = func.mJumpToLine;
+		// Fat arrow functions are either removed from the main line list or come after the
+		// line which contains them, in which case our caller would have found the latter.
+		if (fl->mLineNumber == line_no && fl->mFileIndex == file_no && func.mIsFuncExpression)
+			fl->mBreakpoint = bp;
+		// After the script loads, a function's parameter default initializers precede mJumpToLine.
+		for (fl = fl->mPrevLine
+			; fl->mLineNumber == line_no && fl->mFileIndex == file_no && fl->mActionType == ACT_EXPRESSION
+			; fl = fl->mPrevLine)
+			fl->mBreakpoint = bp;
+	}
+}
+
+
 // PreExecLine: aLine is about to execute; handle current line marker, breakpoints and step into/over/out.
 int Debugger::PreExecLine(Line *aLine)
 {
@@ -85,6 +189,9 @@ int Debugger::PreExecLine(Line *aLine)
 	// small amount of complexity in stack_get (which is only called by request of the debugger client):
 	//	mStack.mTop->line = aLine;
 	mCurrLine = aLine;
+
+	if (mProcessingCommands) // Reentry into ProcessCommands() isn't possible, so Break() would be ignored.
+		return DEBUGGER_E_OK; // Skip the rest; in particular, don't delete any temporary breakpoints.
 	
 	// Check for a breakpoint on the current line:
 	Breakpoint *bp = aLine->mBreakpoint;
@@ -92,8 +199,11 @@ int Debugger::PreExecLine(Line *aLine)
 	{
 		if (bp->temporary)
 		{
-			aLine->mBreakpoint = NULL;
-			delete bp;
+			Line *line = aLine, *prev;
+			while ((prev = line->mPrevLine) && prev->mLineNumber == line->mLineNumber && prev->mFileIndex == line->mFileIndex)
+				line = prev;
+			SetBreakpointForLineGroup(line, nullptr);
+			DeleteBreakpoint(bp);
 		}
 		return Break();
 	}
@@ -101,9 +211,10 @@ int Debugger::PreExecLine(Line *aLine)
 	if ((mInternalState == DIS_StepInto
 		|| mInternalState == DIS_StepOver && mStack.Depth() <= mContinuationDepth
 		|| mInternalState == DIS_StepOut && mStack.Depth() < mContinuationDepth) // Due to short-circuit boolean evaluation, mStack.Depth() is only evaluated once and only if mInternalState is StepOver or StepOut.
-		// Although IF/ELSE/LOOP skips its block-begin, standalone/function-body block-begin still gets here; we want to skip it:
-		&& aLine->mActionType != ACT_BLOCK_BEGIN && (aLine->mActionType != ACT_BLOCK_END || aLine->mAttribute) // Ignore { and }; except for function-end, since we want to break there after a "return" to inspect variables while they're still in scope.
-		&& aLine->mLineNumber) // Some scripts (i.e. LowLevel/code.ahk) use mLineNumber==0 to indicate the Line has been generated and injected by the script.
+		// Although IF/ELSE/LOOP skips its block-begin, standalone/function-body block-begin still gets here; we want to skip it,
+		// unless it's the block-end of a function, to allow breaking there after a "return" to inspect variables while still in scope.
+		&& !PreExecLineIsSlippery(aLine)
+		&& aLine->mLineNumber) // Lines with no number should be skipped (e.g. lines inserted by Script::DefineClassInit).
 	{
 		return Break();
 	}
@@ -122,6 +233,37 @@ int Debugger::PreExecLine(Line *aLine)
 }
 
 
+void Debugger::LeaveFunction()
+{
+	// If the debugger is stepping out from a user-defined function, break at the line
+	// which called the function.  Otherwise, a step might appear to jump from one
+	// function to another called by the same line, or to the next line, or to some line
+	// further up the stack.  Into/Over count as stepping out only if the function we're
+	// leaving is the one in which the step command was issued.
+	if (mInternalState == DIS_StepInto
+		|| ((mInternalState == DIS_StepOut || mInternalState == DIS_StepOver)
+			&& mStack.Depth() < mContinuationDepth) // Always '<' and not '<=' (for StepOver) because we just returned from a function call.
+		&& mStack.mTop > mStack.mBottom) // More than one entry, otherwise mCurrLine has no meaning.
+		PreExecLine(mCurrLine);
+}
+
+
+bool Debugger::PreThrow(ExprTokenType *aException)
+{
+	if (mBreakOnException.state != BS_Enabled)
+		return false;
+	if (mBreakOnException.temporary)
+		mBreakOnException.state = BS_Disabled;
+	mThrownToken = aException;
+	// The spec doesn't provide a way to differentiate between handled and unhandled exceptions,
+	// nor when to use the "exception" and "error" statuses, so we'll use them for that:
+	Break((g->ExcptMode & EXCPTMODE_CATCH) ? "exception" : "error");
+	bool suppress_default_handling = mThrownToken == NULL; // Signal from client via property_set.
+	mThrownToken = NULL;
+	return suppress_default_handling;
+}
+
+
 bool Debugger::HasPendingCommand()
 // Returns true if there is data in the socket's receive buffer.
 // This is used for receiving commands asynchronously.
@@ -133,17 +275,22 @@ bool Debugger::HasPendingCommand()
 }
 
 
-int Debugger::EnterBreakState()
+int Debugger::EnterBreakState(LPCSTR aReason)
 {
-	if (mInternalState != DIS_Starting && mInternalState != DIS_Break)
-		// Send a response for the previous continuation command.
-		if (int err = SendContinuationResponse())
-			return err;
-	// Remove keyboard/mouse hooks.
-	if (mDisabledHooks = GetActiveHooks())
-		AddRemoveHooks(0, true);
-	// Set break state.
-	mInternalState = DIS_Break;
+	if (mInternalState != DIS_Break)
+	{
+		if (mInternalState != DIS_Starting)
+			// Send a response for the previous continuation command.
+			if (int err = SendContinuationResponse(nullptr, "break", aReason))
+				return err;
+		// Remove keyboard/mouse hooks.
+		if (mDisabledHooks = GetActiveHooks())
+			AddRemoveHooks(0, true);
+		// Set break state.
+		mInternalState = DIS_Break;
+	}
+	//else: no continuation command has been received so send no "response".
+	// Hooks were already removed and mDisabledHooks must not be overwritten.
 	return DEBUGGER_E_OK;
 }
 
@@ -159,25 +306,47 @@ void Debugger::ExitBreakState()
 }
 
 
-int Debugger::Break()
+int Debugger::Break(LPCSTR aReason)
 {
-	int err = EnterBreakState();
-	if (!err)
-		err = ProcessCommands();
-	return err;
+	return ProcessCommands(aReason);
 }
 
 
 const int MAX_DBGP_ARGS = 16; // More than currently necessary.
 
-int Debugger::ProcessCommands()
+int Debugger::ProcessCommands(LPCSTR aBreakReason)
 {
+	int err;
+
+	// The command loop isn't designed to support re-entry, so that is prevented by
+	// the following check.  Re-entry could otherwise occur if a command causes script
+	// to execute and then a command is received asynchonously or a breakpoint is hit.
+	// Such commands include:
+	//  - property_get when evaluation of an object property is required.
+	//  - property_set when an object with __delete is released.
+	// Note that both the executing command and pending command could be asynchronous.
+	// Although re-entry could be supported by preserving data already in the buffers,
+	// more complexity would be needed to ensure each command is given the chance to
+	// complete before another one is pushed onto the stack (otherwise, rapid commands
+	// could cause stack exhaustion).
+	if (mProcessingCommands)
+		return DEBUGGER_E_OK;
+	if (aBreakReason)
+		if (err = EnterBreakState(aBreakReason))
+			return err;
+	mProcessingCommands = true;
+	// Set a non-zero ExcptMode so that UnhandledException will be called for runtime
+	// errors, and use EXCPTMODE_DEBUGGER so that UnhandledException will immediately
+	// free the exception and return FAIL without doing any reporting.
+	// Any ExcptMode flags of the interrupted thread don't apply to code executed by the
+	// debugger, since it isn't executing within or being called by the current block.
+	auto excptmode = g->ExcptMode;
+	g->ExcptMode = EXCPTMODE_DEBUGGER;
+
 	// Disable notification of READ readiness and reset socket to synchronous mode.
 	u_long zero = 0;
 	WSAAsyncSelect(mSocket, g_hWnd, 0, 0);
 	ioctlsocket(mSocket, FIONBIO, &zero);
-
-	int err;
 
 	for (;;)
 	{
@@ -256,21 +425,29 @@ int Debugger::ProcessCommands()
 		// Remove this command and its args from the buffer.
 		// (There may be additional commands following it.)
 		if (mCommandBuf.mDataUsed) // i.e. it hasn't been cleared as a result of disconnecting.
-			mCommandBuf.Remove(command_length + 1);
+			mCommandBuf.Delete(command_length + 1);
 
 		// If a command is received asynchronously, the debugger does not
 		// enter a break state.  In that case, we need to return after each
 		// command to avoid blocking in recv().
 		if (mInternalState != DIS_Break)
+		{
+			// As ExitBreakState() can cause re-entry into ReceiveCommand() via the message pump,
+			// it is safe to call only now that the command has been removed from the buffer.
+			if (mInternalState != DIS_Starting) // i.e. it hasn't already been called by Disconnect().
+				ExitBreakState();
 			break;
+		}
 	}
 	ASSERT(mInternalState != DIS_Break);
+	mProcessingCommands = false;
+	g->ExcptMode = excptmode;
 	// Register for message-based notification of data arrival.  If a command
 	// is received asynchronously, control will be passed back to the debugger
 	// to process it.  This allows the debugger engine to respond even if the
 	// script is sleeping or waiting for messages.
 	if (mSocket != INVALID_SOCKET)
-		WSAAsyncSelect(mSocket, g_hWnd, AHK_CHECK_DEBUGGER, FD_READ);
+		WSAAsyncSelect(mSocket, g_hWnd, AHK_CHECK_DEBUGGER, FD_READ | FD_CLOSE);
 	return err;
 }
 
@@ -308,14 +485,35 @@ int Debugger::ParseArgs(char *aArgs, char **aArgV, int &aArgCount, char *&aTrans
 
 		if (arg_char == '-') // -- base64-encoded-data
 			break;
-		
-		// Find where this arg's value ends and the next arg begins.
-		char *next_arg = strstr(aArgs + 1, " -");
-		if (!next_arg)
-			break;
 
-		// Terminate this arg.
-		*next_arg = '\0';
+		char *next_arg;
+		if (aArgs[1] == '"')
+		{
+			char *arg_end;
+			for (arg_end = aArgs + 1, next_arg = aArgs + 2; *next_arg != '"'; ++arg_end, ++next_arg)
+			{
+				if (*next_arg == '\\')
+					++next_arg; // Currently only \\ and \" are supported; i.e. mark next char as literal.
+				if (!*next_arg)
+					return DEBUGGER_E_PARSE_ERROR;
+				// Copy the value to eliminate the quotes and escape sequences.
+				*arg_end = *next_arg;
+			}
+			*arg_end = '\0'; // Terminate this arg.
+			++next_arg;
+			if (!*next_arg)
+				break;
+			if (strncmp(next_arg, " -", 2))
+				return DEBUGGER_E_PARSE_ERROR;
+		}
+		else
+		{
+			// Find where this arg's value ends and the next arg begins.
+			next_arg = strstr(aArgs + 1, " -");
+			if (!next_arg)
+				break;
+			*next_arg = '\0'; // Terminate this arg.
+		}
 		
 		// Point aArgs to the next arg's hyphen.
 		aArgs = next_arg + 1;
@@ -367,11 +565,7 @@ DEBUGGER_COMMAND(Debugger::feature_get)
 		else if (!strcmp(feature_name + 9, "name"))
 			setting = DEBUGGER_LANG_NAME;
 		else if (!strcmp(feature_name + 9, "version"))
-#ifdef UNICODE
-			setting = AHK_VERSION " (Unicode)";
-#else
 			setting = AHK_VERSION;
-#endif
 	} else if (!strcmp(feature_name, "encoding"))
 		setting = "UTF-8";
 	else if (!strcmp(feature_name, "protocol_version")
@@ -380,7 +574,7 @@ DEBUGGER_COMMAND(Debugger::feature_get)
 	// Not supported: data_encoding - assume base64.
 	// Not supported: breakpoint_languages - assume only %language_name% is supported.
 	else if (!strcmp(feature_name, "breakpoint_types"))
-		setting = "line";
+		setting = "line exception";
 	else if (!strcmp(feature_name, "multiple_sessions"))
 		setting = "0";
 	else if (!strcmp(feature_name, "max_data"))
@@ -485,7 +679,6 @@ int Debugger::run_step(char **aArgV, int aArgCount, char *aTransactionId, char *
 	if (mInternalState != DIS_Break)
 		return DEBUGGER_E_COMMAND_UNAVAIL;
 
-	ExitBreakState();
 	mInternalState = aNewState;
 	mContinuationDepth = mStack.Depth();
 	mContinuationTransactionId = aTransactionId;
@@ -507,7 +700,7 @@ DEBUGGER_COMMAND(Debugger::stop)
 {
 	mContinuationTransactionId = aTransactionId;
 
-	// Call g_script.TerminateApp instead of g_script.ExitApp to bypass OnExit subroutine.
+	// Call g_script.TerminateApp instead of g_script.ExitApp to bypass OnExit function.
 	g_script.TerminateApp(EXIT_EXIT, 0); // This also causes this->Exit() to be called.
 	
 	// Should never be reached, but must be here to avoid a compile error:
@@ -561,21 +754,36 @@ DEBUGGER_COMMAND(Debugger::breakpoint_set)
 			temporary = (*value != '0');
 			break;
 			
-		case 'm': // function
 		case 'x': // exception
+			if (!stricmp(value, "Any")) // Require this or nothing, for now.
+				break;
+			return DEBUGGER_E_INVALID_OPTIONS;
+
+		case 'm': // function
 		case 'h': // hit_value
 		case 'o': // hit_condition = >= | == | %
 		case '-': // expression for conditional breakpoints
-			// These aren't used/supported, but ignored for now.
-			break;
-
+			// These aren't used/supported.
 		default:
 			return DEBUGGER_E_INVALID_OPTIONS;
 		}
 	}
 
-	if (!type || strcmp(type, "line")) // i.e. type != "line"
+	// Breakpoint type is required according to the spec, but allowing it to be omitted
+	// and defaulting to "line" is more convenient for debugging the debugger via console.
+	if (type && strcmp(type, "line")) // i.e. type was specified and is not "line".
+	{
+		if (!strcmp(type, "exception") && lineno == 0 && !filename)
+		{
+			mBreakOnException.state = state;
+			mBreakOnException.temporary = temporary;
+			
+			return mResponseBuf.WriteF(
+				"<response command=\"breakpoint_set\" transaction_id=\"%e\" state=\"%s\" id=\"%i\"/>"
+				, aTransactionId, state ? "enabled" : "disabled", mBreakOnException.id);
+		}
 		return DEBUGGER_E_BREAKPOINT_TYPE;
+	}
 	if (lineno < 1)
 		return DEBUGGER_E_BREAKPOINT_INVALID;
 
@@ -596,62 +804,34 @@ DEBUGGER_COMMAND(Debugger::breakpoint_set)
 			return DEBUGGER_E_BREAKPOINT_INVALID;
 	}
 
-	Line *line = NULL, *found_line = NULL;
-	// Due to the introduction of expressions in static initializers, lines aren't necessarily in
-	// line number order.  First determine if any static initializers match the requested lineno.
-	// If not, use the first non-static line at or following that line number.
-
-	if (g_script.mFirstStaticLine)
-		for (line = g_script.mFirstStaticLine; ; line = line->mNextLine)
-		{
-			if (line->mFileIndex == file_index && line->mLineNumber == lineno) // Exact match, unlike normal lines.
-			{
-				found_line = line;
-				break;
-			}
-			if (line == g_script.mLastStaticLine)
-				break;
-		}
-	if (!found_line)
-		// If line is non-NULL, above has left it set to mLastStaticLine, which we want to exclude:
-		for (line = line ? line->mNextLine : g_script.mFirstLine; line; line = line->mNextLine)
-			if (line->mFileIndex == file_index && line->mLineNumber >= lineno)
-			{
-				// ACT_ELSE and ACT_BLOCK_BEGIN generally don't cause PreExecLine() to be called,
-				// so any breakpoint set on one of those lines would never be hit.  Attempting to
-				// set a breakpoint on one of these should act like setting a breakpoint on a line
-				// which contains no code: put the breakpoint at the next line instead.
-				// Without this check, setting a breakpoint on a line like "else Exit" would not work.
-				if (line->mActionType == ACT_ELSE || line->mActionType == ACT_BLOCK_BEGIN)
-					continue;
-				// Use the first line of code at or after lineno, like Visual Studio.
-				// To display the breakpoint correctly, an IDE should use breakpoint_get.
-				if (!found_line || found_line->mLineNumber > line->mLineNumber)
-					found_line = line;
-				// Must keep searching, since class var initializers can cause lines to be listed out of order.
-				//break;
-			}
-	if (found_line)
+	if (auto line = FindFirstLineForBreakpoint(file_index, lineno))
 	{
-		if (!found_line->mBreakpoint)
-			found_line->mBreakpoint = new Breakpoint();
-		found_line->mBreakpoint->state = state;
-		found_line->mBreakpoint->temporary = temporary;
+		Breakpoint *bp = line->mBreakpoint;
+		if (!bp)
+		{
+			bp = CreateBreakpoint();
+			bp->line = line;
+			SetBreakpointForLineGroup(line, bp);
+		}
+		bp->state = state;
+		bp->temporary = temporary;
 
 		return mResponseBuf.WriteF(
 			"<response command=\"breakpoint_set\" transaction_id=\"%e\" state=\"%s\" id=\"%i\"/>"
-			, aTransactionId, state ? "enabled" : "disabled", found_line->mBreakpoint->id);
+			, aTransactionId, state ? "enabled" : "disabled", bp->id);
 	}
 	// There are no lines of code beginning at or after lineno.
 	return DEBUGGER_E_BREAKPOINT_INVALID;
 }
 
-int Debugger::WriteBreakpointXml(Breakpoint *aBreakpoint, Line *aLine)
+int Debugger::WriteBreakpointXml(Breakpoint *aBreakpoint)
 {
-	mResponseBuf.WriteF("<breakpoint id=\"%i\" type=\"line\" state=\"%s\" filename=\""
-					, aBreakpoint->id, aBreakpoint->state ? "enabled" : "disabled");
-	mResponseBuf.WriteFileURI(U4T(Line::sSourceFile[aLine->mFileIndex]));
-	return mResponseBuf.WriteF("\" lineno=\"%u\"/>", aLine->mLineNumber);
+	if (aBreakpoint->type == BT_Exception)
+		return mResponseBuf.WriteF("<breakpoint id=\"%i\" type=\"exception\" state=\"%s\" exception=\"Any\"/>"
+			, aBreakpoint->id, aBreakpoint->state == BS_Enabled ? "enabled" : "disabled");
+	return mResponseBuf.WriteF("<breakpoint id=\"%i\" type=\"line\" state=\"%s\" filename=\"%r\" lineno=\"%u\"/>"
+		, aBreakpoint->id, aBreakpoint->state ? "enabled" : "disabled"
+		, Line::sSourceFile[aBreakpoint->line->mFileIndex], aBreakpoint->line->mLineNumber);
 }
 
 DEBUGGER_COMMAND(Debugger::breakpoint_get)
@@ -662,13 +842,12 @@ DEBUGGER_COMMAND(Debugger::breakpoint_get)
 
 	int breakpoint_id = atoi(ArgValue(aArgV, 0));
 
-	Line *line;
-	for (line = g_script.mFirstLine; line; line = line->mNextLine)
+	for (auto bp = mFirstBreakpoint; bp; bp = bp->next)
 	{
-		if (line->mBreakpoint && line->mBreakpoint->id == breakpoint_id)
+		if (bp->id == breakpoint_id)
 		{
 			mResponseBuf.WriteF("<response command=\"breakpoint_get\" transaction_id=\"%e\">", aTransactionId);
-			WriteBreakpointXml(line->mBreakpoint, line);
+			WriteBreakpointXml(bp);
 			mResponseBuf.Write("</response>");
 
 			return DEBUGGER_E_OK;
@@ -682,7 +861,7 @@ DEBUGGER_COMMAND(Debugger::breakpoint_update)
 {
 	char arg, *value;
 	
-	int breakpoint_id = 0; // Breakpoint IDs begin at 1.
+	int breakpoint_id = -1;
 	LineNumberType lineno = 0;
 	char state = -1;
 
@@ -693,6 +872,8 @@ DEBUGGER_COMMAND(Debugger::breakpoint_update)
 		switch (arg)
 		{
 		case 'd':
+			if (!cisdigit(*value))
+				return DEBUGGER_E_INVALID_OPTIONS;
 			breakpoint_id = atoi(value);
 			break;
 
@@ -719,38 +900,24 @@ DEBUGGER_COMMAND(Debugger::breakpoint_update)
 		}
 	}
 
-	if (!breakpoint_id)
-		return DEBUGGER_E_INVALID_OPTIONS;
-
-	Line *line;
-	for (line = g_script.mFirstLine; line; line = line->mNextLine)
+	for (auto bp = mFirstBreakpoint; bp; bp = bp->next)
 	{
-		Breakpoint *bp = line->mBreakpoint;
-
-		if (bp && bp->id == breakpoint_id)
+		if (bp->id == breakpoint_id)
 		{
-			if (lineno && line->mLineNumber != lineno)
+			if (lineno && !bp->line)
+				return DEBUGGER_E_INVALID_OPTIONS;
+
+			if (lineno && bp->line->mLineNumber != lineno)
 			{
 				// Move the breakpoint within its current file.
-				int file_index = line->mFileIndex;
-				Line *old_line = line;
-
-				for (line = g_script.mFirstLine; line; line = line->mNextLine)
+				Line *new_line = FindFirstLineForBreakpoint(bp->line->mFileIndex, lineno);
+				if (new_line != bp->line)
 				{
-					if (line->mFileIndex == file_index && line->mLineNumber >= lineno)
-					{
-						line->mBreakpoint = bp;
-						break;
-					}
+					if (!new_line)
+						return DEBUGGER_E_BREAKPOINT_INVALID;
+					SetBreakpointForLineGroup(bp->line, nullptr);
+					SetBreakpointForLineGroup(new_line, bp);
 				}
-
-				// If line is NULL, the line was not found.
-				if (!line)
-					return DEBUGGER_E_BREAKPOINT_INVALID;
-
-				// Seems best to only remove the breakpoint from its previous line
-				// once we know the breakpoint_update has succeeded.
-				old_line->mBreakpoint = NULL;
 			}
 
 			if (state != -1)
@@ -769,16 +936,24 @@ DEBUGGER_COMMAND(Debugger::breakpoint_remove)
 	if (aArgCount != 1 || ArgChar(aArgV, 0) != 'd')
 		return DEBUGGER_E_INVALID_OPTIONS;
 
-	int breakpoint_id = atoi(ArgValue(aArgV, 0));
-
-	Line *line;
-	for (line = g_script.mFirstLine; line; line = line->mNextLine)
+	auto arg = ArgValue(aArgV, 0);
+	if (!cisdigit(*arg)) // Don't interpret empty/non-numeric values as ID 0.
+		return DEBUGGER_E_INVALID_OPTIONS;
+	int breakpoint_id = atoi(arg);
+	
+	if (breakpoint_id == mBreakOnException.id)
 	{
-		if (line->mBreakpoint && line->mBreakpoint->id == breakpoint_id)
-		{
-			delete line->mBreakpoint;
-			line->mBreakpoint = NULL;
+		mBreakOnException.state = BS_Disabled;
+		return DEBUGGER_E_OK;
+	}
 
+	// mFirstBreakpoint itself is currently always &mBreakOnException.
+	for (auto bp = mFirstBreakpoint->next; bp; bp = bp->next)
+	{
+		if (bp->id == breakpoint_id)
+		{
+			SetBreakpointForLineGroup(bp->line, nullptr);
+			DeleteBreakpoint(bp);
 			return DEBUGGER_E_OK;
 		}
 	}
@@ -793,14 +968,8 @@ DEBUGGER_COMMAND(Debugger::breakpoint_list)
 	
 	mResponseBuf.WriteF("<response command=\"breakpoint_list\" transaction_id=\"%e\">", aTransactionId);
 	
-	Line *line;
-	for (line = g_script.mFirstLine; line; line = line->mNextLine)
-	{
-		if (line->mBreakpoint)
-		{
-			WriteBreakpointXml(line->mBreakpoint, line);
-		}
-	}
+	for (auto bp = mFirstBreakpoint->state ? mFirstBreakpoint : mFirstBreakpoint->next; bp; bp = bp->next)
+		WriteBreakpointXml(bp);
 
 	return mResponseBuf.Write("</response>");
 }
@@ -846,10 +1015,11 @@ DEBUGGER_COMMAND(Debugger::stack_get)
 			else if (se->type == DbgStack::SE_Thread)
 			{
 				// !se->line implies se->type == SE_Thread.
-				if (se[1].type == DbgStack::SE_Func)
-					line = se[1].func->mJumpToLine;
-				else if (se[1].type == DbgStack::SE_Sub)
-					line = se[1].sub->mJumpToLine;
+				if (se->desc != g_AutoExecuteThreadDesc && se[1].type == DbgStack::SE_UDF)
+					// Show the function's jump-to line since se->line is most likely whatever line
+					// this thread interrupted.  Don't do it for the auto-execute thread since in
+					// that case the function doesn't represent the thread's overall execution.
+					line = se[1].udf->func->mJumpToLine;
 				else
 					// The auto-execute thread is probably the only one that can exist without
 					// a Sub or Func entry immediately above it.  As se != mStack.mTop, se->line
@@ -860,19 +1030,18 @@ DEBUGGER_COMMAND(Debugger::stack_get)
 			{
 				line = se->line;
 			}
-			mResponseBuf.WriteF("<stack level=\"%i\" type=\"file\" filename=\"", level);
-			mResponseBuf.WriteFileURI(U4T(Line::sSourceFile[line->mFileIndex]));
-			mResponseBuf.WriteF("\" lineno=\"%u\" where=\"", line->mLineNumber);
+			mResponseBuf.WriteF("<stack level=\"%i\" type=\"file\" filename=\"%r\" lineno=\"%u\" where=\""
+				, level, Line::sSourceFile[line->mFileIndex], line->mLineNumber);
 			switch (se->type)
 			{
 			case DbgStack::SE_Thread:
 				mResponseBuf.WriteF("%e thread", U4T(se->desc)); // %e to escape characters which desc may contain (e.g. "a & b" in hotkey name).
 				break;
-			case DbgStack::SE_Func:
-				mResponseBuf.WriteF("%s()", U4T(se->func->mName)); // %s because function names should never contain characters which need escaping.
+			case DbgStack::SE_UDF:
+				mResponseBuf.WriteF("%e()", U4T(se->udf->func->mName));
 				break;
-			case DbgStack::SE_Sub:
-				mResponseBuf.WriteF("%e sub", U4T(se->sub->mName)); // %e because label/hotkey names may contain almost anything.
+			case DbgStack::SE_BIF:
+				mResponseBuf.WriteF("%e()", U4T(se->func->mName));
 				break;
 			}
 			mResponseBuf.Write("\"/>");
@@ -895,7 +1064,7 @@ DEBUGGER_COMMAND(Debugger::context_names)
 
 DEBUGGER_COMMAND(Debugger::context_get)
 {
-	int err;
+	int err = DEBUGGER_E_OK;
 	char arg, *value;
 
 	int context_id = 0, depth = 0;
@@ -907,34 +1076,27 @@ DEBUGGER_COMMAND(Debugger::context_get)
 		switch (arg)
 		{
 		case 'c':	context_id = atoi(value);	break;
-		case 'd':	depth = atoi(value);		break;
+		case 'd':
+			depth = atoi(value);
+			if (depth && (depth < 0 || depth >= mStack.Depth())) // Allow depth 0 even when stack is empty.
+				return DEBUGGER_E_INVALID_STACK_DEPTH;
+			break;
 		default:
 			return DEBUGGER_E_INVALID_OPTIONS;
 		}
 	}
 
-	// TODO: Support setting/retrieving variables at a given stack depth. See also property_get_or_value and property_set.
-	if (depth != 0)
-		return DEBUGGER_E_INVALID_STACK_DEPTH;
-
-	Var **var, **var_end; // An array of pointers-to-var.
+	// Two lists are used to support static and non-static variables, both of which
+	// are seen to be in "local" context, since they are in the same namespace (and
+	// it never makes sense to have a static and non-static with the same name).
+	// Non-static variables are expected to be used more often, so are listed first.
+	VarList *var_lists[2] = { nullptr, nullptr };
+	VarBkp *bkp = NULL, *bkp_end = NULL;
 	
-	// TODO: Include the lazy-var arrays for completeness. Low priority since lazy-var arrays are used only for 10001+ variables, and most conventional debugger interfaces would generally not be useful with that many variables.
 	if (context_id == PC_Local)
-	{
-		if (g->CurrentFunc)
-		{
-			var = g->CurrentFunc->mVar;
-			var_end = var + g->CurrentFunc->mVarCount;
-		}
-		else
-			var_end = var = NULL;
-	}
+		mStack.GetLocalVars(depth, var_lists[0], var_lists[1], bkp, bkp_end);
 	else if (context_id == PC_Global)
-	{
-		var = g_script.mVar;
-		var_end = var + g_script.mVarCount;
-	}
+		var_lists[0] = g_script.GlobalVars();
 	else
 		return DEBUGGER_E_INVALID_CONTEXT;
 
@@ -942,9 +1104,31 @@ DEBUGGER_COMMAND(Debugger::context_get)
 		"<response command=\"context_get\" context=\"%i\" transaction_id=\"%e\">"
 		, context_id, aTransactionId);
 
-	for ( ; var < var_end; ++var)
-		if (err = WritePropertyXml(**var, mMaxPropertyData))
-			return err;
+	TCHAR value_buf[_f_retval_buf_size];
+	CStringA name_buf;
+	PropertyInfo prop(name_buf, value_buf);
+	prop.max_data = mMaxPropertyData;
+	prop.pagesize = mMaxChildren;
+	prop.max_depth = mMaxDepth;
+	for ( ; bkp < bkp_end; ++bkp)
+		if (bkp->mType != VAR_CONSTANT) // Exclude closures.
+			if (  (err = GetPropertyInfo(*bkp, prop))
+				|| (err = WritePropertyXml(prop, bkp->mVar->mName))  )
+				break;
+	for (int j = 0; j < _countof(var_lists); ++j)
+	{
+		if (!var_lists[j])
+			continue;
+		Var **vars = var_lists[j]->mItem;
+		int var_count = var_lists[j]->mCount;
+		for (int i = 0; i < var_count; ++i)
+			if (vars[i]->mType != VAR_CONSTANT || context_id != PC_Local) // Exclude closures.
+				if (  (err = GetPropertyInfo(*vars[i], prop))
+					|| (err = WritePropertyXml(prop, vars[i]->mName))  )
+					break;
+	}
+	if (err)
+		return err;
 
 	return mResponseBuf.Write("</response>");
 }
@@ -975,60 +1159,53 @@ DEBUGGER_COMMAND(Debugger::property_value)
 }
 
 
-int Debugger::WritePropertyXml(Var &aVar, int aMaxEncodedSize, int aPage)
+int Debugger::GetPropertyInfo(Var &aVar, PropertyInfo &aProp)
 {
-	char facet[35]; // Alias Builtin Static ClipboardAll
-	facet[0] = '\0';
-	VarAttribType attrib;
-	if (aVar.mType == VAR_ALIAS)
-	{
-		strcat(facet, "Alias ");
-		attrib = aVar.mAliasFor->mAttrib;
-	}
-	else
-		attrib = aVar.mAttrib;
-	if (aVar.Type() == VAR_BUILTIN)
-		strcat(facet, "Builtin ");
-	if (aVar.IsStatic())
-		strcat(facet, "Static ");
-	if (aVar.IsBinaryClip())
-		strcat(facet, "ClipboardAll ");
-	if (facet[0] != '\0') // Remove the final space.
-		facet[strlen(facet)-1] = '\0';
-
-	if (attrib & VAR_ATTRIB_OBJECT)
-	{
-		CStringUTF8FromTChar name_buf(aVar.mName);
-		return WritePropertyXml(aVar.Object(), name_buf.GetString(), name_buf, aPage, mMaxChildren, mMaxDepth, aMaxEncodedSize, facet);
-	}
-
-	char *type;
-	if (attrib & VAR_ATTRIB_HAS_VALID_INT64)
-		type = "integer";
-	else if (attrib & VAR_ATTRIB_HAS_VALID_DOUBLE)
-		type = "float";
-	else if (attrib & VAR_ATTRIB_UNINITIALIZED)
-		type = "undefined";
-	else
-		type = "string";
-
-	// Write as much as possible now to simplify calculation of required buffer space.
-	// We can't write the data size yet as it needs to be UTF-8 encoded (see WritePropertyData).
-	mResponseBuf.WriteF("<property name=\"%s\" fullname=\"%s\" type=\"%s\" facet=\"%s\" children=\"0\" encoding=\"base64\" size=\""
-						, U4T(aVar.mName), U4T(aVar.mName), type, facet);
-
-	if (int err = WritePropertyData(aVar, aMaxEncodedSize))
-		return err;
-
-	return mResponseBuf.Write("</property>");
+	aProp.is_alias = aVar.mType == VAR_ALIAS;
+	aProp.is_static = aVar.IsStatic();
+	aProp.is_builtin = aVar.mType == VAR_VIRTUAL;
+	aProp.kind = PropValue;
+	aProp.invokee = nullptr;
+	return GetPropertyValue(aVar, aProp.value);
 }
 
-int Debugger::WritePropertyXml(IObject *aObject, const char *aName, CStringA &aNameBuf, int aPage, int aPageSize, int aDepthRemaining, int aMaxEncodedSize, char *aFacet)
+int Debugger::GetPropertyInfo(VarBkp &aBkp, PropertyInfo &aProp)
 {
-	PropertyWriter pw(*this, aObject, aName, aNameBuf, aPage, aPageSize, aDepthRemaining, aMaxEncodedSize);
-	// Ask the object to write out its properties:
-	aObject->DebugWriteProperty(&pw, aPage, aPageSize, aDepthRemaining);
-	aNameBuf.Truncate(pw.mNameLength);
+	Var temp; // Never freed, as that would invalidate aBkp.
+	temp.Restore(aBkp);
+	return GetPropertyInfo(temp, aProp);
+}
+
+int Debugger::GetPropertyValue(Var &aVar, ResultToken &aValue)
+{
+	aValue.Free();
+	aValue.InitResult(aValue.buf);
+	aVar.Get(aValue);
+	return aValue.Exited() ? DEBUGGER_E_EVAL_FAIL : DEBUGGER_E_OK;
+}
+
+int Debugger::GetPropertyValue(VarBkp &aBkp, ResultToken &aValue)
+{
+	Var temp; // Never freed, as that would invalidate aBkp.
+	temp.Restore(aBkp);
+	return GetPropertyValue(temp, aValue);
+}
+
+
+int Debugger::WritePropertyObjectXml(PropertyInfo &aProp)
+{
+	ASSERT(aProp.value.symbol == SYM_OBJECT || aProp.invokee);
+	if (!aProp.invokee)
+		aProp.invokee = aProp.value.object;
+	PropertyWriter pw(*this, aProp);
+	// Write out the object's properties.
+	Object *defs;
+	if (aProp.invokee->IsOfType(Object::sPrototype))
+		defs = static_cast<Object*>(aProp.invokee);
+	else
+		defs = aProp.invokee->Base();
+	defs->DebugWriteProperty(&pw, aProp.page, aProp.pagesize, aProp.max_depth);
+	aProp.fullname.Truncate(pw.mNameLength);
 	// For simplicity/code size, instead of requiring error handling in aObject,
 	// any failure during the above sets pw.mError, which causes it to ignore
 	// any further method calls.  Since we're finished now, return the error
@@ -1036,137 +1213,207 @@ int Debugger::WritePropertyXml(IObject *aObject, const char *aName, CStringA &aN
 	return pw.mError;
 }
 
+
 void Object::DebugWriteProperty(IDebugProperties *aDebugger, int aPage, int aPageSize, int aDepth)
 {
-	DebugCookie cookie;
-	aDebugger->BeginProperty(NULL, "object", (int)mFieldCount + (mBase != NULL), cookie);
+	auto enum_method = IsClassPrototype() ? nullptr : GetMethod(_T("__Enum"));
+	int num_children = (int)mFields.Length() + (mBase != nullptr) + (enum_method != nullptr);
 
-	if (aDepth)
+	DebugCookie cookie;
+	aDebugger->BeginProperty(NULL, "object", num_children, cookie);
+
+	if (aDepth > 0)
 	{
-		int i = aPageSize * aPage, j = aPageSize * (aPage + 1);
+		auto props = new PropEnum(this, aDebugger->ThisToken());
+		Var vname, vval;
+
+		int page_start = aPageSize * aPage, page_end = aPageSize * (aPage + 1);
+		int i = 0;
 
 		if (mBase)
 		{
 			// Since this object has a "base", let it count as the first field.
-			if (i == 0) // i.e. this is the first page.
-			{
-				aDebugger->WriteProperty("base", mBase);
-				// Now fall through and retrieve field[0] (unless aPageSize == 1).
-			}
-			// So 20..39 becomes 19..38 when there's a base object:
-			else --i; 
-			--j;
+			if (page_start == 0) // i.e. this is the first page.
+				aDebugger->WriteBaseProperty(mBase);
+			i++; // Count it even if it wasn't within the current page.
 		}
-		if (j > (int)mFieldCount)
-			j = (int)mFieldCount;
-		// For each field in the requested page...
-		for ( ; i < j; ++i)
-		{
-			Object::FieldType &field = mFields[i];
-			
-			ExprTokenType value;
-			field.ToToken(value);
 
-			if (i >= mKeyOffsetString) // String
-				aDebugger->WriteProperty(CStringUTF8FromTChar(field.key.s), value);
-			else if (i >= mKeyOffsetObject)
-				aDebugger->WriteProperty(field.key.p, value);
-			else
-				aDebugger->WriteProperty(field.key.i, value);
+		// For each field NOT in the requested page...
+		for (; i < page_start && props->Next(nullptr, nullptr) == CONDITION_TRUE; ++i);
+
+		// For each field in the requested page...
+		for (; i < page_end; ++i)
+		{
+			auto result = props->Next(&vname, &vval);
+			if (result == CONDITION_FALSE)
+				break;
+			ExprTokenType value;
+			if (result == CONDITION_TRUE)
+				vval.ToTokenSkipAddRef(value);
+			else // For PropEnum, this means a property was enumerated but its getter failed/exited.
+				value.SetValue(_T("<error>"), 7);
+			aDebugger->WriteProperty(vname.Contents(), value);
 		}
+
+		vname.Free();
+		vval.Free();
+
+		if (enum_method && i < page_end)
+		{
+			if (dynamic_cast<NativeFunc *>(enum_method))
+			{
+				// Built-in enumerators are always safe to call automatically.
+				aDebugger->WriteEnumItems(this, page_start - i, page_end - i);
+			}
+			else
+			{
+				DebugCookie cookie;
+				// Write an empty property; enumerate only on property_get.
+				aDebugger->BeginProperty("<enum>", "object", 1, cookie);
+				aDebugger->EndProperty(cookie);
+			}
+		}
+
+		props->Release();
 	}
 
 	aDebugger->EndProperty(cookie);
 }
 
-int Debugger::WritePropertyXml(Object::FieldType &aField, const char *aName, CStringA &aNameBuf, int aPageSize, int aDepthRemaining, int aMaxEncodedSize)
+
+int Debugger::WriteEnumItems(PropertyInfo &aProp)
 {
-	ExprTokenType value;
-	aField.ToToken(value);
-	return WritePropertyXml(value, aName, aNameBuf, aPageSize, aDepthRemaining, aMaxEncodedSize);
+	aProp.facet = "";
+	PropertyWriter pw(*this, aProp);
+	int start = aProp.page * aProp.pagesize;
+	pw.WriteEnumItems(aProp.invokee, start, start + aProp.pagesize);
+	return pw.mError;
 }
 
-int Debugger::WritePropertyXml(ExprTokenType &aValue, const char *aName, CStringA &aNameBuf, int aPageSize, int aDepthRemaining, int aMaxEncodedSize)
-// This function has an equivalent WritePropertyData() for property_value, so maintain the two together.
+void Debugger::PropertyWriter::WriteEnumItems(IObject *aEnumerable, int aStart, int aEnd)
 {
-	LPTSTR value;
-	char *type;
-	TCHAR number_buf[MAX_NUMBER_SIZE];
-
-	switch (aValue.symbol)
+	IObject *enumerator;
+	auto result = GetEnumerator(enumerator, ExprTokenType(aEnumerable), 2, false);
+	if (result != OK)
 	{
-	case SYM_VAR:
-		return WritePropertyXml(*aValue.var, aMaxEncodedSize);
+		// Just return no items, since setting an error would prevent any other properties
+		// from being returned.  For context_get in particular, one bad __Enum could break
+		// the client's ability to list variables.
+		//mError = DEBUGGER_E_EVAL_FAIL;
+		return;
+	}
 
-	case SYM_STRING:
-	case SYM_OPERAND:
-		value = aValue.marker;
-		type = "string";
-		break;
-
-	case SYM_INTEGER:
-	case SYM_FLOAT:
-		// The following tries to use the same methods to convert the number to a string as
-		// the script would use when converting a variable's cached binary number to a string:
-		if (aValue.symbol == SYM_INTEGER)
+	DebugCookie cookie;
+	bool write_main_property = !mDepth;
+	if (write_main_property)
+	{
+		if (mProp.kind == PropEnum)
+			mProp.invokee = enumerator;
+		BeginProperty(nullptr, "object", 1, cookie);
+	}
+	
+	if (mProp.max_depth)
+	{
+		auto vkey = new VarRef(), vval = new VarRef();
+		ExprTokenType tparam[] = { vkey, vval }, *param[] = { tparam, tparam + 1 };
+		for (int i = 0; i < aEnd; ++i)
 		{
-			ITOA64(aValue.value_int64, number_buf);
-			type = "integer";
+			result = CallEnumerator(enumerator, param, 2, false);
+			if (result != CONDITION_TRUE)
+				break;
+			if (i >= aStart)
+			{
+				ExprTokenType tkey, tval;
+				vkey->ToTokenSkipAddRef(tkey);
+				vval->ToTokenSkipAddRef(tval);
+				WriteProperty(tkey, tval);
+			}
 		}
-		else
-		{
-			sntprintf(number_buf, _countof(number_buf), g->FormatFloat, aValue.value_double);
-			type = "float";
-		}
-		value = number_buf;
-		break;
+		vkey->Release();
+		vval->Release();
+	}
 
-	case SYM_OBJECT:
-		// Recursively dump object.
-		return WritePropertyXml(aValue.object, aName, aNameBuf, 0, aPageSize, aDepthRemaining, aMaxEncodedSize);
+	if (write_main_property)
+		EndProperty(cookie);
+
+	enumerator->Release();
+}
+
+int Debugger::WritePropertyXml(PropertyInfo &aProp)
+{
+	char facetbuf[32]; // Alias Builtin Static
+	facetbuf[0] = '\0';
+	if (aProp.is_alias)
+		strcat(facetbuf, " Alias");
+	if (aProp.is_builtin)
+		strcat(facetbuf, " Builtin");
+	if (aProp.is_static)
+		strcat(facetbuf, " Static");
+	aProp.facet = facetbuf + (*facetbuf != '\0'); // Skip the leading space, if non-empty.
+
+	ASSERT(aProp.kind != PropEnum);
+	if (aProp.value.symbol == SYM_OBJECT || aProp.invokee) // An object or `primitive.<base>`
+		return WritePropertyObjectXml(aProp);
+
+	char *type;
+	switch (aProp.value.symbol)
+	{
+	case SYM_STRING: type = "string"; break;
+	case SYM_INTEGER: type = "integer"; break;
+	case SYM_FLOAT: type = "float"; break;
 
 	default:
+		// Catch SYM_VAR or any invalid symbol in debug mode.  In release mode, treat as undefined
+		// (the compiler can omit the SYM_MISSING check because the default branch covers it).
 		ASSERT(FALSE);
-		type = "undefined";	// For maintainability.
-		value = _T("");		//
+	case SYM_MISSING:
+		type = "undefined";
 	}
 	// If we fell through, value and type have been set appropriately above.
-	mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" facet=\"\" children=\"0\" encoding=\"base64\" size=\"", aName, aNameBuf.GetString(), type);
+	mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" facet=\"%s\" children=\"0\" encoding=\"base64\" size=\""
+		, aProp.name, aProp.fullname.GetString(), type, aProp.facet);
 	int err;
-	if (err = WritePropertyData(value, _tcslen(value), aMaxEncodedSize))
+	if (err = WritePropertyData(aProp.value, aProp.max_data))
 		return err;
 	return mResponseBuf.Write("</property>");
 }
 
-void Debugger::AppendKeyName(CStringA &aNameBuf, size_t aParentNameLength, const char *aName)
+int Debugger::WritePropertyXml(PropertyInfo &aProp, LPTSTR aName)
 {
+	StringTCharToUTF8(aName, aProp.fullname);
+	aProp.name = aProp.fullname;
+	return WritePropertyXml(aProp);
+}
+
+void Debugger::AppendPropertyName(CStringA &aNameBuf, size_t aParentNameLength, const char *aName)
+{
+	// Property names are almost always valid identifiers, but even most invalid names
+	// should work as long as '.' and '[' are not used.  Supporting those does not seem
+	// worth any added code size.
+	aNameBuf.AppendFormat(".%s", aName);
+}
+
+void Debugger::AppendStringKey(CStringA &aNameBuf, size_t aParentNameLength, const char *aName)
+{
+	// " must be escape in some way to remove ambiguity.  Currently the v1 method is used
+	// since lexikos' version of SciTEDebug.ahk relies on it, and it isn't necessary to
+	// match the v2 expression syntax.
+	char c;
 	const char *ccp;
-	for (ccp = aName; cisalnum(*ccp) || *ccp == '_'; ++ccp);
-	if (!*ccp && ccp != aName) // If it got to the null-terminator, must be empty or alphanumeric.
+	int extra = 4; // 4 for [""].  Also count double-quote marks:
+	for (ccp = aName; *ccp; ++ccp) extra += *ccp=='"';
+	char *cp = aNameBuf.GetBufferSetLength(aParentNameLength + strlen(aName) + extra) + aParentNameLength;
+	*cp++ = '[';
+	*cp++ = '"';
+	for (ccp = aName; c = *ccp; ++ccp)
 	{
-		// Since this string is purely composed of alphanumeric characters and/or underscore,
-		// it doesn't need any quote marks (imitating expression syntax) or escaped characters.
-		aNameBuf.AppendFormat(".%s", aName);
+		*cp++ = c;
+		if (c == '"')
+			*cp++ = '"'; // i.e. replace " with ""
 	}
-	else
-	{
-		// " must be replaced with "" as in expressions to remove ambiguity.
-		char c;
-		int extra = 4; // 4 for [""].  Also count double-quote marks:
-		for (ccp = aName; *ccp; ++ccp) extra += *ccp=='"';
-		char *cp = aNameBuf.GetBufferSetLength(aParentNameLength + strlen(aName) + extra) + aParentNameLength;
-		*cp++ = '[';
-		*cp++ = '"';
-		for (ccp = aName; c = *ccp; ++ccp)
-		{
-			*cp++ = c;
-			if (c == '"')
-				*cp++ = '"'; // i.e. replace " with ""
-		}
-		*cp++ = '"';
-		*cp++ = ']';
-		aNameBuf.ReleaseBuffer();
-	}
+	*cp++ = '"';
+	*cp++ = ']';
+	aNameBuf.ReleaseBuffer();
 }
 
 int Debugger::WritePropertyData(LPCTSTR aData, size_t aDataSize, int aMaxEncodedSize)
@@ -1197,6 +1444,10 @@ int Debugger::WritePropertyData(LPCTSTR aData, size_t aDataSize, int aMaxEncoded
 	//     returned (when limited by aMaxEncodedSize).  This is more useful anyway.
 	//  2) Since the data is encoded as UTF-8, the size attribute must be a UTF-8 byte count
 	//     for any comparison by the IDE to give the correct result.
+
+	// According to the spec, -m 0 should mean "unlimited".
+	if (!aMaxEncodedSize)
+		aMaxEncodedSize = INT_MAX;
 	
 	// Calculate:
 	//  - the total size in terms of UTF-8 bytes (even if that exceeds INT_MAX).
@@ -1256,235 +1507,424 @@ int Debugger::WritePropertyData(LPCTSTR aData, size_t aDataSize, int aMaxEncoded
 	return mResponseBuf.WriteEncodeBase64(utf8_value, (size_t)utf8_size, true);
 }
 
-int Debugger::WritePropertyData(Var &aVar, int aMaxEncodedSize)
-{
-	CString buf;
-	LPTSTR value;
-	size_t value_size;
-
-	if (aVar.Type() == VAR_NORMAL)
-	{
-		value = aVar.Contents(TRUE, TRUE);
-		value_size = aVar.CharLength();
-	}
-	else
-	{
-		// In this case, allocating some memory to temporarily hold the var's value is unavoidable.
-		if (value = buf.GetBufferSetLength(aVar.Get()))
-			aVar.Get(value);
-		else
-			return DEBUGGER_E_INTERNAL_ERROR;
-		CLOSE_CLIPBOARD_IF_OPEN; // Above may leave the clipboard open if aVar is Clipboard.
-		value_size = _tcslen(value);
-	}
-
-	return WritePropertyData(value, value_size, aMaxEncodedSize);
-}
-
-int Debugger::WritePropertyData(Object::FieldType &aField, int aMaxEncodedSize)
-// Write object field: used only by property_value, so does not recursively dump objects.
-// This function has an equivalent WritePropertyXml(), so maintain the two together.
+int Debugger::WritePropertyData(ExprTokenType &aValue, int aMaxEncodedSize)
 {
 	LPTSTR value;
-	char *type;
+	size_t value_length;
 	TCHAR number_buf[MAX_NUMBER_SIZE];
 
-	switch (aField.symbol)
-	{
-	case SYM_OPERAND:
-		value = aField.marker;
-		type = "string";
-		break;
-
-	case SYM_INTEGER:
-	case SYM_FLOAT:
-		// The following tries to use the same methods to convert the number to a string as
-		// the script would use when converting a variable's cached binary number to a string:
-		if (aField.symbol == SYM_INTEGER)
-		{
-			ITOA64(aField.n_int64, number_buf);
-			type = "integer";
-		}
-		else
-		{
-			sntprintf(number_buf, _countof(number_buf), g->FormatFloat, aField.n_double);
-			type = "float";
-		}
-		value = number_buf;
-		break;
-
-	case SYM_OBJECT:
-		value = _T("");
-		type = "object";
-		break;
+	value = TokenToString(aValue, number_buf, &value_length);
 	
-	default:
-		ASSERT(FALSE);
-	}
-	// If we fell through, value and type have been set appropriately above.
-	return WritePropertyData(value, _tcslen(value), aMaxEncodedSize);
+	return WritePropertyData(value, value_length, aMaxEncodedSize);
 }
 
-int Debugger::ParsePropertyName(const char *aFullName, int aVarScope, bool aVarMustExist, Var *&aVar, Object::FieldType *&aField)
+int Debugger::ParsePropertyName(LPCSTR aFullName, int aDepth, int aVarScope, ExprTokenType *aSetValue
+	, PropertySource &aResult)
 {
 	CStringTCharFromUTF8 name_buf(aFullName);
-	LPTSTR name = name_buf.GetBuffer();
-	size_t name_length;
-	TCHAR c, *name_end, *src, *dst;
-	Var *var;
-	SymbolType key_type;
-	Object::KeyType key;
-    Object::FieldType *field;
-	Object::IndexType insert_pos;
-	Object *obj;
+	return ParsePropertyName(name_buf.GetBuffer(), aDepth, aVarScope, aSetValue, aResult);
+}
 
-	name_end = StrChrAny(name, _T(".["));
-	if (name_end)
+int Debugger::ParsePropertyName(LPWSTR aNamePtr, int aDepth, int aVarScope, ExprTokenType *aSetValue
+	, PropertySource &aResult)
+{
+	TCHAR c, *cp = aNamePtr, *cp_end;
+	
+	int err = DEBUGGER_E_OK;
+	ResultToken **temp = nullptr;
+	int temp_size = 0, temp_count = 0;
+	ExprTokenType **param_buf = nullptr;
+	int param_size = 0;
+	
+	aResult.kind = PropNone;
+
+	struct Invocation
 	{
-		c = *name_end;
-		*name_end = '\0'; // Temporarily terminate.
-	}
-	name_length = _tcslen(name);
+		Invocation *outer = nullptr;
+		ResultToken *leftval = nullptr;
+		IObject *invokee = nullptr;
+		LPWSTR name = nullptr;
+		int flags = 0, param_offset = 0;
+		WCHAR end_char = '\0';
+	} root_inv, *inv = &root_inv;
 
-	// Validate name for more accurate error-reporting.
-	if (name_length > MAX_VAR_NAME_LENGTH || !Var::ValidateName(name, DISPLAY_NO_ERROR))
-		return DEBUGGER_E_INVALID_OPTIONS;
+	// Property names that aren't valid identifiers can be set via .%% or DefineProp.
+	// Currently those aren't escaped in any way, so the following permits most characters,
+	// and even the empty string.  The <base> and <enum> sections rely on this permitting <>.
+	constexpr auto TERMINATORS = L".,[]()";
 
-	// If we're allowed to create variables
-	if ( !aVarMustExist
-		// or this variable doesn't exist
-		|| !(var = g_script.FindVar(name, name_length, NULL, aVarScope))
-			// but it is a built-in variable which hasn't been referenced yet:
-			&& g_script.GetVarType(name) > (void*)VAR_LAST_TYPE )
-		// Find or add the variable.
-		var = g_script.FindOrAddVar(name, name_length, aVarScope);
-
-	if (!var)
-		return DEBUGGER_E_UNKNOWN_PROPERTY;
-
-	if (!name_end)
+	for (;;)
 	{
-		// Just a variable name.
-		aVar = var;
-		aField = NULL;
-		return DEBUGGER_E_OK;
-	}
-
-	if ( !var->HasObject() || !(obj = dynamic_cast<Object *>(var->Object())) )
-		return DEBUGGER_E_UNKNOWN_PROPERTY;
-
-	// aFullName contains a '.' or '['.  Although it looks like an expression, the IDE should
-	// only pass a property name which we gave it in response to a previous command, so we
-	// only need to support the subset of expression syntax used by WriteObjectPropertyXml().
-	for (*name_end = c; ; )
-	{
-		name = name_end + 1;
-		if (c == '[')
+		if (temp_count == temp_size)
 		{
-			if (*name == '"')
+			auto new_size = temp_size ? temp_size * 2 : 64;
+			auto new_temp = (ResultToken**)realloc(temp, new_size * sizeof(ResultToken*));
+			if (!new_temp)
 			{
-				// Quoted string which may contain any character.
-				// Replace "" with " in-place and find and of string:
-				for (dst = src = ++name; c = *src; ++src)
+				err = DEBUGGER_E_INTERNAL_ERROR;
+				break;
+			}
+			temp = new_temp;
+			temp_size = new_size;
+		}
+		auto &lastval = *(temp[temp_count++] = new (_alloca(sizeof(ResultToken))) ResultToken());
+		lastval.InitResult(aResult.value.buf);
+		continue_with_same_lastval:
+
+		c = *cp;
+		if (!c) // Checked after continue_with_same_lastval to avoid returning "" in some cases, such as `1,`
+		{
+			err = DEBUGGER_E_INVALID_OPTIONS;
+			break;
+		}
+		if (!inv->leftval)
+		{
+			Var *var = nullptr;
+			VarBkp *varbkp = nullptr;
+
+			if (!_tcsnicmp(cp, _T("<exception>"), 11))
+			{
+				if (!mThrownToken)
 				{
-					if (c == '"')
+					err = DEBUGGER_E_UNKNOWN_PROPERTY;
+					break;
+				}
+				cp += 11;
+				if (!*cp)
+				{
+					// `property_get -n <exception>` is our non-standard way to retrieve the thrown value during an exception break.
+					// `property_set -n <exception> --` is our non-standard way to "clear the exception" (suppress the error dialog).
+					if (aSetValue)
 					{
-						// Quote mark; but is it a literal quote mark?
-						if (*++src != '"')
-							// Nope.
+						if (!TokenIsEmptyString(*aSetValue))
+						{
+							err = DEBUGGER_E_INVALID_OPTIONS;
 							break;
-						//else above skipped the second quote mark, so fall through:
+						}
+						mThrownToken = nullptr;
+						break;
 					}
-					*dst++ = c;
 				}
-				if (*src != ']') return DEBUGGER_E_INVALID_OPTIONS;
-				*dst = '\0'; // Only after the check above, since src might be == dst.
-				name_end = src + 1; // Set it up for the next iteration.
-				key_type = SYM_STRING;
+				lastval.CopyValueFrom(*mThrownToken);
 			}
-			else if (!_tcsnicmp(name, _T("Object("), 7))
+			else if (cp_end = ParsePropertyKeyLiteral(cp, lastval))
 			{
-				// Object(n) where n is the address of a key object, as a literal signed integer.
-				name += 7;
-				name_end = _tcschr(name, ')');
-				if (!name_end || name_end[1] != ']') return DEBUGGER_E_INVALID_OPTIONS;
-				*name_end = '\0';
-				name_end += 2; // Set it up for the next iteration.
-				key_type = SYM_OBJECT;
+				cp = cp_end;
 			}
-			else
+			else if (IS_IDENTIFIER_CHAR(*cp))
 			{
-				// The only other valid form is a literal signed integer.
-				name_end = _tcschr(name, ']');
-				if (!name_end) return DEBUGGER_E_INVALID_OPTIONS;
-				*name_end = '\0'; // Although not actually necessary for _ttoi(), seems best for maintainability.
-				++name_end; // Set it up for the next iteration.
-				key_type = SYM_INTEGER;
-			}
-			c = *name_end; // Set for the next iteration.
-		}
-		else if (c == '.')
-		{
-			// For simplicity, let this be any string terminated by '.' or '['.
-			// Actual expressions require it to contain only alphanumeric chars and/or '_'.
-			name_end = StrChrAny(name, _T(".[")); // This also sets it up for the next iteration.
-			if (name_end)
-			{
-				c = *name_end; // Save this for the next iteration.
-				*name_end = '\0';
-			}
-			//else there won't be a next iteration.
-			key_type = IsPureNumeric(name); // SYM_INTEGER or SYM_STRING.
-		}
-		else
-			return DEBUGGER_E_INVALID_OPTIONS;
-		
-		if (key_type == SYM_STRING)
-			key.s = name;
-		else // SYM_INTEGER or SYM_OBJECT
-			key.i = Exp32or64(_ttoi,_ttoi64)(name);
+				auto name = cp;
+				cp = find_identifier_end(cp + 1);
+				auto name_length = cp - name;
+				c = *cp;
+				*cp = '\0'; // Temporarily terminate.
 
-		if ( !(field = obj->FindField(key_type, key, insert_pos)) )
-		{
-			if (!_tcsicmp(name, _T("base")) && (aVarMustExist || name_end && c)) // i.e. don't return the fake field to property_set since it would Release() the base object but not actually work.
-			{
-				// Since "base" doesn't usually correspond to an actual field, let it resolve
-				// to a fake one for simplicity (dynamically allocated since we never want the
-				// destructor to be called):
-				static Object::FieldType *sBaseField = new Object::FieldType();
-				if (obj->mBase)
+				VarList *vars = nullptr;
+				bool search_local = (aVarScope & VAR_LOCAL) && g->CurrentFunc;
+				if (search_local && aDepth > 0)
 				{
-					sBaseField->symbol = SYM_OBJECT;
-					sBaseField->object = obj->mBase;
+					VarList *static_vars = nullptr;
+					VarBkp *bkps = nullptr, *bkps_end = nullptr;
+					mStack.GetLocalVars(aDepth, vars, static_vars, bkps, bkps_end);
+					for (; bkps < bkps_end; ++bkps)
+						if (!_tcsicmp(bkps->mVar->mName, name))
+						{
+							varbkp = bkps;
+							break;
+						}
+					if (!varbkp && static_vars)
+						var = static_vars->Find(name);
+					// If a var wasn't found above, make sure not to return a local var of the wrong function or depth.
+					if (!var)
+						aVarScope = FINDVAR_GLOBAL;
 				}
+
+				if (!var && !varbkp)
+				{
+					int insert_pos;
+					if (vars) // Use this first to support aDepth.
+						var = vars->Find(name, &insert_pos);
+					if (!var) // Use FindVar to support built-ins and globals.
+						var = g_script.FindVar(name, name_length, aVarScope, &vars, &insert_pos);
+					if (!var && aSetValue) // Avoid creating empty variables.
+						var = g_script.AddVar(name, name_length, vars, insert_pos
+							, search_local ? VAR_LOCAL : VAR_GLOBAL);
+				}
+
+				*cp = c; // Undo temporary termination.
+
+				if (!var && !varbkp)
+				{
+					err = DEBUGGER_E_UNKNOWN_PROPERTY;
+					break;
+				}
+
+				if (!c)
+				{
+					// Just a variable name.
+					if (var)
+						aResult.var = var, aResult.kind = PropVar;
+					else
+						aResult.bkp = varbkp, aResult.kind = PropVarBkp;
+					break;
+				}
+				if (varbkp && varbkp->mType == VAR_ALIAS)
+					var = varbkp->mAliasFor;
+				if (var)
+					err = GetPropertyValue(*var, lastval);
 				else
-				{
-					sBaseField->symbol = SYM_OPERAND;
-					sBaseField->marker = _T("");
-					sBaseField->size = 0;
-				}
-				field = sBaseField;
-				// If this is the end of 'name', sBaseField will be returned to our caller.
-				// Otherwise the next iteration will either fail (mBase == NULL) or search
-				// the base object's fields.
+					err = GetPropertyValue(*varbkp, lastval);
+			}
+			else if (inv->outer && (c == ',' || c == inv->end_char))
+			{
+				// Missing parameter or empty parameter list.
+				lastval.symbol = SYM_MISSING;
 			}
 			else
-				return DEBUGGER_E_UNKNOWN_PROPERTY;
-		}
+				break; // Syntax error; err will be set due to *cp != 0.
 
-		if (!name_end || !c)
+			if (lastval.symbol == SYM_OBJECT && !var) // AddRef() was called only if var != nullptr.
+				lastval.object->AddRef();
+
+			c = *cp;
+			if (!c)
+				break; // lastval is the final result, in temp[temp_count-1].
+			if (lastval.symbol == SYM_MISSING && !(c == ',' || c == inv->end_char))
+			{
+				err = DEBUGGER_E_UNKNOWN_PROPERTY;
+				break;
+			}
+			inv->leftval = &lastval;
+			continue; // inv->leftval is a parameter or left-hand side of an invocation.
+		}
+		// Now inv->leftval has been set up with a value, and lastval is available to place a result into.
+
+		if (!inv->invokee) // Initialize for a potential invocation.
+			if (inv->leftval->symbol == SYM_OBJECT)
+			{
+				inv->invokee = inv->leftval->object;
+				inv->flags = 0;
+			}
+			else
+			{
+				inv->invokee = Object::ValueBase(*inv->leftval);
+				inv->flags = IF_SUBSTITUTE_THIS;
+			}
+		ASSERT(inv->invokee || inv->leftval->symbol == SYM_MISSING && (c == ',' || c == inv->end_char));
+
+		for (c = *cp; c == '.'; cp = cp_end)
 		{
-			// All done!
-			aVar = NULL;
-			aField = field;
-			return DEBUGGER_E_OK;
+			for (cp_end = ++cp; !_tcschr(TERMINATORS, c = *cp_end); ++cp_end);
+			*cp_end = '\0';
+
+			if (!_tcsicmp(cp, _T("<base>"))) // Debugger pseudo-property.
+			{
+				// x.<base> returns the base of x, but x.<base>.y invokes the version of y defined
+				// by x.<base> but with `this` set to x (for property getters or methods).
+				if (inv->flags != IF_SUBSTITUTE_THIS) // i.e. it's not already *implicitly* the value's base.
+					inv->invokee = inv->invokee->Base();
+				if (!inv->invokee) // Any.Prototype.<base> (potentially with a suffix)
+				{
+					err = DEBUGGER_E_UNKNOWN_PROPERTY;
+					goto break_outer;
+				}
+				inv->flags = IF_SUPER;
+			}
+			else if (!_tcsicmp(cp, _T("<enum>"))) // Debugger pseudo-property.
+			{
+				// x.<enum>[1] invokes x[1], but caller knows to enumerate items when aResult.kind == PropEnum.
+				if (!c)
+					aResult.kind = PropEnum;
+			}
+			else
+			{
+				ASSERT(!inv->name);
+				inv->name = cp;
+				cp = cp_end;
+				break; // Break inner loop to invoke this property below.
+			}
+		} // for()
+		// Due to potential null-termination of a property name above, must now use c instead of *cp.
+		
+		if (c == '[' && (cp[1] != ']' || !inv->name) || c == '(')
+		{
+			if (c == '(')
+				inv->flags |= IT_CALL;
+			auto new_inv = new (_alloca(sizeof(Invocation))) Invocation();
+			new_inv->end_char = c == '(' ? ')' : ']';
+			new_inv->param_offset = inv->param_offset;
+			new_inv->outer = inv;
+			inv = new_inv;
+			cp++;
+			goto continue_with_same_lastval;
 		}
 
-		if ( field->symbol != SYM_OBJECT || !(obj = dynamic_cast<Object *>(field->object)) )
-			// No usable target object for the next iteration, therefore the property mustn't exist.
-			return DEBUGGER_E_UNKNOWN_PROPERTY;
+		ExprTokenType **param = nullptr;
+		int param_count = 0;
 
-	} // infinite loop.
+		if (!inv->name)
+		{
+			// name is null and '[' and '(' are not present, therefore inv->leftval is not being invoked.
+			if (!c)
+			{
+				--temp_count;
+				ASSERT(temp[temp_count-1] == inv->leftval);
+				break; // inv->leftval is the final result (lastval wasn't needed).
+			}
+			// leftval should be a parameter.
+			
+			if (inv->param_offset + 1 >= param_size) // +1 for aSetValue
+			{
+				auto new_size = param_size ? param_size * 2 : 64;
+				auto new_buf = (ExprTokenType**)realloc(param_buf, new_size * sizeof(ExprTokenType*));
+				if (!new_buf)
+				{
+					err = DEBUGGER_E_INTERNAL_ERROR;
+					break;
+				}
+				param_buf = new_buf;
+				param_size = new_size;
+			}
+			param_buf[inv->param_offset++] = inv->leftval;
+
+			if (c == ',')
+			{
+				cp++;
+				inv->leftval = nullptr;
+				inv->invokee = nullptr;
+				inv->flags = 0;
+				goto continue_with_same_lastval;
+			}
+
+			if (inv->end_char != c)
+				break; // Syntax error.
+			
+			param = param_buf + inv->outer->param_offset;
+			param_count = inv->param_offset - inv->outer->param_offset;
+			while (param_count && param[param_count-1]->symbol == SYM_MISSING)
+				--param_count;
+			inv = inv->outer;
+			cp_end = ++cp; // Set things up to continue parsing after the end char.
+			c = *cp;
+		}
+		
+		// Prepare parameters for invocation.
+		ExprTokenType *value_to_set = !c ? aSetValue : NULL;
+		if (value_to_set)
+		{
+			if ((inv->flags & IT_BITMASK) == IT_CALL)
+			{
+				err = DEBUGGER_E_INVALID_OPTIONS;
+				break;
+			}
+			if (param)
+				param[param_count] = aSetValue;
+			else
+				param = &aSetValue;
+			param_count++;
+			inv->flags |= IT_SET;
+		}
+
+		// Attempt to invoke property.
+		auto result = inv->invokee->Invoke(lastval, inv->flags, inv->name, *inv->leftval, param, param_count);
+
+		if (lastval.symbol == SYM_STRING && !lastval.mem_to_free)
+		{
+			// Make a copy of the string since it could otherwise be deleted as a side-effect
+			// of a subsequent Invoke or Release call, or be overwritten if in prop.buf.
+			if (!lastval.Malloc(lastval.marker, lastval.marker_length))
+				result = FAIL;
+		}
+
+		if (result != OK) // FAIL, INVOKE_NOT_HANDLED or EARLY_EXIT
+		{
+			err = result == INVOKE_NOT_HANDLED ? DEBUGGER_E_UNKNOWN_PROPERTY : DEBUGGER_E_EVAL_FAIL;
+			break;
+		}
+		inv->invokee = nullptr;
+		if (!c)
+			break;
+		inv->leftval = &lastval;
+		inv->name = nullptr;
+		inv->flags = 0;
+		ASSERT(cp == cp_end && (*cp == c || !*cp));
+		*cp = c; // Potentially undo temporary termination.
+	}
+	break_outer:
+	
+	if (!err && (*cp || inv->outer || !temp_count))
+		err = DEBUGGER_E_INVALID_OPTIONS;
+
+	if (!err && !aSetValue && (!aResult.kind || aResult.kind == PropEnum))
+	{
+		// temp[--temp_count] is used in preference to inv->leftval, which should have the same value,
+		// because we also want to "remove" it from the array so that it won't be deleted below.
+		auto &ret = *temp[--temp_count];
+		if (!aResult.kind)
+			aResult.kind = PropValue;
+		aResult.invokee = inv->invokee;
+		aResult.value.CopyValueFrom(ret);
+		aResult.value.mem_to_free = ret.mem_to_free;
+	}
+	
+	while (temp_count)
+		temp[--temp_count]->Free();
+	free(temp);
+	free(param_buf);
+	return err;
+}
+
+LPWSTR Debugger::ParsePropertyKeyLiteral(LPWSTR src, ExprTokenType &t_key)
+{
+	if (*src == '"')
+	{
+		// Quoted string which may contain any character.
+		t_key.symbol = SYM_STRING;
+		t_key.marker = ++src;
+		// Replace "" with " in-place and find end of string:
+		WCHAR *dst;
+		for (dst = src; WCHAR c = *src; ++src)
+		{
+			if (c == '"')
+			{
+				// Quote mark; but is it a literal quote mark?
+				if (*++src != '"') // This currently doesn't match up with expression syntax, but is left this way for simplicity.
+					// Nope.
+					break;
+				//else above skipped the second quote mark, so fall through:
+			}
+			*dst++ = c;
+		}
+		*dst = '\0';
+		t_key.marker_length = dst - t_key.marker;
+		return src;
+	}
+	else if (!_tcsnicmp(src, _T("Object("), 7) && cisdigit(src[7]))
+	{
+		// Object(n) where n is the address of a key object, as a literal signed integer.
+		t_key.value_int64 = istrtoi64(src + 7, &src);
+		if (*src != ')')
+			return nullptr;
+		t_key.symbol = SYM_OBJECT;
+		return src + 1;
+	}
+	else if (!cisalpha(*src)) // Rule out inf/nan.
+	{
+		LPTSTR iend, fend;
+		auto ival = istrtoi64(src, &iend);
+		auto fval = _tcstod(src, &fend);
+		if (fend > iend)
+		{
+			t_key.SetValue(fval);
+			return fend;
+		}
+		else if (iend > src)
+		{
+			t_key.SetValue(ival);
+			return iend;
+		}
+	}
+	return nullptr;
 }
 
 
@@ -1494,8 +1934,13 @@ int Debugger::property_get_or_value(char **aArgV, int aArgCount, char *aTransact
 	char arg, *value;
 
 	char *name = NULL;
-	int context_id = 0, depth = 0, page = 0;
-	int max_data = aIsPropertyGet ? mMaxPropertyData : 1024*1024*1024; // Limit property_value to 1GB by default.
+	int context_id = 0, depth = 0; // Var context and stack depth.
+	CStringA name_buf;
+	TCHAR value_buf[_f_retval_buf_size];
+	PropertyInfo prop(name_buf, value_buf);
+	prop.pagesize = mMaxChildren;
+	prop.max_data = aIsPropertyGet ? mMaxPropertyData : 1024*1024*1024; // Limit property_value to 1GB by default.
+	prop.max_depth = mMaxDepth; // Max property nesting depth.
 
 	for (int i = 0; i < aArgCount; ++i)
 	{
@@ -1508,23 +1953,23 @@ int Debugger::property_get_or_value(char **aArgV, int aArgCount, char *aTransact
 		// context id - optional, default zero. see PropertyContextType enum.
 		case 'c': context_id = atoi(value); break;
 		// stack depth - optional, default zero
-		case 'd': depth = atoi(value); break;
+		case 'd':
+			depth = atoi(value);
+			if (depth && (depth < 0 || depth >= mStack.Depth())) // Allow depth 0 even when stack is empty.
+				return DEBUGGER_E_INVALID_STACK_DEPTH;
+			break;
 		// max data size - optional
-		case 'm': max_data = atoi(value); break;
+		case 'm': prop.max_data = atoi(value); break;
 		// data page - optional
-		case 'p': page = atoi(value); break;
+		case 'p': prop.page = atoi(value); break;
 
 		default:
 			return DEBUGGER_E_INVALID_OPTIONS;
 		}
 	}
 
-	if (!name || max_data < 0)
+	if (!name || prop.max_data < 0)
 		return DEBUGGER_E_INVALID_OPTIONS;
-
-	// Currently only stack depth 0 (the top-most running function) is supported.
-	if (depth != 0)
-		return DEBUGGER_E_INVALID_STACK_DEPTH;
 
 	int always_use;
 	switch (context_id)
@@ -1532,64 +1977,62 @@ int Debugger::property_get_or_value(char **aArgV, int aArgCount, char *aTransact
 	// It seems best to allow context id zero to retrieve either a local or global,
 	// rather than requiring the IDE to check each context when looking up a variable.
 	//case PC_Local:	always_use = FINDVAR_LOCAL; break;
-	case PC_Local:	always_use = FINDVAR_DEFAULT; break;
+	case PC_Local:	always_use = FINDVAR_FOR_READ; break;
 	case PC_Global:	always_use = FINDVAR_GLOBAL; break;
 	default:
 		return DEBUGGER_E_INVALID_CONTEXT;
 	}
 
-	Var *var;
-	Object::FieldType *field;
-	if (err = ParsePropertyName(name, always_use, true, var, field))
+	if (err = ParsePropertyName(name, depth, always_use, NULL, prop))
 	{
 		// Var not found/invalid name.
 		if (!aIsPropertyGet)
 			return err;
-
-		// NOTEPAD++ DBGP PLUGIN:
-		// The DBGp plugin for Notepad++ assumes property_get will always succeed.
-		// Property retrieval on mouse hover does not choose words intelligently,
-		// so it will attempt to retrieve properties like ";" or " r".
-		// If we respond with an <error/> instead of a <property/>, Notepad++ will
-		// show an error message and then become unstable. Even after the editor
-		// window is closed, notepad++.exe must be terminated forcefully.
-		//
-		// As a work-around (until this is resolved by the plugin's author),
-		// we return a property with an empty value and the 'undefined' type.
-		
-		return mResponseBuf.WriteF(
-			"<response command=\"property_get\" transaction_id=\"%e\">"
-				"<property name=\"%e\" fullname=\"%e\" type=\"undefined\" facet=\"\" size=\"0\" children=\"0\"/>"
-			"</response>"
-			, aTransactionId, name, name);
+		// Return a value of type "undefined".  This was originally done to work around
+		// an issue with the DBGp plugin for Notepad++, but that was last updated in 2012
+		// and doesn't support Notepad++ 64-bit.  Now it's done for compatibility with
+		// AutoHotkey-specific clients that may have come to rely on it:
+		prop.kind = PropValue;
+		if (prop.value.symbol == SYM_OBJECT)
+			prop.value.object->Release();
+		prop.value.symbol = SYM_MISSING;
 	}
 	//else var and field were set by the called function.
 
-	if (aIsPropertyGet)
+	switch (prop.kind)
 	{
-		mResponseBuf.WriteF(
-			"<response command=\"property_get\" transaction_id=\"%e\">"
-			, aTransactionId);
-		
-		if (var)
-			err = WritePropertyXml(*var, max_data, page);
-		else
-			err = WritePropertyXml(*field, name, CStringA(name), mMaxChildren, mMaxDepth, max_data);
+	case PropVar: err = GetPropertyInfo(*prop.var, prop); break;
+	case PropVarBkp: err = GetPropertyInfo(*prop.bkp, prop); break;
+	//case PropEnum: // value already set by ParsePropertyName().
+	default: err = DEBUGGER_E_OK; break;
 	}
-	else
+	if (!err)
 	{
-		mResponseBuf.WriteF(
-			"<response command=\"property_value\" transaction_id=\"%e\" encoding=\"base64\" size=\""
-			, aTransactionId);
-
-		if (var)
-			err = WritePropertyData(*var, max_data);
+		if (aIsPropertyGet)
+		{
+			mResponseBuf.WriteF(
+				"<response command=\"property_get\" transaction_id=\"%e\">"
+				, aTransactionId);
+			name_buf.SetString(name); // prop.fullname is an alias of name_buf.
+			// For simplicity and code size, we use the full caller-specified name
+			// instead of trying to parse out the "short" name or record it during
+			// ParsePropertyName (which would have to take into account differences
+			// between UTF-8 and LPTSTR):
+			prop.name = name;
+			if (prop.kind == PropEnum)
+				err = WriteEnumItems(prop);
+			else
+				err = WritePropertyXml(prop);
+		}
 		else
-			err = WritePropertyData(*field, max_data);
+		{
+			mResponseBuf.WriteF(
+				"<response command=\"property_value\" transaction_id=\"%e\" encoding=\"base64\" size=\""
+				, aTransactionId);
+			err = WritePropertyData(prop.value, prop.max_data);
+		}
 	}
-	if (err)
-		return err;
-	return mResponseBuf.Write("</response>");
+	return err ? err : mResponseBuf.Write("</response>");
 }
 
 DEBUGGER_COMMAND(Debugger::property_set)
@@ -1611,7 +2054,11 @@ DEBUGGER_COMMAND(Debugger::property_set)
 		// context id - optional, default zero. see PropertyContextType enum.
 		case 'c': context_id = atoi(value); break;
 		// stack depth - optional, default zero
-		case 'd': depth = atoi(value); break;
+		case 'd':
+			depth = atoi(value);
+			if (depth && (depth < 0 || depth >= mStack.Depth())) // Allow depth 0 even when stack is empty.
+				return DEBUGGER_E_INVALID_STACK_DEPTH;
+			break;
 		// new base64-encoded value
 		case '-': new_value = value; break;
 		// data type: string, integer or float
@@ -1627,10 +2074,6 @@ DEBUGGER_COMMAND(Debugger::property_set)
 	if (!name || !new_value)
 		return DEBUGGER_E_INVALID_OPTIONS;
 
-	// Currently only stack depth 0 (the top-most running function) is supported.
-	if (depth != 0)
-		return DEBUGGER_E_INVALID_STACK_DEPTH;
-
 	int always_use;
 	switch (context_id)
 	{
@@ -1642,35 +2085,80 @@ DEBUGGER_COMMAND(Debugger::property_set)
 		return DEBUGGER_E_INVALID_CONTEXT;
 	}
 
-	Var *var;
-	Object::FieldType *field;
-	if (err = ParsePropertyName(name, always_use, false, var, field))
-		return err;
+	// "Data must be encoded using base64." : https://xdebug.org/docs-dbgp.php
+	// Fixed in v1.1.24.03 to expect base64 even for integer/float:
+	int value_length = (int)Base64Decode(new_value, new_value);
 	
 	CString val_buf;
 	ExprTokenType val;
 	if (!strcmp(type, "integer"))
 	{
-		val.symbol = SYM_INTEGER;
-		val.value_int64 = _atoi64(new_value);
+		val.SetValue(_atoi64(new_value));
 	}
 	else if (!strcmp(type, "float"))
 	{
-		val.symbol = SYM_FLOAT;
-		val.value_double = atof(new_value);
+		val.SetValue(atof(new_value));
 	}
 	else // Assume type is "string", since that's the only other supported type.
 	{
-		StringUTF8ToTChar(new_value, val_buf, (int)Base64Decode(new_value, new_value));
-		val.symbol = SYM_STRING;
-		val.marker = (LPTSTR)val_buf.GetString();
+		StringUTF8ToTChar(new_value, val_buf, value_length);
+		val.SetValue((LPTSTR)val_buf.GetString(), val_buf.GetLength());
 	}
 
+	TCHAR value_buf[_f_retval_buf_size];
+	PropertySource target(value_buf);
+	if (err = ParsePropertyName(name, depth, always_use, &val, target))
+		return err;
+
 	bool success;
-	if (var)
-		success = !VAR_IS_READONLY(*var) && var->Assign(val); // Relies on shortcircuit boolean evaluation.
-	else
-		success = field->Assign(val);
+	switch (target.kind)
+	{
+	case PropVarBkp:
+		if (target.bkp->mType != VAR_ALIAS)
+		{
+			VarBkp &bkp = *target.bkp;
+			if (bkp.mAttrib & VAR_ATTRIB_IS_OBJECT)
+			{
+				bkp.mAttrib &= ~VAR_ATTRIB_IS_OBJECT;
+				bkp.mObject->Release();
+			}
+			if (val.symbol == SYM_STRING)
+			{
+				if ((val.marker_length + 1) * sizeof(TCHAR) > bkp.mByteCapacity && val.marker_length)
+				{
+					if (bkp.mHowAllocated == ALLOC_MALLOC)
+						free(bkp.mCharContents);
+					else
+						bkp.mHowAllocated = ALLOC_MALLOC;
+					bkp.mByteCapacity = (val_buf.GetAllocLength() + 1) * sizeof(TCHAR);
+					bkp.mCharContents = val_buf.DetachBuffer();
+					bkp.mAttrib &= ~VAR_ATTRIB_OFTEN_REMOVED;
+				}
+				else
+					tmemcpy(bkp.mCharContents, val.marker, val.marker_length + 1);
+				bkp.mByteLength = val.marker_length * sizeof(TCHAR);
+			}
+			else
+			{
+				bkp.mContentsInt64 = val.value_int64;
+				bkp.mAttrib = bkp.mAttrib
+					& ~(VAR_ATTRIB_TYPES | VAR_ATTRIB_NOT_NUMERIC | VAR_ATTRIB_UNINITIALIZED)
+					| (val.symbol == SYM_INTEGER ? VAR_ATTRIB_IS_INT64 : VAR_ATTRIB_IS_DOUBLE) | VAR_ATTRIB_CONTENTS_OUT_OF_DATE;
+			}
+			success = true;
+			break;
+		}
+		target.var = target.bkp->mAliasFor;
+		// Fall through:
+	case PropVar:
+		success = !VAR_IS_READONLY(*target.var) && target.var->Assign(val);
+		break;
+	case PropNone: // Assignment handled by ParsePropertyName().
+		success = true;
+		break;
+	default:
+		success = false;
+	}
 
 	return mResponseBuf.WriteF(
 		"<response command=\"property_set\" success=\"%i\" transaction_id=\"%e\"/>"
@@ -1702,7 +2190,6 @@ DEBUGGER_COMMAND(Debugger::source)
 		return DEBUGGER_E_INVALID_OPTIONS;
 
 	int file_index;
-	FILE *source_file = NULL;
 
 	// Decode filename URI -> path, in-place.
 	DecodeURI(filename);
@@ -1714,93 +2201,66 @@ DEBUGGER_COMMAND(Debugger::source)
 	{
 		if (!_tcsicmp(filename_t, Line::sSourceFile[file_index]))
 		{
-			// TODO: Change this section to support different file encodings, perhaps via TextFile class.
-
-			if (!(source_file = _tfopen(filename_t, _T("rb"))))
+			TextFile tf;
+			if (!tf.Open(filename_t, DEFAULT_READ_FLAGS, g_DefaultScriptCodepage))
 				return DEBUGGER_E_CAN_NOT_OPEN_FILE;
 			
 			mResponseBuf.WriteF("<response command=\"source\" success=\"1\" transaction_id=\"%e\" encoding=\"base64\">"
 								, aTransactionId);
 
-			if (begin_line == 0 && end_line == UINT_MAX)
-			{	// RETURN THE ENTIRE FILE:
-				long file_size;
-				// Seek to end of file,
-				if (fseek(source_file, 0, SEEK_END)
-					// get file size
-					|| (file_size = ftell(source_file)) < 1
-					// and seek back to the beginning.
-					|| fseek(source_file, 0, SEEK_SET))
-					break; // fail.
+			CStringA utf8_buf;
+			TCHAR line_buf[LINE_SIZE + 2]; // May contain up to two characters of the previous line to simplify base64-encoding.
+			int line_length;
+			int line_remainder = 0;
 
-				// Reserve some space in advance to read the raw file data into.
-				if (mResponseBuf.WriteEncodeBase64(NULL, file_size) != DEBUGGER_E_OK)
-					break; // fail.
-
-				// Read into the end of the response buffer.
-				char *buf = mResponseBuf.mData + mResponseBuf.mDataSize - (file_size + 1);
-
-				if (file_size != fread(buf, 1, file_size, source_file))
-					break; // fail.
-
-				// Base64-encode and write the file data into the response buffer.
-				mResponseBuf.WriteEncodeBase64(buf, file_size, true);
-			}
-			else
-			{	// RETURN SPECIFIC LINES:
-				char line_buf[LINE_SIZE + 2]; // May contain up to two characters of the previous line to simplify base64-encoding.
-				size_t line_length;
-				int line_remainder = 0;
-
-				LineNumberType current_line = 0;
-				
-				while (fgets(line_buf + line_remainder, LINE_SIZE, source_file))
+			LineNumberType current_line = 0;
+			
+			while (-1 != (line_length = tf.ReadLine(line_buf + line_remainder, LINE_SIZE)))
+			{
+				if (++current_line >= begin_line)
 				{
-					if (++current_line >= begin_line)
-					{
-						if (current_line > end_line)
-							break; // done.
+					if (current_line > end_line)
+						break; // done.
 					
-						if (line_length = strlen(line_buf))
-						{
-							// Encode in multiples of 3 characters to avoid inserting padding characters.
-							line_remainder = line_length % 3;
-							line_length -= line_remainder;
+					// Encode in multiples of 3 characters to avoid inserting padding characters.
+					line_length += line_remainder; // Include remainder of previous line.
+					line_remainder = line_length % 3;
+					line_length -= line_remainder;
 
-							if (line_length)
-							{
-								// Base64-encode and write this line and its trailing newline character into the response buffer.
-								if (mResponseBuf.WriteEncodeBase64(line_buf, line_length) != DEBUGGER_E_OK)
-									goto break_outer_loop; // fail.
-							}
-							//else not enough data to encode in this iteration.
+					if (line_length)
+					{
+						// Convert line to UTF-8.
+						StringTCharToUTF8(line_buf, utf8_buf, line_length);
+						// Base64-encode and write this line and its trailing newline character into the response buffer.
+						if (mResponseBuf.WriteEncodeBase64(utf8_buf.GetString(), utf8_buf.GetLength()) != DEBUGGER_E_OK)
+							goto break_outer_loop; // fail.
+					}
+					//else not enough data to encode in this iteration.
 
-							if (line_remainder) // 0, 1 or 2.
-							{
-								line_buf[0] = line_buf[line_length];
-								if (line_remainder > 1)
-									line_buf[1] = line_buf[line_length + 1];
-							}
-						}
+					if (line_remainder) // 0, 1 or 2.
+					{
+						line_buf[0] = line_buf[line_length];
+						if (line_remainder > 1)
+							line_buf[1] = line_buf[line_length + 1];
 					}
 				}
-
-				// Write any left-over characters (if line_remainder is 0, this does nothing).
-				if (mResponseBuf.WriteEncodeBase64(line_buf, line_remainder) != DEBUGGER_E_OK)
-					break; // fail.
-
-				if (!current_line || current_line < begin_line)
-					break; // fail.
-				// else if (current_line < end_line) -- just return what we can.
 			}
-			fclose(source_file);
+
+			if (line_remainder) // Write any left-over characters.
+			{
+				StringTCharToUTF8(line_buf, utf8_buf, line_remainder);
+				if (mResponseBuf.WriteEncodeBase64(utf8_buf.GetString(), utf8_buf.GetLength()) != DEBUGGER_E_OK)
+					break; // fail.
+			}
+
+			if (!current_line || current_line < begin_line)
+				break; // fail.
+			// else if (current_line < end_line) -- just return what we can.
 
 			return mResponseBuf.Write("</response>");
 		}
 	}
 break_outer_loop:
-	if (source_file)
-		fclose(source_file);
 	// If we got here, one of the following is true:
 	//	- Something failed and used 'break'.
 	//	- The requested file is not a known source file of this script.
@@ -1851,22 +2311,26 @@ DEBUGGER_COMMAND(Debugger::redirect_stderr)
 int Debugger::WriteStreamPacket(LPCTSTR aText, LPCSTR aType)
 {
 	ASSERT(!mResponseBuf.mFailed);
+	// Although it is contrary to the DBGP spec, allowing stream packets to be sent while the debugger
+	// is in a break state (but executing due to a property getter invoked by property_get or context_get)
+	// is useful for debugging and therefore allowed.  We just have to be sure to preserve any partial
+	// response already present in the buffer:
+	size_t offset = mResponseBuf.mDataUsed;
 	mResponseBuf.WriteF("<stream type=\"%s\">", aType);
 	CStringUTF8FromTChar packet(aText);
 	mResponseBuf.WriteEncodeBase64(packet, packet.GetLength() + 1); // Includes the null-terminator.
 	mResponseBuf.Write("</stream>");
-	return SendResponse();
+	return SendResponse(offset);
 }
 
-void Debugger::OutputDebug(LPCTSTR aText)
+bool Debugger::OutputStdErr(LPCTSTR aText)
 {
 	if (mStdErrMode != SR_Disabled) // i.e. SR_Copy or SR_Redirect
 		WriteStreamPacket(aText, "stderr");
-	if (mStdErrMode != SR_Redirect) // i.e. SR_Disabled or SR_Copy
-		OutputDebugString(aText);
+	return mStdErrMode == SR_Redirect;
 }
 
-bool Debugger::FileAppendStdOut(LPCTSTR aText)
+bool Debugger::OutputStdOut(LPCTSTR aText)
 {
 	if (mStdOutMode != SR_Disabled) // i.e. SR_Copy or SR_Redirect
 		WriteStreamPacket(aText, "stdout");
@@ -1896,7 +2360,7 @@ int Debugger::SendStandardResponse(char *aCommandName, char *aTransactionId)
 	return SendResponse();
 }
 
-int Debugger::SendContinuationResponse(char *aCommand, char *aStatus, char *aReason)
+int Debugger::SendContinuationResponse(LPCSTR aCommand, LPCSTR aStatus, LPCSTR aReason)
 {
 	if (!aCommand)
 	{
@@ -1960,14 +2424,22 @@ int Debugger::ReceiveCommand(int *aCommandLength)
 //
 // Sends a response to a command, using mResponseBuf.mData as the message body.
 //
-int Debugger::SendResponse()
+int Debugger::SendResponse(size_t aStartOffset)
 {
 	ASSERT(!mResponseBuf.mFailed);
+	ASSERT(aStartOffset < mResponseBuf.mDataUsed);
+	ASSERT(mResponseBuf.mDataUsed <= mResponseBuf.mDataSize);
 
 	char response_header[DEBUGGER_RESPONSE_OVERHEAD];
+
+	size_t data_length = mResponseBuf.mDataUsed - aStartOffset;
+	
+	// Messages sent by the debugger engine must always be NULL terminated.
+	// ExpandIfNecessary() reserved 1 byte for this (excluded from mDataSize):
+	mResponseBuf.mData[mResponseBuf.mDataUsed] = '\0';
 	
 	// Each message is prepended with a stringified integer representing the length of the XML data packet.
-	Exp32or64(_itoa,_i64toa)(mResponseBuf.mDataUsed + DEBUGGER_XML_TAG_SIZE, response_header, 10);
+	Exp32or64(_itoa,_i64toa)(data_length + DEBUGGER_XML_TAG_SIZE, response_header, 10);
 
 	// The length and XML data are separated by a NULL byte.
 	char *buf = strchr(response_header, '\0') + 1;
@@ -1977,18 +2449,14 @@ int Debugger::SendResponse()
 
 	// Send the response header.
 	if (  SOCKET_ERROR == send(mSocket, response_header, (int)(buf - response_header), 0)
-	   // Messages sent by the debugger engine must always be NULL terminated.
-	   // Failure to write the last byte should be extremely rare, so no attempt
-	   // is made to recover from that condition.
-	   || DEBUGGER_E_OK != mResponseBuf.Write("\0", 1)
 	   // Send the message body.
-	   || SOCKET_ERROR == send(mSocket, mResponseBuf.mData, (int)mResponseBuf.mDataUsed, 0)  )
+	   || SOCKET_ERROR == send(mSocket, mResponseBuf.mData + aStartOffset, (int)(data_length + 1), 0)  )
 	{
 		// Unrecoverable error: disconnect the debugger.
 		return FatalError();
 	}
 
-	mResponseBuf.Clear();
+	mResponseBuf.mDataUsed = aStartOffset;
 	return DEBUGGER_E_OK;
 }
 
@@ -2028,8 +2496,8 @@ int Debugger::Connect(const char *aAddress, const char *aPort)
 				switch (MessageBox(g_hWnd, DEBUGGER_ERR_FAILEDTOCONNECT, g_script.mFileSpec, MB_ABORTRETRYIGNORE | MB_ICONSTOP | MB_SETFOREGROUND | MB_APPLMODAL))
 				{
 				case IDABORT:
-					g_script.ExitApp(EXIT_ERROR, _T(""));
-					// Above should always exit, but if it doesn't, fall through to the next case:
+					g_script.ExitApp(EXIT_CLOSE);
+					// If it didn't exit (due to OnExit), fall through to the next case:
 				case IDIGNORE:
 					closesocket(s);
 					return DEBUGGER_E_INTERNAL_ERROR;
@@ -2049,10 +2517,9 @@ int Debugger::Connect(const char *aAddress, const char *aPort)
 				mResponseBuf.Clear();
 
 				// Write init message.
-				mResponseBuf.WriteF("<init appid=\"" AHK_NAME "\" ide_key=\"%e\" session=\"%e\" thread=\"%u\" parent=\"\" language=\"" DEBUGGER_LANG_NAME "\" protocol_version=\"1.0\" fileuri=\""
-					, ide_key.GetString(), session.GetString(), GetCurrentThreadId());
-				mResponseBuf.WriteFileURI(U4T(g_script.mFileSpec));
-				mResponseBuf.Write("\"/>");
+				mResponseBuf.WriteF("<init appid=\"" AHK_NAME "\" ide_key=\"%e\" session=\"%e\" thread=\"%u\" parent=\"\" language=\"" DEBUGGER_LANG_NAME
+					"\" protocol_version=\"1.0\" fileuri=\"%r\"/>"
+					, ide_key.GetString(), session.GetString(), GetCurrentThreadId(), g_script.mFileSpec);
 
 				if (SendResponse() == DEBUGGER_E_OK)
 				{
@@ -2117,8 +2584,8 @@ int Debugger::FatalError(LPCTSTR aMessage)
 
 	if (IDNO == MessageBox(g_hWnd, aMessage, g_script.mFileSpec, MB_YESNO | MB_ICONSTOP | MB_SETFOREGROUND | MB_APPLMODAL))
 	{
-		// The following will exit even if the OnExit subroutine does not use ExitApp:
-		g_script.ExitApp(EXIT_ERROR, _T(""));
+		// This might not exit, depending on OnExit:
+		g_script.ExitApp(EXIT_CLOSE);
 	}
 	return DEBUGGER_E_INTERNAL_ERROR;
 }
@@ -2306,6 +2773,14 @@ int Debugger::Buffer::WriteF(const char *aFormat, ...)
 					continue;
 				}
 
+				case 'r':
+					if (i == 0)
+						len += EstimateFileURILength(va_arg(vl, LPCTSTR));
+					else
+						WriteFileURI(va_arg(vl, LPCTSTR));
+					++format_ptr; // Skip %, outer loop will skip format char.
+					continue;
+
 				default:
 					s = NULL; // Skip section below.
 				} // switch (format_ptr[1])
@@ -2341,28 +2816,33 @@ int Debugger::Buffer::WriteF(const char *aFormat, ...)
 	return DEBUGGER_E_OK;
 }
 
-// Convert a file path to a URI and write it to the buffer.
-int Debugger::Buffer::WriteFileURI(const char *aPath)
+int Debugger::Buffer::EstimateFileURILength(LPCTSTR aPath)
 {
-	int c, len = 9; // 8 for "file:///", 1 for '\0' (written by sprintf()).
-
-	// Calculate required buffer size for path after encoding.
-	for (const char *ptr = aPath; c = *ptr; ++ptr)
+	TBYTE c, len = 8; // "file:///"
+	for (LPCTSTR ptr = aPath; c = *ptr; ++ptr)
 	{
-		if (cisalnum(c) || strchr("-_.!~*'()/\\", c))
+		if (cisalnum(c) || _tcschr(_T("-_.!~*'()/\\"), c))
 			++len;
 		else
-			len += 3;
+			// For code size, estimate based on worst-case scenario (U+FFFF -> %ef%bf%bf).
+			// Any extra space is likely to be used at some point, as the response buffer gets reused.
+			len += 9;
 	}
+	return len;
+}
 
-	// Ensure the buffer contains enough space.
-	if (ExpandIfNecessary(mDataUsed + len) != DEBUGGER_E_OK)
-		return DEBUGGER_E_INTERNAL_ERROR;
+// Convert a file path to a URI and write it to the buffer.
+// Caller has already verified there is enough space in the buffer.
+void Debugger::Buffer::WriteFileURI(LPCWSTR aPath)
+{
+	memcpy(mData + mDataUsed, "file:///", 8);
+	mDataUsed += 8;
 
-	Write("file:///", 8);
+	char utf8[4];
 
 	// Write to the buffer, encoding as we go.
-	for (const char *ptr = aPath; c = *ptr; ++ptr)
+	int c;
+	for (auto ptr = aPath; c = *ptr; ++ptr)
 	{
 		if (cisalnum(c) || strchr("-_.!~*()/", c))
 		{
@@ -2375,13 +2855,17 @@ int Debugger::Buffer::WriteFileURI(const char *aPath)
 		}
 		else
 		{
-			len = sprintf(mData + mDataUsed, "%%%02X", c & 0xff);
-			if (len != -1)
-				mDataUsed += len;
+			bool extra = IS_SURROGATE_PAIR(ptr[0], ptr[1]);
+			int utf8_size = WideCharToMultiByte(CP_UTF8, 0, ptr, 1 + extra, utf8, sizeof(utf8), NULL, NULL);
+			ptr += extra;
+			for (int i = 0; i < utf8_size; ++i)
+			{
+				int len = sprintf(mData + mDataUsed, "%%%02X", utf8[i] & 0xff);
+				if (len != -1)
+					mDataUsed += len;
+			}
 		}
 	}
-
-	return DEBUGGER_E_OK;
 }
 
 int Debugger::Buffer::WriteEncodeBase64(const char *aInput, size_t aInputSize, bool aSkipBufferSizeCheck/* = false*/)
@@ -2446,7 +2930,7 @@ void Debugger::DecodeURI(char *aUri)
 // Initialize or expand the buffer, don't care how much.
 int Debugger::Buffer::Expand()
 {
-	return ExpandIfNecessary(mDataSize ? mDataSize * 2 : DEBUGGER_INITIAL_BUFFER_SIZE);
+	return ExpandIfNecessary(mDataSize + 1);
 }
 
 // Expand as necessary to meet a minimum required size.
@@ -2456,11 +2940,11 @@ int Debugger::Buffer::ExpandIfNecessary(size_t aRequiredSize)
 		return DEBUGGER_E_INTERNAL_ERROR;
 
 	size_t new_size;
-	for (new_size = mDataSize ? mDataSize : DEBUGGER_INITIAL_BUFFER_SIZE
-		; new_size < aRequiredSize
+	for (new_size = mDataSize ? mDataSize + 1 : DEBUGGER_INITIAL_BUFFER_SIZE
+		; new_size <= aRequiredSize
 		; new_size *= 2);
 
-	if (new_size > mDataSize)
+	if (new_size > mDataSize + 1)
 	{
 		// For simplicity, this preserves all of mData not just the first mDataUsed bytes.  Some sections may rely on this.
 		char *new_data = (char*)realloc(mData, new_size);
@@ -2472,13 +2956,13 @@ int Debugger::Buffer::ExpandIfNecessary(size_t aRequiredSize)
 		}
 
 		mData = new_data;
-		mDataSize = new_size;
+		mDataSize = new_size - 1; // Reserve 1 byte for null-termination.
 	}
 	return DEBUGGER_E_OK;
 }
 
 // Remove data from the front of the buffer (i.e. after it is processed).
-void Debugger::Buffer::Remove(size_t aDataSize)
+void Debugger::Buffer::Delete(size_t aDataSize)
 {
 	ASSERT(aDataSize <= mDataUsed);
 	// Move remaining data to the front of the buffer.
@@ -2505,7 +2989,7 @@ DbgStack::Entry *DbgStack::Push()
 		// which means that it needs to point to the last executed line at that depth. The
 		// following fixes a bug where the line number of this entry appears to revert to
 		// the first line of the function or sub whenever the debugger steps into another
-		// function or sub.  Entry::line is now also used by BIF_Exception even when the
+		// function or sub.  Entry::line is also used by Object::Error__New even when the
 		// debugger is disconnected, which has two consequences:
 		//  - g_script.mCurrLine must be used in place of g_Debugger.mCurrLine.
 		//  - Changing PreExecLine() to update mStack.mTop->line won't help.
@@ -2514,7 +2998,15 @@ DbgStack::Entry *DbgStack::Push()
 	return ++mTop;
 }
 
-void DbgStack::Push(TCHAR *aDesc)
+void DbgStack::Pop()
+{
+	ASSERT(mTop >= mBottom);
+	--mTop;
+	if (mTop >= mBottom)
+		g_script.mCurrLine = g_Debugger.mCurrLine = mTop->line;
+}
+
+void DbgStack::Push(LPCTSTR aDesc)
 {
 	Entry &s = *Push();
 	s.line = NULL;
@@ -2522,56 +3014,137 @@ void DbgStack::Push(TCHAR *aDesc)
 	s.type = SE_Thread;
 }
 	
-void DbgStack::Push(Label *aSub)
+void DbgStack::Push(NativeFunc *aFunc)
 {
 	Entry &s = *Push();
-	s.line = aSub->mJumpToLine;
-	s.sub  = aSub;
-	s.type = SE_Sub;
-}
-	
-void DbgStack::Push(Func *aFunc)
-{
-	Entry &s = *Push();
-	s.line = aFunc->mJumpToLine;
+	s.line = NULL;
 	s.func = aFunc;
-	s.type = SE_Func;
+	s.type = SE_BIF;
+}
+
+void DbgStack::Push(UDFCallInfo *aUDF)
+{
+	Entry &s = *Push();
+	s.line = aUDF->func->mJumpToLine;
+	s.udf = aUDF;
+	s.type = SE_UDF;
+}
+
+
+LPCTSTR DbgStack::Entry::Name()
+{
+	switch (type)
+	{
+	case SE_UDF:
+		return udf->func->mName;
+	case SE_BIF:
+		return func->mName;
+	default: // SE_Thread
+		return desc;
+	}
+}
+
+
+void DbgStack::GetLocalVars(int aDepth,  VarList *&aVars, VarList *&aStaticVars, VarBkp *&aBkp, VarBkp *&aBkpEnd)
+{
+	DbgStack::Entry *se = mTop - aDepth;
+	for (;;)
+	{
+		if (se < mBottom)
+			return;
+		if (se->type == DbgStack::SE_UDF)
+			break;
+		--se;
+	}
+	auto &func = *se->udf->func;
+	aStaticVars = &func.mStaticVars;
+	if (func.mInstances > 1 && aDepth > 0)
+	{
+		while (++se <= mTop)
+		{
+			if (se->type == DbgStack::SE_UDF && se->udf->func == &func)
+			{
+				// This instance interrupted the target instance, so its backup
+				// contains the values of the target instance's local variables.
+				aBkp = se->udf->backup;
+				aBkpEnd = aBkp + se->udf->backup_count;
+				return;
+			}
+		}
+	}
+	// Since above did not return, this instance wasn't interrupted.
+	aVars = &func.mVars;
 }
 
 
 void Debugger::PropertyWriter::WriteProperty(LPCSTR aName, ExprTokenType &aValue)
 {
-	mDbg.AppendKeyName(mNameBuf, mNameLength, aName); // See BeginProperty() for comments about this line.
+	mProp.fullname.AppendFormat(".%s", aName);
 	_WriteProperty(aValue);
 }
 
 
-void Debugger::PropertyWriter::WriteProperty(INT_PTR aKey, ExprTokenType &aValue)
+void Debugger::PropertyWriter::WriteProperty(LPCWSTR aName, ExprTokenType &aValue)
 {
-	mNameBuf.AppendFormat("[%Ii]", aKey);
-	_WriteProperty(aValue);
+	WriteProperty(CStringUTF8FromWChar(aName), aValue);
 }
 
 
-void Debugger::PropertyWriter::WriteProperty(IObject *aKey, ExprTokenType &aValue)
+void Debugger::PropertyWriter::WriteProperty(ExprTokenType &aKey, ExprTokenType &aValue)
 {
-	mNameBuf.AppendFormat("[Object(%Ii)]", aKey);
+	switch (aKey.symbol)
+	{
+	case SYM_INTEGER: mProp.fullname.AppendFormat("[%Ii]", aKey.value_int64); break;
+	case SYM_OBJECT: mProp.fullname.AppendFormat("[Object(%Ii)]", aKey.object); break;
+	default:
+		ASSERT(aKey.symbol == SYM_STRING);
+		mDbg.AppendStringKey(mProp.fullname, mNameLength, CStringUTF8FromTChar(aKey.marker));
+	}
 	_WriteProperty(aValue);
 }
 
 
-void Debugger::PropertyWriter::_WriteProperty(ExprTokenType &aValue)
+void Debugger::PropertyWriter::WriteBaseProperty(IObject *aBase)
+{
+	mProp.fullname.Append(".<base>", 7);
+	_WriteProperty(mProp.value, aBase);
+}
+
+
+void Debugger::PropertyWriter::WriteDynamicProperty(LPTSTR aName)
+{
+	FuncResult result_token;
+	auto result = mProp.invokee->Invoke(result_token, IT_GET, aName, mProp.value, nullptr, 0);
+	if (!result)
+		result_token.SetValue(_T("<error>"), 7);
+	mDbg.AppendPropertyName(mProp.fullname, mNameLength, CStringUTF8FromTChar(aName));
+	_WriteProperty(result_token);
+	result_token.Free();
+}
+
+
+void Debugger::PropertyWriter::_WriteProperty(ExprTokenType &aValue, IObject *aInvokee)
 {
 	if (mError)
 		return;
+	PropertyInfo prop(mProp.fullname, mProp.value.buf);
+	if (aInvokee)
+		prop.invokee = aInvokee;
 	// Find the property's "relative" name at the end of the buffer:
-	LPCSTR name = mNameBuf.GetString() + mNameLength;
-	if (*name == '.')
-		name++;
+	prop.name = mProp.fullname.GetString() + mNameLength;
+	if (*prop.name == '.')
+		prop.name++;
 	// Write the property (and if it contains an object, any child properties):
-	mError = mDbg.WritePropertyXml(aValue, name, mNameBuf, mPageSize, mMaxDepth - mDepth, mMaxEncodedSize);
+	prop.value.CopyValueFrom(aValue);
+	if (aValue.symbol == SYM_OBJECT)
+		aValue.object->AddRef();
+	//prop.page = 0; // "the childrens pages are always the first page."
+	prop.pagesize = mProp.pagesize;
+	prop.max_data = mProp.max_data;
+	prop.max_depth = mProp.max_depth - mDepth;
+	mError = mDbg.WritePropertyXml(prop);
 	// Truncate back to the parent property name:
-	mNameBuf.Truncate(mNameLength);
+	mProp.fullname.Truncate(mNameLength);
 }
 
 
@@ -2584,31 +3157,34 @@ void Debugger::PropertyWriter::BeginProperty(LPCSTR aName, LPCSTR aType, int aNu
 
 	if (mDepth == 1) // Write <property> for the object itself.
 	{
-		LPCSTR classname = typeid(*mObject).name();
-		if (!strncmp(classname, "class ", 6))
-			classname += 6;
-
-		mError = mDbg.mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" classname=\"%s\" address=\"%p\" size=\"0\" page=\"%i\" pagesize=\"%i\" children=\"%i\" numchildren=\"%i\">"
-					, mName, mNameBuf.GetString(), aType, classname, mObject, mPage, mPageSize, aNumChildren > 0, aNumChildren);
+		LPTSTR classname;
+		LPSTR class_suffix = "";
+		if (   mProp.invokee->IsOfType(Object::sPrototype)
+			&& (classname = static_cast<Object*>(mProp.invokee)->GetOwnPropString(_T("__Class")))   )
+			class_suffix = ".Prototype";
+		else
+			classname = mProp.invokee->Type();
+		mError = mDbg.mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" facet=\"%s\" classname=\"%s%s\" address=\"%p\" size=\"0\" page=\"%i\" pagesize=\"%i\" children=\"%i\">"
+					, mProp.name, mProp.fullname.GetString(), aType, mProp.facet, U4T(classname), class_suffix, mProp.invokee, mProp.page, mProp.pagesize, aNumChildren > 0);
 		return;
 	}
 
 	// aName is the raw name of this property.  Before writing it into the response,
 	// convert it to the required expression-like form.  Do this conversion within
-	// mNameBuf so it can be used for the fullname attribute:
-	mDbg.AppendKeyName(mNameBuf, mNameLength, aName);
+	// mProp.fullname so it can be used for the fullname attribute:
+	mDbg.AppendPropertyName(mProp.fullname, mNameLength, aName);
 
 	// Find the property's "relative" name at the end of the buffer:
-	LPCSTR name = mNameBuf.GetString() + mNameLength;
+	LPCSTR name = mProp.fullname.GetString() + mNameLength;
 	if (*name == '.')
 		name++;
 	
 	// Save length of outer property name and update mNameLength.
 	aCookie = (DebugCookie)mNameLength;
-	mNameLength = mNameBuf.GetLength();
+	mNameLength = mProp.fullname.GetLength();
 
-	mError = mDbg.mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" size=\"0\" page=\"0\" pagesize=\"%i\" children=\"%i\" numchildren=\"%i\">"
-				, name, mNameBuf.GetString(), aType, mPageSize, aNumChildren > 0, aNumChildren);
+	mError = mDbg.mResponseBuf.WriteF("<property name=\"%e\" fullname=\"%e\" type=\"%s\" size=\"0\" page=\"0\" pagesize=\"%i\" children=\"%i\">"
+				, name, mProp.fullname.GetString(), aType, mProp.pagesize, aNumChildren > 0);
 }
 
 
@@ -2622,10 +3198,43 @@ void Debugger::PropertyWriter::EndProperty(DebugCookie aCookie)
 	if (mDepth > 0) // If we just ended a child property...
 	{
 		mNameLength = (size_t)aCookie; // Restore to the value it had before BeginProperty().
-		mNameBuf.Truncate(mNameLength);
+		mProp.fullname.Truncate(mNameLength);
 	}
 	
 	mError = mDbg.mResponseBuf.Write("</property>");
+}
+
+
+void GetScriptStack(LPTSTR aBuf, int aBufSize, DbgStack::Entry *aTop)
+{
+	*aBuf = '\0';
+	aBufSize -= 12;
+	auto aBuf_orig = aBuf;
+	for (auto se = aTop ? aTop : g_Debugger.mStack.mTop - 1; se >= g_Debugger.mStack.mBottom; --se)
+	{
+		auto &line = se->line ? *se->line : *g_script.mCurrLine;
+		auto line_start = aBuf;
+		if (se->type != DbgStack::SE_Thread || se->desc == g_AutoExecuteThreadDesc)
+		{
+			auto name = se->Name();
+			if (name == g_AutoExecuteThreadDesc)
+				name = _T("");
+			aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T("%s (%i) : [%s] ")
+				, Line::sSourceFile[line.mFileIndex], (int)line.mLineNumber, name);
+			aBuf = line.ToText(aBuf, BUF_SPACE_REMAINING, true, 0, false, false);
+		}
+		if (se->type == DbgStack::SE_Thread)
+		{
+			aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T("> %s\r\n"), se->desc);
+		}
+		if (BUF_SPACE_REMAINING <= 1) // In case of truncation, there should be 1 char left, since the terminator is not counted.
+		{
+			aBuf = line_start;
+			aBufSize += 12;
+			sntprintf(aBuf, BUF_SPACE_REMAINING, _T("... %i more"), int(se - g_Debugger.mStack.mBottom) + 1);
+			break;
+		}
+	}
 }
 
 
@@ -2634,11 +3243,13 @@ void Debugger::PropertyWriter::EndProperty(DebugCookie aCookie)
 
 // Helper for Var::ToText().
 
-LPTSTR Var::ObjectToText(LPTSTR aBuf, int aBufSize)
+LPTSTR Var::ObjectToText(LPTSTR aName, LPTSTR aBuf, int aBufSize)
 {
 	LPTSTR aBuf_orig = aBuf;
-	aBuf += sntprintf(aBuf, aBufSize, _T("%s[Object]: 0x%p"), mName, mObject);
+	aBuf += sntprintf(aBuf, aBufSize, _T("%s: %s object"), aName, mObject->Type());
 	if (ComObject *cobj = dynamic_cast<ComObject *>(mObject))
-		aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T(" <= ComObject(0x%04hX, 0x%I64X)"), cobj->mVarType, cobj->mVal64);
+		aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T(" {wrapper: 0x%IX, vt: 0x%04hX, value: 0x%I64X}"), cobj, cobj->mVarType, cobj->mVal64);
+	else
+		aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T(" {address: 0x%IX}"), mObject);
 	return aBuf;
 }

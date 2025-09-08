@@ -19,13 +19,12 @@ GNU General Public License for more details.
 
 #include "stdafx.h" // pre-compiled headers
 #include "defines.h"
-EXTERN_G;  // For ITOA() and related functions' use of g->FormatIntAsHex
 
 
 #ifdef _WIN64
-#define Exp32or64(a,b) (b)
+#define Exp32or64(exp32, exp64) (exp64)
 #else
-#define Exp32or64(a,b) (a)
+#define Exp32or64(exp32, exp64) (exp32)
 #endif
 
 
@@ -54,14 +53,6 @@ EXTERN_G;  // For ITOA() and related functions' use of g->FormatIntAsHex
 #define IS_SPACE_OR_TAB_OR_NBSP(c) IS_SPACE_OR_TAB(c) // wchar_t is unsigned
 #endif
 
-#ifdef UNICODE
-#define TRANS_CHAR_TO_INT(a) ((int)(USHORT)(a)) // Cast not actually necessary since wchar_t is usually unsigned.
-#define TRANS_CHAR_MAX 65535
-#else
-#define TRANS_CHAR_TO_INT(a) ((int)(UCHAR)(a)) // Cast to UCHAR so that chars above Asc(127) show as positive.
-#define TRANS_CHAR_MAX 255
-#endif
-
 // v1.0.43.04: The following are macros to avoid crash bugs caused by improper casting, namely a failure to cast
 // a signed char to UCHAR before promoting it to LPSTR, which crashes since CharLower/Upper would interpret
 // such a high unsigned value as an address rather than a single char.
@@ -69,21 +60,22 @@ EXTERN_G;  // For ITOA() and related functions' use of g->FormatIntAsHex
 #define ltoupper(ch) (TBYTE)(UINT_PTR)CharUpper((LPTSTR)(TBYTE)(ch))  // For performance, some callers don't want return value cast to char.
 
 
-// Locale independent ctype (applied to the ASCII characters only)
-// isctype/iswctype affects the some non-ASCII characters.
+// Locale independent ctype (applied to the ASCII characters only).
 inline int cisctype(TBYTE c, int type)
 {
 	return (c & (~0x7F)) ? 0 : _isctype(c, type);
 }
 
-#define cisalpha(c)		cisctype(c, _ALPHA)
-#define cisalnum(c)		cisctype(c, _ALPHA | _DIGIT)
-#define cisdigit(c)		cisctype(c, _DIGIT)
-#define cisxdigit(c)	cisctype(c, _HEX)
-#define cisupper(c)		cisctype(c, _UPPER)
-#define cislower(c)		cisctype(c, _LOWER)
-#define cisprint(c)		cisctype(c, _ALPHA | _BLANK | _DIGIT | _PUNCT)
-#define cisspace(c)		cisctype(c, _SPACE)
+// These simplified checks significantly reduce code size vs. using the standard C functions:
+inline int cisupper(TBYTE c)  { return c <= 'Z' && c >= 'A'; }
+inline int cislower(TBYTE c)  { return c >= 'a' && c <= 'z'; }
+inline int cisdigit(TBYTE c)  { return c <= '9' && c >= '0'; }
+inline int cisalpha(TBYTE c)  { return cisupper(c) || cislower(c); }
+
+inline int cisalnum(TBYTE c)  { return ((c & ~0x7F) ? 0 : isalnum(c)); }
+inline int cisxdigit(TBYTE c) { return ((c & ~0x7F) ? 0 : isxdigit(c)); }
+inline int cisprint(TBYTE c)  { return ((c & ~0x7F) ? 0 : isprint(c)); }
+inline int cisspace(TBYTE c)  { return ((c & ~0x7F) ? 0 : isspace(c)); }
 
 // The results of toupper/tolower are implementations dependent (see below), though the test results are OK in VS2008's CRT.
 // MDSN: In order for toupper to give the expected results, __isascii and islower must both return nonzero.
@@ -96,15 +88,6 @@ inline TCHAR ctolower(TBYTE c)
 {
 	return cisupper(c) ? (c | 0x20) : c;
 }
-
-// Runtime setting dependent. "a" prefix stand for AutoHotkey.
-#define aisalpha(c)	((int)((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? IsCharAlpha(c) : cisalpha(c)))
-#define aisalnum(c)	((int)((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? IsCharAlphaNumeric(c) : cisalnum(c)))
-#define aisupper(c)	((int)((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? IsCharUpper(c) : cisupper(c)))
-#define aislower(c)	((int)((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? IsCharLower(c) : cislower(c)))
-
-#define atoupper(c)	((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? ltoupper(c) : ctoupper(c))
-#define atolower(c)	((::g->StringCaseSense == SCS_INSENSITIVE_LOCALE) ? ltolower(c) : ctolower(c))
 
 // NOTE: MOVING THINGS OUT OF THIS FILE AND INTO util.cpp can hurt benchmarks by 10% or more, so be careful
 // when doing so (even when the change seems inconsequential, it can impact benchmarks due to quirks of code
@@ -142,7 +125,8 @@ inline LPTSTR StrToTitleCase(LPTSTR aStr)
 
 
 
-inline LPTSTR StrChrAny(LPTSTR aStr, LPTSTR aCharList)
+template<typename T = LPTSTR>
+inline T StrChrAny(T aStr, LPCTSTR aCharList)
 // Returns the position of the first char in aStr that is of any one of the characters listed in aCharList.
 // Returns NULL if not found.
 // Update: Yes, this seems identical to strpbrk().  However, since the corresponding code would
@@ -155,7 +139,7 @@ inline LPTSTR StrChrAny(LPTSTR aStr, LPTSTR aCharList)
 	// Don't use strchr() because that would just find the first occurrence
 	// of the first search-char, which is not necessarily the first occurrence
 	// of *any* search-char:
-	LPTSTR look_for_this_char;
+	LPCTSTR look_for_this_char;
 	TCHAR char_being_analyzed;
 	for (; *aStr; ++aStr)
 		// If *aStr is any of the search char's, we're done:
@@ -180,14 +164,15 @@ inline LPTSTR omit_leading_whitespace(LPTSTR aBuf)
 }
 
 
-inline LPTSTR omit_leading_any(LPTSTR aBuf, LPTSTR aOmitList, size_t aLength)
+template<typename T>
+inline T omit_leading_any(T aBuf, LPCTSTR aOmitList, size_t aLength)
 // Returns the address of the first character in aBuf that isn't a member of aOmitList.
 // But no more than aLength characters of aBuf will be considered.  If aBuf is composed
 // entirely of omitted characters, the address of the char after the last char in the
 // string will returned (that char will be the zero terminator unless aLength explicitly
 // caused only part of aBuf to be considered).
 {
-	LPTSTR cp;
+	LPCTSTR cp;
 	for (size_t i = 0; i < aLength; ++i, ++aBuf)
 	{
 		// Check if the current char is a member of the omitted-char list:
@@ -215,13 +200,14 @@ inline LPTSTR omit_trailing_whitespace(LPTSTR aBuf, LPTSTR aBuf_marker)
 
 
 
-inline size_t omit_trailing_any(LPTSTR aBuf, LPTSTR aOmitList, LPTSTR aBuf_marker)
+template<typename T>
+inline size_t omit_trailing_any(T aBuf, LPCTSTR aOmitList, T aBuf_marker)
 // aBuf_marker must be a position in aBuf (to the right of it).
 // Starts at aBuf_marker and keeps moving to the left until a char that isn't a member
 // of aOmitList is found.  The length of the remaining substring is returned.
 // That length will be zero if the string consists entirely of omitted characters.
 {
-	LPTSTR cp;
+	LPCTSTR cp;
 	for (; aBuf_marker > aBuf; --aBuf_marker)
 	{
 		// Check if the current char is a member of the omitted-char list:
@@ -244,7 +230,6 @@ inline size_t omit_trailing_any(LPTSTR aBuf, LPTSTR aOmitList, LPTSTR aBuf_marke
 inline size_t ltrim(LPTSTR aStr, size_t aLength = -1)
 // Caller must ensure that aStr is not NULL.
 // v1.0.25: Returns the length if it was discovered as a result of the operation, or aLength otherwise.
-// This greatly improves the performance of PerformAssign().
 // NOTE: THIS VERSION trims only tabs and spaces.  It specifically avoids
 // trimming newlines because some callers want to retain those.
 {
@@ -253,7 +238,7 @@ inline size_t ltrim(LPTSTR aStr, size_t aLength = -1)
 	// Find the first non-whitespace char (which might be the terminator):
 	for (ptr = aStr; IS_SPACE_OR_TAB(*ptr); ++ptr); // Self-contained loop.
 	// v1.0.25: If no trimming needed, don't do the memmove.  This seems to make a big difference
-	// in the performance of critical sections of the program such as PerformAssign():
+	// in the performance of critical sections of the program:
 	size_t offset;
 	if (offset = ptr - aStr) // Assign.
 	{
@@ -269,8 +254,7 @@ inline size_t ltrim(LPTSTR aStr, size_t aLength = -1)
 inline size_t rtrim(LPTSTR aStr, size_t aLength = -1)
 // Caller must ensure that aStr is not NULL.
 // To improve performance, caller may specify a length (e.g. when it is already known).
-// v1.0.25: Always returns the new length of the string.  This greatly improves the performance of
-// PerformAssign().
+// v1.0.25: Always returns the new length of the string.
 // NOTE: THIS VERSION trims only tabs and spaces.  It specifically avoids trimming newlines because
 // some callers want to retain those.
 {
@@ -292,42 +276,8 @@ inline size_t rtrim(LPTSTR aStr, size_t aLength = -1)
 		// Otherwise, it is a space or tab...
 		if (cp == aStr) // ... and we're now at the first character of the string...
 		{
-			if (IS_SPACE_OR_TAB(*cp)) // ... and that first character is also a space or tab...
-			{
-				*cp = '\0'; // ... so the entire string is made empty...
-				return 0; // Fix for v1.0.39: Must return 0 not aLength in this case.
-			}
-			return aLength; // ... and we return in any case.
-		}
-		// else it's a space or tab, and there are still more characters to check.  Let the loop
-		// do its decrements.
-	}
-}
-
-inline void rtrim_literal(LPTSTR aStr, TCHAR aLiteralMap[])
-// Caller must ensure that aStr is not NULL.
-// NOTE: THIS VERSION trims only tabs and spaces which aren't marked as literal (so not "`t" or "` ").
-// It specifically avoids trimming newlines because some callers want to retain those.
-{
-	if (!*aStr) return; // The below relies upon this check having been done.
-	// It's done this way in case aStr just happens to be address 0x00 (probably not possible
-	// on Intel & Intel-clone hardware) because otherwise --cp would decrement, causing an
-	// underflow since pointers are probably considered unsigned values, which would
-	// probably cause an infinite loop.  Extremely unlikely, but might as well try
-	// to be thorough:
-	for (size_t last = _tcslen(aStr) - 1; ; --last)
-	{
-		if (!IS_SPACE_OR_TAB(aStr[last]) || aLiteralMap[last]) // It's not a space or tab, or it's a literal one.
-		{
-			aStr[last + 1] = '\0';
-			return;
-		}
-		// Otherwise, it is a space or tab...
-		if (last == 0) // ... and we're now at the first character of the string...
-		{
-			if (IS_SPACE_OR_TAB(aStr[last])) // ... and that first character is also a space or tab...
-				*aStr = '\0'; // ... so the entire string is made empty.
-			return; // ... and we return in any case.
+			*cp = '\0'; // ... so the entire string is made empty.
+			return 0;
 		}
 		// else it's a space or tab, and there are still more characters to check.  Let the loop
 		// do its decrements.
@@ -373,8 +323,7 @@ inline size_t trim(LPTSTR aStr, size_t aLength = -1)
 {
 	aLength = ltrim(aStr, aLength);  // It may return -1 to indicate that it still doesn't know the length.
     return rtrim(aStr, aLength);
-	// v1.0.25: rtrim() always returns the new length of the string.  This greatly improves the
-	// performance of PerformAssign() and possibly other things.
+	// v1.0.25: rtrim() always returns the new length of the string.
 }
 
 inline size_t strip_trailing_backslash(LPTSTR aPath)
@@ -395,8 +344,25 @@ inline size_t strip_trailing_backslash(LPTSTR aPath)
 }
 
 
+// Returns aBuf if not surrounded by matching quote marks (" or ').
+// Otherwise returns aBuf+1 after terminating at the trailing quote mark.
+inline LPTSTR strip_quote_marks(LPTSTR aBuf)
+{
+	if (!aBuf || !(*aBuf == '"' || *aBuf == '\''))
+		return aBuf;
+	LPTSTR end = _tcschr(aBuf + 1, '\0');
+	if (end[-1] != *aBuf)
+		return aBuf;
+	end[-1] = '\0';
+	return aBuf + 1;
+}
 
-#define IS_IDENTIFIER_CHAR(c) (cisalnum(c) || (c) == '_' || ((UINT)(c) > 0x7F))
+
+
+// For the following, checking for non-ASCII first avoids undefined behaviour in
+// isalnum/isalpha, which produce smaller code than using cisalnum/cisalpha.
+#define IS_IDENTIFIER_CHAR(c)			(UINT(c) > 0x7F || isalnum(c) || (c) == '_')
+#define IS_LEADING_IDENTIFIER_CHAR(c)	(UINT(c) > 0x7F || isalpha(c) || (c) == '_')
 template<typename T> inline T find_identifier_end(T aBuf)
 // Locates the next character which is not valid in an identifier (var, func, or obj.key name).
 {
@@ -419,8 +385,7 @@ inline COLORREF rgb_to_bgr(DWORD aRGB)
 
 
 inline bool IsHex(LPCTSTR aBuf) // 10/17/2006: __forceinline worsens performance, but physically ordering it near ATOI64() [via /ORDER] boosts by 3.5%.
-// Note: AHK support for hex ints reduces performance by only 10% for decimal ints, even in the tightest
-// of math loops that have SetBatchLines set to -1.
+// Note: AHK support for hex ints reduces performance by only 10% for decimal ints, even in the tightest of math loops.
 {
 	// For whatever reason, omit_leading_whitespace() benches consistently faster (albeit slightly) than
 	// the same code put inline (confirmed again on 10/17/2006, though the difference is hardly anything):
@@ -437,6 +402,15 @@ inline bool IsHex(LPCTSTR aBuf) // 10/17/2006: __forceinline worsens performance
 
 
 
+__int64 istrtoi64(LPCTSTR buf, LPCTSTR *endptr);
+
+inline __int64 istrtoi64(LPTSTR buf, LPTSTR *endptr)
+{
+	return istrtoi64(buf, const_cast<LPCTSTR *>(endptr));
+}
+
+__int64 nstrtoi64(LPCTSTR buf);
+
 // As of v1.0.30, ATOI(), ITOA() and the other related functions below are no longer macros
 // because there are too many places where something like ATOI(++cp) is done, which would be a
 // bug if not caught since cp would be incremented more than once if the macro referred to that
@@ -450,20 +424,28 @@ inline bool IsHex(LPCTSTR aBuf) // 10/17/2006: __forceinline worsens performance
 // the performance isn't any better.
 
 inline __int64 ATOI64(LPCTSTR buf)
-// The following comment only applies if the code is a macro or actually put inline by the compiler,
-// which is no longer true:
-// A more complex macro is used for ATOI64(), since it is more often called from places where
-// performance matters (e.g. ACT_ADD).  It adds about 500 bytes to the code size  in exchange for
-// a 8% faster math loops.  But it's probably about 8% slower when used with hex integers, but
-// those are so rare that the speed-up seems worth the extra code size:
-//#define ATOI64(buf) _strtoi64(buf, NULL, 0) // formerly used _atoi64()
 {
-	return IsHex(buf) ? _tcstoi64(buf, NULL, 16) : _ttoi64(buf);  // _atoi64() has superior performance, so use it when possible.
+	// See ATOI() for the reason IsHex() is used.
+	// Old comment: _atoi64() has superior performance, so use it when possible.
+	// Update: Benchmarks in 2018 showed there to be only marginal difference between _ttoi64
+	// and _tcstoull, with the latter getting slightly better results.  Initially _tcstoull
+	// was used to allow values in the range LLONG_MAX+1..ULLONG_MAX to overflow, but it also
+	// made the behaviour of larger values even less consistent (producing -1 vs. LLONG_MAX).
+	// Instead, a custom version of _tcstoi64 is used, allowing all overflow and disallowing
+	// octal (avoiding the need for IsHex()).  This benchmarked considerably faster.
+	// For example, these expressions are now true:
+	//  9223372036854775807+1 == 9223372036854775808
+	//   0xFFFFFFFFFFFFFFFF == -1
+	//  0x10000000000000001 ==  1
+	//return IsHex(buf) ? _tcstoi64(buf, NULL, 16) : _ttoi64(buf);  
+	return nstrtoi64(buf);
 }
 
 inline unsigned __int64 ATOU64(LPCTSTR buf)
 {
-	return _tcstoui64(buf, NULL, IsHex(buf) ? 16 : 10);
+	// Simple type-cast is sufficient since nstrtoi64 doesn't do range checks.
+	return (unsigned __int64)nstrtoi64(buf);
+	//return _tcstoui64(buf, NULL, IsHex(buf) ? 16 : 10);
 }
 
 inline int ATOI(LPCTSTR buf)
@@ -471,7 +453,12 @@ inline int ATOI(LPCTSTR buf)
 	// Below has been updated because values with leading zeros were being interpreted as
 	// octal, which is undesirable.
 	// Formerly: #define ATOI(buf) strtol(buf, NULL, 0) // Use zero as last param to support both hex & dec.
-	return IsHex(buf) ? _tcstol(buf, NULL, 16) : _ttoi(buf); // atoi() has superior performance, so use it when possible.
+	//return IsHex(buf) ? _tcstol(buf, NULL, 16) : _ttoi(buf); // atoi() has superior performance, so use it when possible.
+	// Update: ATOI() is mostly used in places where other factors have a much bigger impact
+	// on performance; still, this method benchmarks slightly faster and produces smaller code
+	// than the older version above.  It is also behaves more consistently with ATOI64() for
+	// very large out of range values.
+	return (int)nstrtoi64(buf);
 }
 
 // v1.0.38.01: Make ATOU a macro that refers to ATOI64() to improve performance (takes advantage of _atoi64()
@@ -487,105 +474,64 @@ inline int ATOI(LPCTSTR buf)
 //	return strtoul(buf, NULL, IsHex(buf) ? 16 : 10);
 //}
 
+// ParseInteger() and ParsePositiveInteger() replace several calls to IsNumeric() that would otherwise
+// be immediately followed by a call to ATOI(), ATOI64() or ATOU().  This reduces code size measurably
+// in some cases (I observed between 0 and 440 bytes per call) and may also improve performance.
+
+// If buf is a valid integer, sets i to the converted value and returns true.
+// Otherwise returns false and leaves i unset.
+template<typename T>
+bool ParseInteger(LPCTSTR buf, T &i)
+{
+	LPCTSTR endptr;
+	T temp = static_cast<T>(istrtoi64(buf, &endptr));
+	if (!*endptr) // No invalid suffix.
+	{
+		i = temp; // Set output parameter only now that we know it is valid.
+		return true;
+	}
+	return false;
+}
+
+// If buf is a valid integer not starting with '-', sets i to the converted value and returns true.
+// Otherwise returns false and leaves i unset.
+template<typename T>
+bool ParsePositiveInteger(LPCTSTR buf, T &i)
+{
+	// Callers don't want to permit negative values.
+	return *buf != '-' && ParseInteger(buf, i);
+}
+
 inline double ATOF(LPCTSTR buf)
 // Unlike some Unix versions of strtod(), the VC++ version does not seem to handle hex strings
 // such as "0xFF" automatically.  So this macro must check for hex because some callers rely on that.
 // Also, it uses _strtoi64() vs. strtol() so that more of a double's capacity can be utilized:
 {
-	return IsHex(buf) ? (double)_tcstoi64(buf, NULL, 16) : _tstof(buf);
+	return IsHex(buf) ? (double)nstrtoi64(buf) : _tstof(buf);
 }
 
-inline LPTSTR ITOA(int value, LPTSTR buf)
-{
-	if (g->FormatInt == 'D')
-	{
-		return _itot(value, buf, 10);
-	}
-	// g->FormatInt == 'h' or 'H'
-	LPTSTR our_buf_temp = buf;
-	// Negative hex numbers need special handling, otherwise something like zero minus one would create
-	// a huge 0xffffffffffffffff value, which would subsequently not be read back in correctly as
-	// a negative number (but UTOA() doesn't need this since there can't be negatives in that case).
-	if (value < 0)
-	{
-		*our_buf_temp++ = '-';
-		value = -value;
-	}
-	*our_buf_temp++ = '0';
-	*our_buf_temp++ = 'x';
-	_itot(value, our_buf_temp, 16);
-	// Must not return the result of the above because it's our_buf_temp and we want buf.
-	if (g->FormatInt == 'H') // uppercase
-		CharUpper(our_buf_temp);
-	return buf;
-}
+int FTOA(double aValue, LPTSTR aBuf, int aBufSize);
 
-inline LPTSTR ITOA64(__int64 value, LPTSTR buf)
-{
-	if (g->FormatInt == 'D')
-	{
-		return _i64tot(value, buf, 10);
-	}
-	// g->FormatInt == 'h' or 'H'
-	LPTSTR our_buf_temp = buf;
-	if (value < 0)
-	{
-		*our_buf_temp++ = '-';
-		value = -value;
-	}
-	*our_buf_temp++ = '0';
-	*our_buf_temp++ = 'x';
-	_i64tot(value, our_buf_temp, 16);
-	// Must not return the result of the above because it's our_buf_temp and we want buf.
-	if (g->FormatInt == 'H') // uppercase
-		CharUpper(our_buf_temp);
-	return buf;
-}
-
-inline LPTSTR UTOA(unsigned long value, LPTSTR buf)
-{
-	if (g->FormatInt == 'D')
-	{
-		return _ultot(value, buf, 10);
-	}
-	// g->FormatInt == 'h' or 'H'
-	*buf = '0';
-	*(buf + 1) = 'x';
-	_ultot(value, buf + 2, 16);
-	// Must not return the result of the above because it's buf + 2 and we want buf.
-	if (g->FormatInt == 'H') // uppercase
-		CharUpper(buf + 2);
-	return buf;
-}
-
+#define ITOA(value, buf)	_itot(value, buf, 10)
+#define ITOA64(value, buf)	_i64tot(value, buf, 10)
+#define UTOA(value, buf)	_ultot(value, buf, 10)
+#define UTOA64(value, buf)	_ui64tot(value, buf, 10)
 #ifdef _WIN64
-inline LPTSTR UTOA64(unsigned __int64 value, LPTSTR buf) 
-{
-	if (g->FormatInt == 'D')
-	{
-		return _ui64tot(value, buf, 10);
-	}
-	// g->FormatInt == 'h' or 'H'
-	*buf = '0';
-	*(buf + 1) = 'x';
-	_ui64tot(value, buf + 2, 16);
-	// Must not return the result of the above because it's buf + 2 and we want buf.
-	if (g->FormatInt == 'H') // uppercase
-		CharUpper(buf + 2);
-	return buf;
-}
+#define UPTRTOA UTOA64
+#else
+#define UPTRTOA UTOA
 #endif
 
 
-inline LPTSTR HwndToString(HWND aHwnd, LPTSTR aBuf)
-{
-	aBuf[0] = '0';
-	aBuf[1] = 'x';
-	// Use _ultot for performance on 32-bit systems and _ui64tot on 64-bit systems in case it's
-	// possible for HWNDs to have non-zero upper 32-bits:
-	Exp32or64(_ultot,_ui64tot)((size_t)aHwnd, aBuf + 2, 16);
-	return aBuf;
-}
+//inline LPTSTR HwndToString(HWND aHwnd, LPTSTR aBuf)
+//{
+//	aBuf[0] = '0';
+//	aBuf[1] = 'x';
+//	// Use _ultot for performance on 32-bit systems and _ui64tot on 64-bit systems in case it's
+//	// possible for HWNDs to have non-zero upper 32-bits:
+//	Exp32or64(_ultot,_ui64tot)((size_t)aHwnd, aBuf + 2, 16);
+//	return aBuf;
+//}
 
 
 //inline LPTSTR tcscatmove(LPTSTR aDst, LPCTSTR aSrc)
@@ -600,7 +546,7 @@ inline LPTSTR HwndToString(HWND aHwnd, LPTSTR aBuf)
 
 
 
-// v1.0.43.03: The following macros support the new "StringCaseSense Locale" setting.  This setting performs
+// The following macros support StringCaseSense parameters (0, 1, 'Locale').  Locale mode performs
 // 1 to 10 times slower for most things, but has the benefit of seeing characters like ä and Ä as identical
 // when insensitive.  MSDN implies that lstrcmpi() is the same as:
 //     CompareString(LOCALE_USER_DEFAULT, NORM_IGNORECASE, ...)
@@ -611,16 +557,18 @@ inline LPTSTR HwndToString(HWND aHwnd, LPTSTR aBuf)
 // the program when the new locale-case-insensitive mode is in effect.
 #define tcscmp2(str1, str2, string_case_sense) ((string_case_sense) == SCS_INSENSITIVE ? _tcsicmp(str1, str2) \
 	: ((string_case_sense) == SCS_INSENSITIVE_LOCALE ? lstrcmpi(str1, str2) : _tcscmp(str1, str2)))
-#define g_tcscmp(str1, str2) tcscmp2(str1, str2, ::g->StringCaseSense)
 // The most common mode is listed first for performance:
 #define tcsstr2(haystack, needle, string_case_sense) ((string_case_sense) == SCS_INSENSITIVE ? tcscasestr(haystack, needle) \
 	: ((string_case_sense) == SCS_INSENSITIVE_LOCALE ? lstrcasestr(haystack, needle) : _tcsstr(haystack, needle)))
-#define g_tcsstr(haystack, needle) tcsstr2(haystack, needle, ::g->StringCaseSense)
 // For the following, caller must ensure that len1 and len2 aren't beyond the terminated length of the string
 // because CompareString() might not stop at the terminator when a length is specified.  Also, CompareString()
 // returns 0 on failure, but failure occurs only when parameter/flag is invalid, which should never happen in
 // this case.
 #define lstrcmpni(str1, len1, str2, len2) (CompareString(LOCALE_USER_DEFAULT, NORM_IGNORECASE, str1, (int)(len1), str2, (int)(len2)) - 2) // -2 for maintainability
+// Compare string using the operating system uppercasing table, independent of locale but treating non-ASCII
+// letters such as è and È as equivalent.  Documentation indicates it will be consistent with NTFS file names.
+#define ostrcmpni(str1, len1, str2, len2) (CompareStringOrdinal(str1, (int)(len1), str2, (int)(len2), TRUE) - 2) // -2 for maintainability
+#define ostrcmpi(str1, str2) (ostrcmpni(str1, -1, str2, -1))
 
 
 // The following macros simplify and make consistent the calls to MultiByteToWideChar().
@@ -701,26 +649,28 @@ inline LPTSTR UTF8ToWide(LPCSTR str){
 // seems best to use the same approach to avoid calling ToAsciiEx() more than once in cases where a
 // script has hotstrings and also uses the Input command. Calling ToAsciiEx() twice in such a case would
 // be likely to aggravate its side effects with dead keys as described at length in the hook/Input code).
+// v1.1.27.01: Retrieve the layout of the thread which owns the focused control, not the active window.
+// This fixes UWP apps such as Microsoft Edge, where the top-level window is owned by a different process.
 #define Get_active_window_keybd_layout \
-	HWND active_window;\
-	HKL active_window_keybd_layout = GetKeyboardLayout((active_window = GetForegroundWindow())\
-		? GetWindowThreadProcessId(active_window, NULL) : 0); // When no foreground window, the script's own layout seems like the safest default.
+	HKL active_window_keybd_layout = GetFocusedKeybdLayout();
 
-#define FONT_POINT(hdc, p) (-MulDiv(p, GetDeviceCaps(hdc, LOGPIXELSY), 72))
+
+#define FONT_POINT_FOR_DPI(dpi, p) (-MulDiv(p, dpi, 72))
+#define FONT_POINT(hdc, p) FONT_POINT_FOR_DPI(GetDeviceCaps(hdc, LOGPIXELSY), p)
 #define DATE_FORMAT_LENGTH 14 // "YYYYMMDDHHMISS"
 #define IS_LEAP_YEAR(year) ((year) % 4 == 0 && ((year) % 100 != 0 || (year) % 400 == 0))
 
 int GetYDay(int aMon, int aDay, bool aIsLeapYear);
 int GetISOWeekNumber(LPTSTR aBuf, int aYear, int aYDay, int aWDay);
-ResultType YYYYMMDDToFileTime(LPTSTR aYYYYMMDD, FILETIME &aFileTime);
-DWORD YYYYMMDDToSystemTime2(LPTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime);
-ResultType YYYYMMDDToSystemTime(LPTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool aDoValidate);
+ResultType YYYYMMDDToFileTime(LPCTSTR aYYYYMMDD, FILETIME &aFileTime);
+DWORD YYYYMMDDToSystemTime2(LPCTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime);
+ResultType YYYYMMDDToSystemTime(LPCTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool aValidateTimeValues);
 LPTSTR FileTimeToYYYYMMDD(LPTSTR aBuf, FILETIME &aTime, bool aConvertToLocalTime = false);
 LPTSTR SystemTimeToYYYYMMDD(LPTSTR aBuf, SYSTEMTIME &aTime);
-__int64 YYYYMMDDSecondsUntil(LPTSTR aYYYYMMDDStart, LPTSTR aYYYYMMDDEnd, bool &aFailed);
+__int64 YYYYMMDDSecondsUntil(LPCTSTR aYYYYMMDDStart, LPCTSTR aYYYYMMDDEnd, FResult &aStatus);
 __int64 FileTimeSecondsUntil(FILETIME *pftStart, FILETIME *pftEnd);
 
-SymbolType IsPureNumeric(LPCTSTR aBuf, BOOL aAllowNegative = false // BOOL vs. bool might squeeze a little more performance out of this frequently-called function.
+SymbolType IsNumeric(LPCTSTR aBuf, BOOL aAllowNegative = false // BOOL vs. bool might squeeze a little more performance out of this frequently-called function.
 	, BOOL aAllowAllWhitespace = true, BOOL aAllowFloat = false, BOOL aAllowImpure = false);
 
 void strlcpy(LPSTR aDst, LPCSTR aSrc, size_t aDstSize);
@@ -743,45 +693,83 @@ UINT StrReplace(LPTSTR aHaystack, LPTSTR aOld, LPTSTR aNew, StringCaseSenseType 
 	, UINT aLimit = UINT_MAX, size_t aSizeLimit = -1, LPTSTR *aDest = NULL, size_t *aHaystackLength = NULL);
 size_t PredictReplacementSize(ptrdiff_t aLengthDelta, int aReplacementCount, int aLimit, size_t aHaystackLength
 	, size_t aCurrentLength, size_t aEndOffsetOfCurrMatch);
-LPTSTR TranslateLFtoCRLF(LPTSTR aString);
-bool DoesFilePatternExist(LPTSTR aFilePattern, DWORD *aFileAttr = NULL);
-#ifdef _DEBUG
-	ResultType FileAppend(LPTSTR aFilespec, LPTSTR aLine, bool aAppendNewline = true);
-#endif
-LPTSTR ConvertFilespecToCorrectCase(LPTSTR aFullFileSpec);
+LPTSTR TranslateLFtoCRLF(LPCTSTR aString);
+bool DoesFilePatternExist(LPCTSTR aFilePattern, DWORD *aFileAttr = NULL, DWORD aRequiredAttr = 0);
+LPTSTR ConvertFilespecToCorrectCase(LPTSTR aFilespec, LPTSTR aBuf, size_t aBufSize, size_t &aBufLength);
+void ConvertFilespecToCorrectCase(LPTSTR aBuf, size_t aBufSize, size_t &aBufLength);
 LPTSTR FileAttribToStr(LPTSTR aBuf, DWORD aAttr);
 unsigned __int64 GetFileSize64(HANDLE aFileHandle);
-LPTSTR GetLastErrorText(LPTSTR aBuf, int aBufSize, bool aUpdateLastError = false);
-void AssignColor(LPTSTR aColorName, COLORREF &aColor, HBRUSH &aBrush);
-COLORREF ColorNameToBGR(LPTSTR aColorName);
-HRESULT MySetWindowTheme(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR pszSubIdList);
-//HRESULT MyEnableThemeDialogTexture(HWND hwnd, DWORD dwFlags);
-LPTSTR ConvertEscapeSequences(LPTSTR aBuf, TCHAR aEscapeChar, bool aAllowEscapedSpace);
-int FindNextDelimiter(LPCTSTR aBuf, TCHAR aDelimiter = ',', int aStartIndex = 0, LPCTSTR aLiteralMap = NULL);
+LPTSTR GetWin32ErrorText(LPTSTR aBuf, DWORD aBufSize, DWORD aError);
+void AssignColor(LPTSTR aNewColorName, COLORREF &aColor, HBRUSH &aBrush);
+void AssignColor(COLORREF aNewColorValue, COLORREF &aColor, HBRUSH &aBrush);
+bool ColorToBGR(LPCTSTR aColorNameOrRGB, COLORREF &aBGR);
+COLORREF ColorNameToBGR(LPCTSTR aColorName);
+
+LPTSTR ConvertEscapeSequences(LPTSTR aBuf);
+LPTSTR ConvertEscapeSequences(LPTSTR aDst, size_t aDstSize, LPCTSTR aSrc, size_t aSrcLen);
+size_t UnescapedLength(LPCTSTR aSrc, size_t aSrcLen);
+LPTSTR ConvertSpaceEscapeSequences(LPTSTR aBuf);
+bool CharIsEscaped(LPCTSTR aChar, LPCTSTR aBuf);
+template<LPTSTR (*Alloc)(size_t size)>
+LPTSTR ConvertEscapeSequences(LPCTSTR aSrc, size_t aSrcLen, size_t &aDestLen)
+{
+	aDestLen = UnescapedLength(aSrc, aSrcLen);
+	auto dst = Alloc(aDestLen + 1);
+	//if (!dst)
+	//	return nullptr;
+	return ConvertEscapeSequences(dst, aDestLen + 1, aSrc, aSrcLen);
+}
+
+int FindExprDelim(LPCTSTR aBuf, TCHAR aDelimiter = ',', int aStartIndex = 0);
+int FindTextDelim(LPCTSTR aBuf, TCHAR aDelimiter = ',', int aStartIndex = 0);
+#define MAX_BALANCEEXPR_DEPTH 100 // The maximum depth at which BalanceExpr() can validate symbols (the size of aExpect[]).
+int BalanceExpr(LPCTSTR aBuf, int aStartBalance, TCHAR aExpect[], TCHAR *aOpenQuote = NULL);
+int BalanceExpr(LPCTSTR aBuf);
 POINT CenterWindow(int aWidth, int aHeight);
 bool FontExist(HDC aHdc, LPCTSTR aTypeface);
 void ScreenToWindow(POINT &aPoint, HWND aHwnd);
 void CoordToScreen(int &aX, int &aY, int aWhichMode);
 void CoordToScreen(POINT &aPoint, int aWhichMode);
-void GetVirtualDesktopRect(RECT &aRect);
 BOOL IsProcess64Bit(HANDLE aHandle);
 BOOL IsOS64Bit();
 LPVOID AllocInterProcMem(HANDLE &aHandle, DWORD aSize, HWND aHwnd, DWORD aExtraAccess = 0);
 void FreeInterProcMem(HANDLE aHandle, LPVOID aMem);
 
+bool ToolTipTextEquals(HWND aToolTipHwnd, LPCTSTR aText);
+
 DWORD GetEnvVarReliable(LPCTSTR aEnvVarName, LPTSTR aBuf);
 DWORD ReadRegString(HKEY aRootKey, LPTSTR aSubkey, LPTSTR aValueName, LPTSTR aBuf, DWORD aBufSize, DWORD aFlag = 0);
 
-HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, int aIconNumber
-	, bool aUseGDIPlusIfAvailable);
+int GetSystemTrayIconSize();
+
+HBITMAP LoadPicture(LPCTSTR aFilespec, int aWidth, int aHeight, int &aImageType, int aIconNumber
+	, bool aUseGDIPlusIfAvailable, bool *apNoDelete = NULL, HMODULE *apModule = NULL);
 HBITMAP IconToBitmap(HICON ahIcon, bool aDestroyIcon);
 HBITMAP IconToBitmap32(HICON aIcon, bool aDestroyIcon); // Lexikos: Used for menu icons on Vista+. Creates a 32-bit (ARGB) device-independent bitmap from an icon.
 int CALLBACK FontEnumProc(ENUMLOGFONTEX *lpelfe, NEWTEXTMETRICEX *lpntme, DWORD FontType, LPARAM lParam);
-bool IsStringInList(LPTSTR aStr, LPTSTR aList, bool aFindExactMatch);
-LPTSTR InStrAny(LPTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundLen);
+//bool IsStringInList(LPTSTR aStr, LPTSTR aList, bool aFindExactMatch);
+LPCTSTR InStrAny(LPCTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundLen);
 
 LPTSTR ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex); // L17: Find integer ID of resource from index. i.e. IconNumber -> resource ID.
-HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, int aHeight); // L17: Extract icon of the appropriate size from an executable (or compatible) file.
+HICON ExtractIconFromExecutable(LPCTSTR aFilespec, int aIconNumber, int aWidth, int aHeight // L17: Extract icon of the appropriate size from an executable (or compatible) file.
+	, HMODULE *apModule = NULL);
+
+PWSTR GetDocumentsFolder();
+
+int VersionSatisfies(LPCTSTR v, LPCTSTR r, bool aThreeWayDefault = false);
+int CompareVersion(LPCTSTR a, LPCTSTR b);
+
+BOOLEAN __stdcall GenRandom(PVOID RandomBuffer, ULONG RandomBufferLength);
+
+// This is used due to the popcnt instruction not being supported on old CPUs.
+// Source: https://www.autohotkey.com/boards/viewtopic.php?f=14&p=384978
+inline int popcount8(unsigned char c)
+{
+	c = (c & 0x55u) + ((c >> 1) & 0x55u);
+	c = (c & 0x33u) + ((c >> 2) & 0x33u);
+	c = (c & 0x0fu) + ((c >> 4) & 0x0fu);
+	return c;
+}
 
 #if defined(_MSC_VER) && defined(_DEBUG)
 void OutputDebugStringFormat(LPCTSTR fmt, ...); // put debug message to the "Output" panel of Visual Studio.

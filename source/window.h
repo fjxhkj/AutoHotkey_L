@@ -32,7 +32,7 @@ GNU General Public License for more details.
 #define SET_TARGET_TO_ALLOWABLE_FOREGROUND(detect_hidden_windows) \
 {\
 	if (target_window = GetForegroundWindow())\
-		if (!(detect_hidden_windows) && !IsWindowVisible(target_window))\
+		if (!(detect_hidden_windows) && (!IsWindowVisible(target_window) || IsWindowCloaked(target_window)))\
 			target_window = NULL;\
 }
 #define IF_USE_FOREGROUND_WINDOW(detect_hidden_windows, title, text, exclude_title, exclude_text)\
@@ -43,7 +43,7 @@ if (USE_FOREGROUND_WINDOW(title, text, exclude_title, exclude_text))\
 
 
 
-inline bool IsTextMatch(LPTSTR aHaystack, LPTSTR aNeedle)
+inline bool IsTextMatch(LPCTSTR aHaystack, LPCTSTR aNeedle)
 // Generic helper function used by WindowSearch and other things.
 // To help performance, it's the caller's responsibility to ensure that all params are not NULL.
 {
@@ -61,7 +61,6 @@ inline bool IsTextMatch(LPTSTR aHaystack, LPTSTR aNeedle)
 
 
 
-#define SEARCH_PHRASE_SIZE 1024
 // Info from AutoIt3 source: GetWindowText fails under 95 if >65535, WM_GETTEXT randomly fails if > 32767.
 // My: And since 32767 is what AutoIt3 passes to the API functions as the size (not the length, i.e.
 // it can only store 32766 if room is left for the zero terminator) we'll use that for the size too.
@@ -69,6 +68,8 @@ inline bool IsTextMatch(LPTSTR aHaystack, LPTSTR aNeedle)
 // copy to the buffer, including the NULL character. If the text exceeds this limit, it is truncated."
 #define WINDOW_TEXT_SIZE 32767
 #define WINDOW_CLASS_SIZE 257  // MSDN implies length can't be greater than 256: "The maximum length for [WNDCLASS] lpszClassName is 256. If lpszClassName is greater than the maximum length, the RegisterClass function will fail."
+#define CONTROL_NN_SIZE 10  // Allows for maximum length of a UINT to ensure buffers are always sufficient (although creating so many controls would be impossible).
+#define WINDOW_CLASS_NN_SIZE (WINDOW_CLASS_SIZE + CONTROL_NN_SIZE)
 
 // Bitwise fields to support multiple criteria in v1.0.36.02
 #define CRITERION_TITLE 0x01
@@ -89,18 +90,20 @@ public:
 	DWORD mCriteria; // Which criteria are currently in effect (ID, PID, Class, Title, etc.)
 
 	// Controlled and initialized by SetCriteria():
-	global_struct *mSettings;                 // Settings such as TitleMatchMode and DetectHiddenWindows.
-	TCHAR mCriterionTitle[SEARCH_PHRASE_SIZE]; // For storing the title.
-	TCHAR mCriterionClass[SEARCH_PHRASE_SIZE]; // For storing the "ahk_class" class name.
+	ScriptThreadSettings *mSettings;           // Settings such as TitleMatchMode and DetectHiddenWindows.
+	LPTSTR mCriterionBuf;                     // Contains all of the other string criterion sourced from WinTitle.
+	size_t mCriterionBufSize;
+	LPCTSTR mCriterionTitle;                   // The portion of WinTitle preceding the first "ahk_" keyword.
+	LPCTSTR mCriterionClass;                   // For "ahk_class".
 	size_t mCriterionTitleLength;             // Length of mCriterionTitle.
-	LPTSTR mCriterionExcludeTitle;             // ExcludeTitle.
+	LPCTSTR mCriterionExcludeTitle;           // ExcludeTitle.
 	size_t mCriterionExcludeTitleLength;      // Length of the above.
-	LPTSTR mCriterionText;                     // WinText.
-	LPTSTR mCriterionExcludeText;              // ExcludeText.
+	LPCTSTR mCriterionText;                   // WinText.
+	LPCTSTR mCriterionExcludeText;            // ExcludeText.
 	HWND mCriterionHwnd;                      // For "ahk_id".
 	DWORD mCriterionPID;                      // For "ahk_pid".
 	WinGroup *mCriterionGroup;                // For "ahk_group".
-	TCHAR mCriterionPath[SEARCH_PHRASE_SIZE]; // For "ahk_exe".
+	LPCTSTR mCriterionPath;                    // For "ahk_exe".
 
 	bool mCriterionPathIsNameOnly;
 	bool mFindLastMatch; // Whether to keep searching even after a match is found, so that last one is found.
@@ -111,45 +114,54 @@ public:
 	HWND *mAlreadyVisited;      // Array of HWNDs to exclude from consideration.
 	int mAlreadyVisitedCount;   // Count of items in the above.
 	WindowSpec *mFirstWinSpec;  // Linked list used by the WinGroup commands.
-	ActionTypeType mActionType; // Used only by WinGroup::PerformShowWindow().
+	BuiltInFunctionID mActionType; // Used only by WinGroup::PerformShowWindow().
 	int mTimeToWaitForClose;    // Same.
-	Var *mArrayStart;           // Used by WinGetList() to fetch an array of matching HWNDs.
+	Array *mArray;             // Used by WinGetList() to fetch an array of matching HWNDs.
 
 	// Controlled by the SetCandidate() method:
 	HWND mCandidateParent;
+	DWORD mCandidateInfo; // Criteria flags indicating which attributes have been retrieved.
+	// Candidate attributes retrieved as needed:
 	DWORD mCandidatePID;
 	TCHAR mCandidateTitle[WINDOW_TEXT_SIZE];  // For storing title or class name of the given mCandidateParent.
 	TCHAR mCandidateClass[WINDOW_CLASS_SIZE]; // Must not share mem with mCandidateTitle because even if ahk_class is in effect, ExcludeTitle can also be in effect.
-	TCHAR mCandidatePath[MAX_PATH];
+	TCHAR mCandidatePath[MAX_PATH]; // MAX_PATH vs. T_MAX_PATH because it currently seems to be impossible to run an executable with a longer path (in Windows 10.0.16299).
 
 
 	void SetCandidate(HWND aWnd) // Must be kept thread-safe since it may be called indirectly by the hook thread.
 	{
-		// For performance reasons, update the attributes only if the candidate window changed:
+		// For performance reasons, invalidate previously retrieved attributes only if the candidate window changed:
 		if (mCandidateParent != aWnd)
 		{
 			mCandidateParent = aWnd;
-			UpdateCandidateAttributes(); // In case mCandidateParent isn't NULL, update the PID/Class/etc. based on what was set above.
+			mCandidateInfo = 0;
 		}
 	}
 
-	ResultType SetCriteria(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText);
-	void UpdateCandidateAttributes();
+	ResultType SetCriteria(ScriptThreadSettings &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText);
+	void SetCriteria(global_struct &aSettings, WinGroup &aGroup);
 	HWND IsMatch(bool aInvert = false);
 
 	WindowSearch() // Constructor.
 		// For performance and code size, only the most essential members are initialized.
 		// The others do not require it or are initialized by SetCriteria() or SetCandidate().
 		: mCriteria(0), mCriterionExcludeTitle(_T("")) // ExcludeTitle is referenced often, so should be initialized.
+		, mCriterionBuf(NULL), mCriterionBufSize(0)
 		, mFoundCount(0), mFoundParent(NULL) // Must be initialized here since none of the member functions is allowed to do it.
 		, mFoundChild(NULL) // ControlExist() relies upon this.
 		, mCandidateParent(NULL)
+		, mCandidateInfo(0)
 		// The following must be initialized because it's the object user's responsibility to override
 		// them in those relatively rare cases when they need to be.  WinGroup::ActUponAll() and
 		// WinGroup::Deactivate() (and probably other callers) rely on these attributes being retained
 		// after they were overridden even upon multiple subsequent calls to SetCriteria():
-		, mFindLastMatch(false), mAlreadyVisited(NULL), mAlreadyVisitedCount(0), mFirstWinSpec(NULL), mArrayStart(NULL)
+		, mFindLastMatch(false), mAlreadyVisited(NULL), mAlreadyVisitedCount(0), mFirstWinSpec(NULL), mArray(NULL)
 	{
+	}
+
+	~WindowSearch()
+	{
+		free(mCriterionBuf);
 	}
 };
 
@@ -160,16 +172,11 @@ struct control_list_type
 	// For something this simple, a macro is probably a lot less overhead that making this struct
 	// non-POD and giving it a constructor:
 	#define CL_INIT_CONTROL_LIST(cl) \
-		cl.is_first_iteration = true;\
 		cl.total_classes = 0;\
-		cl.total_length = 0;\
 		cl.buf_free_spot = cl.class_buf; // Points to the next available/writable place in the buf.
 	bool fetch_hwnds;         // True if fetching HWND of each control rather than its ClassNN.
-	bool is_first_iteration;  // Must be initialized to true by Enum's caller.
 	int total_classes;        // Must be initialized to 0.
-	VarSizeType total_length; // Must be initialized to 0.
-	VarSizeType capacity;     // Must be initialized to size of the below buffer.
-	LPTSTR target_buf;         // Caller sets it to NULL if only the total_length is to be retrieved.
+	Array *target_array;
 	#define CL_CLASS_BUF_SIZE (32 * 1024) // Even if class names average 50 chars long, this supports 655 of them.
 	TCHAR class_buf[CL_CLASS_BUF_SIZE];
 	LPTSTR buf_free_spot;      // Must be initialized to point to the beginning of class_buf.
@@ -203,7 +210,7 @@ struct class_and_hwnd_type
 {
 	LPTSTR class_name;
 	bool is_found;
-	int class_count;
+	UINT class_count;
 	HWND hwnd;
 };
 
@@ -220,19 +227,19 @@ struct point_and_hwnd_type
 HWND WinActivate(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
 	, bool aFindLastMatch = false
 	, HWND aAlreadyVisited[] = NULL, int aAlreadyVisitedCount = 0);
-HWND SetForegroundWindowEx(HWND aTargetWindow);
+HWND SetForegroundWindowEx(HWND aTargetWindow, bool aBackgroundActivation = false);
 
 // Defaulting to a non-zero wait-time solves a lot of script problems that would otherwise
 // require the user to specify the last param (or use WinWaitClose):
 #define DEFAULT_WINCLOSE_WAIT 20
-HWND WinClose(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, int aTimeToWaitForClose = DEFAULT_WINCLOSE_WAIT
-	, LPTSTR aExcludeTitle = _T(""), LPTSTR aExcludeText = _T(""), bool aKillIfHung = false);
+HWND WinClose(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, int aTimeToWaitForClose = DEFAULT_WINCLOSE_WAIT
+	, LPCTSTR aExcludeTitle = _T(""), LPCTSTR aExcludeText = _T(""), bool aKillIfHung = false);
 HWND WinClose(HWND aWnd, int aTimeToWaitForClose = DEFAULT_WINCLOSE_WAIT, bool aKillIfHung = false);
 
-HWND WinActive(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
+HWND WinActive(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText
 	, bool aUpdateLastUsed = false);
 
-HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
+HWND WinExist(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText
 	, bool aFindLastMatch = false, bool aUpdateLastUsed = false
 	, HWND aAlreadyVisited[] = NULL, int aAlreadyVisitedCount = 0);
 
@@ -245,24 +252,24 @@ BOOL CALLBACK EnumChildFind(HWND hwnd, LPARAM lParam);
 // Use a fairly long default for aCheckInterval since the contents of this function's loops
 // might be somewhat high in overhead (especially SendMessageTimeout):
 #define SB_DEFAULT_CHECK_INTERVAL 50
-ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber = 1, LPTSTR aTextToWaitFor = _T("")
-	, int aWaitTime = -1, int aCheckInterval = SB_DEFAULT_CHECK_INTERVAL);
-HWND ControlExist(HWND aParentWindow, LPTSTR aClassNameAndNum = NULL);
+FResult StatusBarUtil(HWND aWindow, int aPartNumber, StrRet *aRetVal = nullptr
+	, LPCTSTR aTextToWaitFor = nullptr, int aWaitTime = -1, int aCheckInterval = SB_DEFAULT_CHECK_INTERVAL);
+HWND ControlExist(HWND aParentWindow, LPCTSTR aClassNameAndNum = NULL);
 BOOL CALLBACK EnumControlFind(HWND aWnd, LPARAM lParam);
 
 #define MSGBOX_NORMAL (MB_OK | MB_SETFOREGROUND)
 #define MSGBOX_TEXT_SIZE (1024 * 8)
 #define DIALOG_TITLE_SIZE 1024
 int MsgBox(int aValue);
-int MsgBox(LPCTSTR aText = _T(""), UINT uType = MSGBOX_NORMAL, LPTSTR aTitle = NULL, double aTimeout = 0, HWND aOwner = NULL);
+int MsgBox(LPCTSTR aText = _T(""), UINT uType = MSGBOX_NORMAL, LPCTSTR aTitle = NULL, double aTimeout = 0, HWND aOwner = NULL);
 HWND FindOurTopDialog();
 BOOL CALLBACK EnumDialog(HWND hwnd, LPARAM lParam);
 
-HWND WindowOwnsOthers(HWND aWnd);
-BOOL CALLBACK EnumParentFindOwned(HWND aWnd, LPARAM lParam);
 HWND GetNonChildParent(HWND aWnd);
 HWND GetTopChild(HWND aParent);
 bool IsWindowHung(HWND aWnd);
+bool IsWindowCloaked(HWND aWnd);
+bool IsWindowStandardDialog(HWND aWnd);
 
 // Defaults to a low timeout because a window may have hundreds of controls, and if the window
 // is hung, each control might result in a delay of size aTimeout during an EnumWindows.
@@ -280,7 +287,6 @@ bool IsWindowHung(HWND aWnd);
 // 5000 seems about the largest value that should ever be needed since this is what
 // Windows uses as the cutoff for determining if a window has become "unresponsive":
 int GetWindowTextTimeout(HWND aWnd, LPTSTR aBuf = NULL, INT_PTR aBufSize = 0, UINT aTimeout = 5000);
-void SetForegroundLockTimeout();
 
 
 // Notes about the below macro:
@@ -320,16 +326,8 @@ void SetForegroundLockTimeout();
 // dispatch them to a Window Proc).
 // GetQueueStatus() is used because unlike PeekMessage() or GetMessage(), it might not yield
 // our timeslice if the CPU is under heavy load, which would be good to improve performance here.
-#define DIALOG_PREP bool thread_was_critical = DialogPrep();
-// v1.0.40.01: Turning off critical during the dialog is relied upon by ResumeUnderlyingThread(),
-// UninterruptibleTimeout(), and KILL_AUTOEXEC_TIMER.  Doing it this way also seems more maintainable
-// than some other approach such as storing a new flag in the "g" struct that says whether it is currently
-// displaying a dialog and waiting for it to finish.
-#define DIALOG_END \
-{\
-	g->ThreadIsCritical = thread_was_critical;\
-	g->AllowThreadToBeInterrupted = !thread_was_critical;\
-}
-bool DialogPrep();
+#define DIALOG_PREP DialogPrep();
+#define DIALOG_END g->AllowThreadToBeInterrupted = !g->ThreadIsCritical;
+void DialogPrep();
 
 #endif

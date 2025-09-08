@@ -7,11 +7,12 @@ extern bool g_ComErrorNotify;
 class ComObject;
 class ComEvent : public ObjectBase
 {
-	DWORD mCookie;
+	DWORD mCookie = 0;
 	ComObject *mObject;
-	ITypeInfo *mTypeInfo;
+	ITypeInfo *mTypeInfo = nullptr;
 	IID mIID;
-	IObject *mAhkObject;
+	IObject *mAhkObject = nullptr;
+	ScriptModule *mModule = nullptr;
 	TCHAR mPrefix[64];
 
 public:
@@ -19,24 +20,19 @@ public:
 	STDMETHODIMP GetIDsOfNames(REFIID riid, LPOLESTR *rgszNames, UINT cNames, LCID lcid, DISPID *rgDispId);
 	STDMETHODIMP Invoke(DISPID dispIdMember, REFIID riid, LCID lcid, WORD wFlags, DISPPARAMS *pDispParams, VARIANT *pVarResult, EXCEPINFO *pExcepInfo, UINT *puArgErr);
 	
-	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount)
-	{
-		// Currently ComEvent objects are never exposed to the AutoHotkey side.
-		return INVOKE_NOT_HANDLED;
-	}
+	// IObject::Invoke() and Type() are unlikely to be called, since that would mean
+	// the script has a reference to the object, which means either that the script
+	// itself has implemented IConnectionPoint (and why would it?), or has used the
+	// IEnumConnections interface to retrieve its own object (unlikely).
+	//ResultType Invoke(IObject_Invoke_PARAMS_DECL); // ObjectBase::Invoke is sufficient.
+	IObject_Type_Impl("ComEvent") // Unlikely to be called; see above.
+	Object *Base() { return nullptr; }
 
-	void Connect(LPTSTR pfx = NULL, IObject *ahkObject = NULL);
+	HRESULT Connect(ITypeInfo *tinfo = nullptr, IID *iid = nullptr);
+	void SetPrefixOrSink(LPCTSTR pfx, IObject *ahkObject);
 
-	ComEvent(ComObject *obj, ITypeInfo *tinfo, IID iid)
-		: mCookie(0), mObject(obj), mTypeInfo(tinfo), mIID(iid), mAhkObject(NULL)
-	{
-	}
-	~ComEvent()
-	{
-		mTypeInfo->Release();
-		if (mAhkObject)
-			mAhkObject->Release();
-	}
+	ComEvent(ComObject *obj) : mObject(obj) { }
+	~ComEvent();
 
 	friend class ComObject;
 };
@@ -58,8 +54,29 @@ public:
 	enum { F_OWNVALUE = 1 };
 	USHORT mFlags;
 
-	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
-	ResultType SafeArrayInvoke(ExprTokenType &aResultToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
+	enum
+	{
+		P_Ptr,
+		// ComValueRef
+		P___Item, // v2.0: Allows accessing a VT_BYREF value via comobj[].
+		P___Value = P___Item, // v2.1: Alias to allow use with VAR_VIRTUAL_OBJ (ByRef parameters).
+	};
+	static ObjectMember sRefMembers[], sValueMembers[];
+	static ObjectMemberMd sArrayMembers[];
+	
+	FResult SafeArray_Item(VariantParams &aParam, ExprTokenType *aNewValue, ResultToken *aResultToken);
+	FResult set_SafeArray_Item(ExprTokenType &aNewValue, VariantParams &aParam) { return SafeArray_Item(aParam, &aNewValue, nullptr); }
+	FResult get_SafeArray_Item(ResultToken &aResultToken, VariantParams &aParam) { return SafeArray_Item(aParam, nullptr, &aResultToken); }
+	
+	FResult SafeArray_Clone(IObject *&aRetVal);
+	FResult SafeArray_Enum(optl<int>, IObject *&aRetVal);
+	FResult SafeArray_MaxIndex(optl<UINT> aDims, int &aRetVal);
+	FResult SafeArray_MinIndex(optl<UINT> aDims, int &aRetVal);
+
+	ResultType Invoke(IObject_Invoke_PARAMS_DECL);
+	void Invoke(ResultToken &aResultToken, int aID, int aFlags, ExprTokenType *aParam[], int aParamCount);
+	LPTSTR Type();
+	Object *Base();
 
 	void ToVariant(VARIANT &aVar)
 	{
@@ -80,9 +97,9 @@ public:
 		{
 			if (mEventSink)
 			{
-				mEventSink->Connect();
-				mEventSink->mObject = NULL;
-				mEventSink->Release();
+				mEventSink->Connect(FALSE);
+				if (mEventSink) // i.e. it wasn't fully released as a result of calling Unadvise().
+					mEventSink->mObject = nullptr;
 			}
 			mUnknown->Release();
 		}
@@ -90,25 +107,23 @@ public:
 		{
 			SafeArrayDestroy(mArray);
 		}
+		else if (mVarType == VT_BSTR && (mFlags & F_OWNVALUE))
+		{
+			SysFreeString((BSTR)mValPtr);
+		}
 	}
-
-#ifdef CONFIG_DEBUGGER
-	void DebugWriteProperty(IDebugProperties *, int aPage, int aPageSize, int aDepth);
-#endif
 };
 
 
 class ComEnum : public EnumBase
 {
 	IEnumVARIANT *penum;
+	bool cheat;
 
 public:
-	int Next(Var *aOutput, Var *aOutputType);
+	ResultType Next(Var *aOutput, Var *aOutputType);
 
-	ComEnum(IEnumVARIANT *enm)
-		: penum(enm)
-	{
-	}
+	ComEnum(IEnumVARIANT *enm);
 	~ComEnum()
 	{
 		penum->Release();
@@ -119,23 +134,59 @@ public:
 class ComArrayEnum : public EnumBase
 {
 	ComObject *mArrayObject;
-	char *mPointer, *mEnd;
+	void *mData;
+	long mLBound, mUBound;
 	UINT mElemSize;
 	VARTYPE mType;
+	bool mIndexMode;
+	long mOffset = -1;
 
-	ComArrayEnum(ComObject *aObj, char *aData, char *aDataEnd, UINT aElemSize, VARTYPE aType)
-		: mArrayObject(aObj), mPointer(aData - aElemSize), mEnd(aDataEnd), mElemSize(aElemSize), mType(aType)
+	ComArrayEnum(ComObject *aObj, void *aData, long aLBound, long aUBound, UINT aElemSize, VARTYPE aType, bool aIndexMode)
+		: mArrayObject(aObj), mData(aData), mLBound(aLBound), mUBound(aUBound), mElemSize(aElemSize), mType(aType), mIndexMode(aIndexMode)
 	{
 	}
 
 public:
-	static HRESULT Begin(ComObject *aArrayObject, ComArrayEnum *&aOutput);
-	int Next(Var *aOutput, Var *aOutputType);
+	static HRESULT Begin(ComObject *aArrayObject, ComArrayEnum *&aOutput, int aMode);
+	ResultType Next(Var *aVar1, Var *aVar2);
 	~ComArrayEnum();
 };
 
 
-void ComError(HRESULT, LPTSTR = _T(""), EXCEPINFO* = NULL);
+// Adapts an AutoHotkey enumerator object to the IEnumVARIANT COM interface.
+class EnumComCompat : public IEnumVARIANT, public IServiceProvider
+{
+	IObject *mEnum;
+	int mRefCount;
+	bool mCheat;
+
+public:
+	EnumComCompat(IObject *enumObj) : mEnum(enumObj), mRefCount(1), mCheat(false) {}
+	~EnumComCompat() { mEnum->Release(); }
+
+	STDMETHODIMP QueryInterface(REFIID riid, void **ppvObject);
+	STDMETHODIMP_(ULONG) AddRef();
+	STDMETHODIMP_(ULONG) Release();
+
+	STDMETHODIMP Next(ULONG celt, /*out*/ VARIANT *rgVar, /*out*/ ULONG *pCeltFetched);
+	STDMETHODIMP Skip(ULONG celt);
+	STDMETHODIMP Reset();
+	STDMETHODIMP Clone(/*out*/ IEnumVARIANT **ppEnum);
+
+	STDMETHODIMP QueryService(REFGUID guidService, REFIID riid, void **ppvObject);
+};
+
+
+enum TTVArgType
+{
+	VariantIsValue,
+	VariantIsAllocatedString,
+	VariantIsVarRef
+};
+void TokenToVariant(ExprTokenType &aToken, VARIANT &aVar, TTVArgType *aVarIsArg = FALSE);
+HRESULT TokenToVarType(ExprTokenType &aToken, VARTYPE aVarType, void *apValue, bool aCallerIsComValue = false);
+
+void ComError(HRESULT, ResultToken &, LPTSTR = _T(""), EXCEPINFO* = NULL);
 
 bool SafeSetTokenObject(ExprTokenType &aToken, IObject *aObject);
 

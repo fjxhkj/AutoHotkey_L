@@ -15,8 +15,11 @@ GNU General Public License for more details.
 */
 
 #include "stdafx.h" // pre-compiled headers
+#include "defines.h"
+#include "script_object.h"
 #include "var.h"
 #include "globaldata.h" // for g_script
+#include <utility>
 
 
 // Init static vars:
@@ -25,108 +28,38 @@ TCHAR Var::sEmptyString[] = _T(""); // For explanation, see its declaration in .
 
 ResultType Var::AssignHWND(HWND aWnd)
 {
-	// For backward compatibility, tradition, and the fact that operations involving HWNDs tend not to
-	// be nearly as performance-critical as pure-math expressions, HWNDs are stored as a hex string,
-	// and thus UpdateBinaryInt64() isn't called here.
-	// Older comment: Always assign as hex for better compatibility with Spy++ and other apps that
-	// report window handles.
-	TCHAR buf[MAX_INTEGER_SIZE];
-	return Assign(HwndToString(aWnd, buf));
+	return Assign((size_t)aWnd);
 }
 
 
 
 ResultType Var::Assign(Var &aVar)
 // Assign some other variable to the "this" variable.
-// Although this->Type() can be VAR_CLIPBOARD, caller must ensure that aVar.Type()==VAR_NORMAL.
+// aVar.Type() and this->Type() must be VAR_NORMAL.
 // Returns OK or FAIL.
 {
-	// Below relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()).
-	Var &source_var = aVar.mType == VAR_ALIAS ? *aVar.mAliasFor : aVar;
-	Var &target_var = *(mType == VAR_ALIAS ? mAliasFor : this);
+	Var &target_var = *ResolveAlias();
+	Var &source_var = *aVar.ResolveAlias();
 
-	if (source_var.mAttrib & VAR_ATTRIB_HAS_VALID_INT64) // A binary Int64 is cached.
+	// Caller already handled virtual target_var.
+	ASSERT(!target_var.IsVirtual());
+
+	if (source_var.mAttrib & VAR_ATTRIB_UNINITIALIZED)
 	{
-		if (!(source_var.mAttrib & VAR_ATTRIB_CONTENTS_OUT_OF_DATE)) // Since contents are in sync with the cached binary integer, must also copy the text contents to preserve any leading/trailing whitespace in it.
-		{
-			// Since source_var's contents are in sync with its cached binary number, in addition to copying
-			// source_var's binary number, must also copy its text contents if it has any leading/trailing
-			// whitespace or unusual formatting that the script may rely on to be copied.  For example:
-			//    Var := " 055. "  ; Leading+trailing whitespace, leading zero, and trailing decimal point.
-			//    if (Var == 55)     ; This statement causes Var to acquire a cached binary number, yet it's in sync with contents because it represents contents (but not necessarily vice versa).
-			//    ...
-			// It seems worth peeking into beginning and end of var to check for such special formatting
-			// because it potentially avoids the copying of mContents, which in turn potentially avoids
-			// allocating or expanding memory for target_var.mContents.
-			int c1 = *source_var.mCharContents; // For performance, resolve once and store as int vs. char.
-			int c2 = source_var.mCharContents[source_var._CharLength()-1]; // No need to check mLength>0 because at this point there's a cached binary number AND mContents is in sync with it, so mContents is non-empty by definition.
-			if (   IS_SPACE_OR_TAB(c1) // IS_SPACE_OR_TAB() is the rule used by IsPureNumeric() to permit
-				|| IS_SPACE_OR_TAB(c2) // leading/trailing whitespace, so it's the right rule to determine whether mContents is technically numeric yet in an unusual format.
-				|| c1 == '0' || c1 == '+'   ) // Retain leading '0' and '+' (even hex like "0x5" because script might rely on exact formatting of such numbers to be retained in mContents).
-				// No need to check for leading/trailing '.' or scientific notation because those would
-				// never have caused an integer to be cached (float instead), so they wouldn't occur in this
-				// section.  Also, integers that are too long (and thus perhaps intended to be a series
-				// of digits rather than an integer) are not checked because they're partially checked
-				// at loadtime, and if encountered here at runtime, the mere fact that a cached integer
-				// exists for that string implies the script has done something to cache it, such as
-				// "if (var > 15)", which implies the script is currently using that variable as a number.
-				// So it seems too rare to justify extra checking such as mLength > MAX_INTEGER_LENGTH.
-			{
-				if (!target_var.Assign(source_var.mCharContents, source_var._CharLength())) // Pass length to improve performance. It isn't necessary to call Contents()/Length() because they must be already up-to-date due to earlier checks.
-					return FAIL;
-				// Below must be done AFTER the above because above's Assign() invalidates the cache, but the
-				// cache should be left valid.
-				target_var.UpdateBinaryInt64(source_var.mContentsInt64); // Except when passing VAR_ATTRIB_CONTENTS_OUT_OF_DATE, all callers of UpdateBinaryInt64() must ensure that mContents is a pure number (e.g. NOT 123abc).
-				return OK;
-			}
-			//else it doesn't have any leading/trailing space or unusual formatting to preserve, so can
-			// write to the cache, which allows mContents to be updated later on demand.
-		}
-		//else number cache is out-of-sync with mContents, so there is no need to copy over mContents because
-		// it will get overwritten by the cached number the next time anyone calls Contents().
-
-		// Since above didn't return, copy the cached number only, not mContents.  But must also mark
-		// the mContents as out-of-date because it will be kept blank until something actually needs it.
-		target_var.UpdateBinaryInt64(source_var.mContentsInt64, VAR_ATTRIB_HAS_VALID_INT64|VAR_ATTRIB_CONTENTS_OUT_OF_DATE);
+		target_var.UninitializeNonVirtual();
 		return OK;
 	}
 
-	if (source_var.mAttrib & VAR_ATTRIB_HAS_VALID_DOUBLE) // A binary double is cached.
+	switch (source_var.mAttrib & VAR_ATTRIB_TYPES) // This switch() method should squeeze a little more performance out of it compared to doing "&" for every attribute.  Only works for attributes that are mutually-exclusive, which these are.
 	{
-		if (!(source_var.mAttrib & VAR_ATTRIB_CONTENTS_OUT_OF_DATE)) // See comments in similar section above.
-		{
-			// Analyzing the mContents of floating point variables (like was done for cached integers above)
-			// doesn't seem worth it because benchmarks show that in percentage terms, caching floats doesn't
-			// offer nearly as much performance improvement as caching integers. In addition, the analysis
-			// would be much more complicated -- so much so that it might entirely negate any performance
-			// benefits, not to mention the extra code size/complexity.  Here is an example of one of the
-			// issues:
-			//    Var := 1.12345678  ; Assign higher precision than the default SetFormat.
-			//    if (Var > 5)  ; This creates a cached binary double in Var.
-			//       Sleep -1
-			//    Var2 := Var  ; If this were to copy only the cached double (and not mContents too), the next time someone asked for Var's text, SetFormat would wrongly be applied to it, resulting in a loss of displayed precision (but not internal precision).
-			// Other examples that would be affected include 1.0 (low precision), 1.0e1 (scientific notation),
-			// .5 (leading decimal point), 5. (trailing decimal point), and also the cases that affect
-			// integers such as "005.5", "+5.5", and leading/trailing whitespace.
-			if (!target_var.Assign(source_var.mCharContents, source_var._CharLength())) // See comments in similar section above.
-				return FAIL;
-			// Below must be done AFTER the above because above's Assign() invalidates the cache, but the
-			// cache should be left valid.
-			target_var.UpdateBinaryDouble(source_var.mContentsDouble); // When not passing VAR_ATTRIB_CONTENTS_OUT_OF_DATE, all callers of UpdateBinaryDouble() must ensure that mContents is a pure number (e.g. NOT 123abc).
-		}
-		else
-			target_var.UpdateBinaryDouble(source_var.mContentsDouble, VAR_ATTRIB_CONTENTS_OUT_OF_DATE); // See comments in similar section above.
-		return OK;
-	}
-
-	if (source_var.mAttrib & VAR_ATTRIB_BINARY_CLIP) // Caller has ensured that source_var's Type() is VAR_NORMAL.
-		return target_var.AssignBinaryClip(source_var); // Caller wants a variable with binary contents assigned (copied) to another variable (usually VAR_CLIPBOARD).
-
-	if (source_var.IsObject()) // L31
+	case VAR_ATTRIB_IS_INT64:
+		return target_var.Assign(source_var.mContentsInt64);
+	case VAR_ATTRIB_IS_DOUBLE:
+		return target_var.Assign(source_var.mContentsDouble);
+	case VAR_ATTRIB_IS_OBJECT:
 		return target_var.Assign(source_var.mObject);
-
+	}
 	// Otherwise:
-	source_var.MaybeWarnUninitialized();
 	return target_var.Assign(source_var.mCharContents, source_var._CharLength()); // Pass length to improve performance. It isn't necessary to call Contents()/Length() because they must be already up-to-date because there is no binary number to update them from (if there were, the above would have returned).  Also, caller ensured Type()==VAR_NORMAL.
 }
 
@@ -136,53 +69,256 @@ ResultType Var::Assign(ExprTokenType &aToken)
 // Returns OK or FAIL.
 // Writes aToken's value into aOutputVar based on the type of the token.
 // Caller must ensure that aToken.symbol is an operand (not an operator or other symbol).
-// Caller must ensure that if aToken.symbol==SYM_VAR, aToken.var->Type()==VAR_NORMAL, not the clipboard or
-// any built-in var.  However, this->Type() can be VAR_CLIPBOARD.
 {
+	if (VarTypeIsVirtual(mType))
+	{
+		if (aToken.symbol == SYM_MISSING)
+			return g_script.RuntimeError(ERR_INVALID_ASSIGNMENT);
+		return AssignVirtual(aToken);
+	}
 	switch (aToken.symbol)
 	{
+	case SYM_STRING:  return Assign(aToken.marker, aToken.marker_length);
 	case SYM_INTEGER: return Assign(aToken.value_int64); // Listed first for performance because it's Likely the most common from our callers.
-	case SYM_OPERAND: // Listed near the top for performance.
-		if (aToken.buf) // The "buf" of a SYM_OPERAND is non-NULL if it's a pure integer.
-		{
-			if (*aToken.marker != '0') // It's not an unusual format like 00123 (leading zeroes) or 0xFF (hex).
-				return Assign(*(__int64 *)aToken.buf);
-			// Otherwise, it's something like 0xFF or 00123. For backward compatibility, preserve that formatting
-			// in case the contents of this variable will go on to be displayed or used in a string operation.
-			// The following "double assign" is similar to that in Var::Assign(Var &aVar):
-			if (!Assign(aToken.marker))
-				return FAIL;
-			// Below must be done AFTER the above because above's Assign() invalidates the cache, but the
-			// cache should be left valid.
-			UpdateBinaryInt64(*(__int64 *)aToken.buf); // Except when passing VAR_ATTRIB_CONTENTS_OUT_OF_DATE, all callers of UpdateBinaryInt64() must ensure that mContents is a pure number (e.g. NOT 123abc).
-			return OK;
-		}
-		//else there is no binary integer; so don't return, continue on to the bottom.
-		break;
-	case SYM_VAR:     return Assign(*aToken.var); // Caller has ensured that var->Type()==VAR_NORMAL (it's only VAR_CLIPBOARD for certain expression lvalues, which would never be assigned here because aToken is an rvalue).
+	case SYM_VAR:     return Assign(*aToken.var);
+	case SYM_OBJECT:  return Assign(aToken.object);
 	case SYM_FLOAT:   return Assign(aToken.value_double); // Listed last because it's probably the least common.
-	case SYM_OBJECT:  return Assign(aToken.object); // L31
+	default:
+		ASSERT(!"Unhandled symbol");
+	case SYM_MISSING:
+		UninitializeNonVirtual();
+		return OK;
 	}
-	// Since above didn't return, it's SYM_STRING, or a SYM_OPERAND that lacks a binary-integer counterpart.
-	return Assign(aToken.marker);
+	// Since above didn't return, it can only be SYM_STRING.
+	return Assign(aToken.marker, aToken.marker_length);
 }
 
 
 
-ResultType Var::AssignClipboardAll()
-// Caller must ensure that "this" is a normal variable or the clipboard (though if it's the clipboard, this
-// function does nothing).
+ResultType Var::AssignVirtual(ExprTokenType &aValue)
 {
-	if (mType == VAR_CLIPBOARD) // Seems pointless to do Clipboard:=ClipboardAll, and the below isn't equipped
-		return OK;              // to handle it, so make this have no effect.
-
-	return GetClipboardAll(mType == VAR_ALIAS ? mAliasFor : this, NULL, NULL);
+	FuncResult result_token;
+	if (mType == VAR_VIRTUAL)
+	{
+		if (!mVV->Set) // Might be impossible due to prior validation of assignments/output vars.
+			return g_script.VarIsReadOnlyError(this);
+		mVV->Set(result_token, mName, aValue);
+	}
+	else
+	{
+		ASSERT(mType == VAR_VIRTUAL_OBJ && IsObject());
+		AssignVirtualObj(mObject, aValue, result_token);
+	}
+	return result_token.Exited() ? FAIL : OK; // Never EXIT, since callers are likely expecting only FAIL or OK.
 }
 
-ResultType Var::GetClipboardAll(Var *aOutputVar, void **aData, size_t *aDataSize)
+
+
+void Var::AssignVirtualObj(IObject *aObj, ExprTokenType &aValue, ResultToken &aResultToken)
 {
+	auto *param = &aValue;
+	if (aObj->Invoke(aResultToken, IT_SET | IF_BYPASS_METAFUNC | IF_NO_NEW_PROPS, _T("__Value"), ExprTokenType(aObj), &param, 1) == INVOKE_NOT_HANDLED)
+		aResultToken.UnknownMemberError(ExprTokenType(aObj), IT_SET, _T("__Value"));
+}
+
+
+
+ResultType Var::PopulateVirtualVar()
+{
+	FuncResult result_token;
+	Get(result_token);
+	if (result_token.Exited())
+		return FAIL;
+	if (result_token.mem_to_free)
+	{
+		_AcceptNewMem(result_token.mem_to_free, result_token.marker_length);
+		mAttrib |= VAR_ATTRIB_VIRTUAL_OPEN;
+		return OK;
+	}
+	size_t length;
+	LPTSTR value = TokenToString(result_token, result_token.buf, &length);
+	if (!length) // Avoid an indirect call to Free().
+	{
+		if (mByteCapacity)
+			*mCharContents = '\0';
+		return OK;
+	}
+	if (!AssignString(nullptr, length))
+		return FAIL;
+	tmemcpy(mCharContents, value, length + 1);
+	return OK;
+}
+
+
+
+void Var::UpdateAlias(Var *aTargetVar)
+// Caller must ensure that aTargetVar isn't NULL.
+// When this function actually converts a normal variable into an alias , the variable's old
+// attributes (especially mContents and mCapacity) are hidden/suppressed by virtue of all Var::
+// methods obeying VAR_ALIAS and resolving it to be the target variable.  This prevents a memory
+// leak in a case where a UDF is defined to provide a default value for a ByRef parameter, and is
+// called both with and without that parameter.
+{
+	IObject *ref = aTargetVar->mType == VAR_ALIAS && aTargetVar->IsObject()
+		? aTargetVar->mObject : nullptr;
+
+	// BELOW IS THE MEANS BY WHICH ALIASES AREN'T ALLOWED TO POINT TO OTHER ALIASES, ONLY DIRECTLY TO
+	// THE TARGET VAR.
+	// Resolve aliases-to-aliases for performance.  A caller may ask to create an alias
+	// to an alias when a function calls another function and passes to it one of its own
+	// byref-params, or if the target var has had its reference taken with GetRef().
+	while (aTargetVar->mType == VAR_ALIAS)
+		aTargetVar = aTargetVar->mAliasFor;
+
+	// The following is done only after the above in case there's ever a way for the above
+	// to circle back to become this variable.
+	// Prevent potential infinite loops in other methods by refusing to change an alias
+	// to point to itself.
+	if (aTargetVar == this)
+		return;
+
+	SetAliasDirect(aTargetVar);
+	
+	// Done last in case it causes interruption:
+	ASSERT(!IsObject());
+	//if (IsObject())
+	//	ReleaseObject();
+	if (ref)
+	{
+		_SetObject(ref);
+		ref->AddRef();
+	}
+}
+
+
+
+void Var::UpdateAlias(VarRef *aTargetVar)
+{
+	ASSERT(!IsObject());
+	SetAliasDirect(aTargetVar);
+	_SetObject(aTargetVar);
+	aTargetVar->AddRef();
+}
+
+
+
+void Var::UpdateVirtualObj(IObject *aTargetRef)
+{
+	ASSERT(!IsObject());
+	mType = VAR_VIRTUAL_OBJ;
+	_SetObject(aTargetRef);
+	mAttrib &= ~VAR_ATTRIB_NOT_NUMERIC; // Let IsNumeric() evaluate the property.
+	aTargetRef->AddRef();
+}
+
+
+
+IObject *Var::GetRef()
+{
+	auto target_var = this;
+	if (mType == VAR_ALIAS)
+	{
+		if (mAttrib & VAR_ATTRIB_IS_OBJECT)
+		{
+			mObject->AddRef();
+			return mObject;
+		}
+		target_var = mAliasFor;
+		// It is also possible for a non-object alias to point to an object alias if the reference operator
+		// is applied to target_var itself or some other alias after this var became an alias of target_var.
+		if (target_var->mType == VAR_ALIAS && (target_var->mAttrib & VAR_ATTRIB_IS_OBJECT))
+		{
+			target_var->mObject->AddRef();
+			return target_var->mObject;
+		}
+	}
+	else if (mType == VAR_VIRTUAL_OBJ)
+	{
+		ASSERT(mAttrib & VAR_ATTRIB_IS_OBJECT);
+		mObject->AddRef();
+		return mObject;
+	}
+	auto ref = new VarRef();
+	if (!target_var->MoveToNewFreeVar(*ref))
+	{
+		ref->Release();
+		return nullptr;
+	}
+	if (mType == VAR_ALIAS)
+		target_var->UpdateAlias(ref);
+	UpdateAlias(ref);
+	return ref;
+}
+
+
+
+ResultType Var::MoveToNewFreeVar(Var &aFV)
+{
+	ASSERT(aFV.mType == VAR_NORMAL && (mType == VAR_NORMAL || mType == VAR_VIRTUAL));
+	ASSERT(aFV.mHowAllocated == ALLOC_MALLOC);
+	aFV.mName = mName;   // For error reporting.
+	aFV.mScope = mScope | VAR_VARREF; // Flag it as a VarRef to allow ToReturnValue to safely optimize.
+	if (mAttrib & VAR_ATTRIB_TYPES)
+	{
+		aFV.mContentsInt64 = mContentsInt64;
+		aFV.mAttrib = (mAttrib & (VAR_ATTRIB_TYPES | VAR_ATTRIB_CACHE | VAR_ATTRIB_CONTENTS_OUT_OF_DATE));
+		mAttrib &= ~VAR_ATTRIB_TYPES; // Mainly to remove VAR_ATTRIB_IS_OBJECT.
+	}
+	else if (mType == VAR_VIRTUAL)
+	{
+		aFV.mType = VAR_VIRTUAL;
+		aFV.mVV = mVV;
+	}
+#if 0
+	// The following is currently not used because:
+	//  - It causes the capacity of the variable to change (possibly reset to 0), which is bad if
+	//    VarSetStrCapacity(&v, n) was used.  GetRef() wouldn't have been called by it because of
+	//    optimization of OutputVar parameters.
+	//  - At worst, a small amount of memory per unique variable is reserved and won't be reused
+	//    from this point on, the same as if its capacity increased beyond MAX_ALLOC_SIMPLE.
+	//  - If the variable isn't empty, it's likely that this action will be repeateded each time
+	// 	  the function is called; i.e. malloc will be used by aFV.Assign() and the string will be
+	// 	  copied, when it would be more efficient to malloc at a earlier point and swap vs. copy.
+	//  - In the most common cases, GetRef() is used when capacity is 0.
+	// An alternative would be to change VarSetStrCapacity() to always GetRef(), but that would be
+	// detrimental for optimizing string concatenation, which is its recommended purpose.
+	else if (mHowAllocated == ALLOC_SIMPLE && !(mScope & (VAR_GLOBAL | VAR_LOCAL_STATIC)))
+	{
+		// Don't transfer a SimpleHeap buffer to freevars since that would cause the
+		// buffer to be lost permanently when the freevar is deleted (such as after
+		// the function returns and the VarRef's reference count reaches 0).
+		if (!aFV.Assign(mCharContents, CharLength()))
+			return FAIL;
+		//mAttrib = VAR_ATTRIB_UNINITIALIZED;
+		//*mCharContents = '\0';
+		//mByteLength = 0;
+		return OK;
+	}
+#endif
+	else
+	{
+		if (!(mAttrib & VAR_ATTRIB_UNINITIALIZED))
+		{
+			aFV.mAttrib &= ~VAR_ATTRIB_UNINITIALIZED;
+			mAttrib |= VAR_ATTRIB_UNINITIALIZED;
+		}
+	}
+	std::swap(aFV.mHowAllocated, mHowAllocated);
+	std::swap(aFV.mByteContents, mByteContents);
+	std::swap(aFV.mByteCapacity, mByteCapacity);
+	std::swap(aFV.mByteLength, mByteLength);
+	return OK;
+}
+
+
+
+ResultType Var::GetClipboardAll(void **aData, size_t *aDataSize)
+{
+	*aData = NULL; // Set default in case of early return or empty data.
+	*aDataSize = 0;
+
 	if (!g_clip.Open())
-		return g_script.ScriptError(CANT_OPEN_CLIPBOARD_READ);
+		return g_script.RuntimeError(CANT_OPEN_CLIPBOARD_READ);
 
 	// Calculate the size needed:
 	// EnumClipboardFormats() retrieves all formats, including synthesized formats that don't
@@ -233,7 +369,7 @@ ResultType Var::GetClipboardAll(Var *aOutputVar, void **aData, size_t *aDataSize
 	// says: "If the system provides an automatic type conversion for a particular clipboard format,
 	// there is no advantage to placing the conversion format(s) on the clipboard."
 	HGLOBAL hglobal;
-	SIZE_T size;
+	UINT size; // Make it 32-bit even on x64 to allow clipboard data to be used between x86 and x64.
 	UINT format;
 	VarSizeType space_needed;
 	UINT dib_format_to_omit = 0;
@@ -293,33 +429,21 @@ ResultType Var::GetClipboardAll(Var *aOutputVar, void **aData, size_t *aDataSize
 	if (space_needed == sizeof(format)) // This works because even a single empty format requires space beyond sizeof(format) for storing its format+size.
 	{
 		g_clip.Close();
-		if (aOutputVar)
-			return aOutputVar->Assign(); // Nothing on the clipboard, so just make the variable blank.
-		*aData = NULL;
-		*aDataSize = 0;
 		return OK;
 	}
 
-	LPVOID binary_contents; 
+	if (space_needed & 1)
+		++space_needed; // Ensure it's a multiple of WCHAR.
+
+	LPVOID binary_contents;
 	
-	// Resize the output variable, if needed:
-	if (aOutputVar)
-		if (aOutputVar->SetCapacity(space_needed, true, false))
-		{
-			binary_contents = aOutputVar->mCharContents; // mCharContents vs. Contents() is okay since aOutputVar type is never VAR_ALIAS.
-			space_needed = aOutputVar->mByteCapacity; // Update to actual granted capacity, which might be a little larger than requested.
-		}
-		else
-			binary_contents = NULL; // For detection below.
-	else
-		*aData = binary_contents = malloc(space_needed);
+	// Allocate buffer.
+	*aData = binary_contents = malloc(space_needed);
 	
 	if (!binary_contents)
 	{
 		g_clip.Close();
-		if (aOutputVar)
-			return FAIL; // Above should have already reported the error.
-		return g_script.ScriptError(ERR_OUTOFMEM);
+		return MemoryError();
 	}
 
 	// Retrieve and store all the clipboard formats.  Because failures of GetClipboardData() are now
@@ -351,7 +475,7 @@ ResultType Var::GetClipboardAll(Var *aOutputVar, void **aData, size_t *aDataSize
 		// GlobalLock() fails to work on hglobals of size zero, so don't do it for them.
 		hglobal = g_clip.GetClipboardDataTimeout(format, &save_null_data);
 		if (hglobal)
-			size = GlobalSize(hglobal);
+			size = (UINT)GlobalSize(hglobal); // Data >= 4GB seems extremely unlikely, and couldn't be detected by 32-bit processes anyway, so there's no checking for overflow on x64.
 		else if (save_null_data)
 			size = 0; // This format usually has NULL data.
 		else
@@ -384,69 +508,16 @@ ResultType Var::GetClipboardAll(Var *aOutputVar, void **aData, size_t *aDataSize
 	g_clip.Close();
 	*(UINT *)binary_contents = 0; // Final termination (must be UINT, see above).
 
-	if (aOutputVar)
-	{
-#ifdef UNICODE
-		// v1.1.16: Although it might change the behaviour of some scripts, it seems safer
-		// to use the "rounded up" size than an odd byte count, which would cause the last
-		// byte to be truncated due to integer division in Var::CharLength().
-		if (actual_space_used & 1) // Odd number of bytes.
-		{
-			// Add one byte to form a complete WCHAR.  This should always be safe because
-			// aOutputVar->SetCapacity() always allocates an even number of bytes.
-			((LPBYTE)binary_contents)[sizeof(UINT)] = 0; // binary_contents points at the "final termination" UINT.
-			++actual_space_used;
-		}
-#endif
-		aOutputVar->mByteLength = actual_space_used;
-		aOutputVar->mAttrib |= VAR_ATTRIB_BINARY_CLIP; // VAR_ATTRIB_CONTENTS_OUT_OF_DATE and VAR_ATTRIB_CACHE were already removed by earlier call to SetCapacity().
-	}
-	else
-		*aDataSize = (DWORD)actual_space_used;
+	*aDataSize = (DWORD)actual_space_used;
 	return OK;
 }
 
 
 
-ResultType Var::AssignBinaryClip(Var &aSourceVar)
-// Caller must ensure that this->Type() is VAR_NORMAL or VAR_CLIPBOARD (usually via load-time validation).
-// Caller must ensure that aSourceVar->Type()==VAR_NORMAL and aSourceVar->IsBinaryClip()==true.
-{
-	if (mType == VAR_ALIAS)
-		// For maintainability, it seems best not to use the following method:
-		//    Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
-		// If that were done, bugs would be easy to introduce in a long function like this one
-		// if your forget at use the implicit "this" by accident.  So instead, just call self.
-		return mAliasFor->AssignBinaryClip(aSourceVar);
-
-	// Resolve early for maintainability.
-	// Relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()).
-	Var &source_var = (aSourceVar.mType == VAR_ALIAS) ? *aSourceVar.mAliasFor : aSourceVar;
-	source_var.UpdateContents(); // Update mContents/mLength (probably not necessary because caller is supposed to ensure that aSourceVar->IsBinaryClip()==true).
-
-	if (mType == VAR_NORMAL) // Copy a binary variable to another variable that isn't the clipboard.
-	{
-		if (this == &source_var) // i.e. source == destination.  Aliases were already resolved.
-		{
-			// No need to mark this var since it has obviously already been initialized (it contains a binary clip):
-			//MarkInitialized();
-			return OK;
-		}
-		if (!SetCapacity(source_var.mByteLength, true, false)) // source_var.mLength vs. Length() is okay (see above).
-			return FAIL; // Above should have already reported the error.
-		memcpy(mByteContents, source_var.mByteContents, source_var.mByteLength + sizeof(TCHAR)); // Add sizeof(TCHAR) not sizeof(format). Contents() vs. a variable for the same because mContents might have just changed due Assign() above.
-		mAttrib |= VAR_ATTRIB_BINARY_CLIP; // VAR_ATTRIB_CACHE and VAR_ATTRIB_CONTENTS_OUT_OF_DATE were already removed by earlier call to Assign().
-		return OK; // No need to call Close() in this case.
-	}
-
-	// SINCE ABOVE DIDN'T RETURN, A VARIABLE CONTAINING BINARY CLIPBOARD DATA IS BEING COPIED BACK ONTO THE CLIPBOARD.
-	return SetClipboardAll(source_var.mByteContents, source_var.mByteLength);
-}
-
 ResultType Var::SetClipboardAll(void *aData, size_t aDataSize)
 {
 	if (!g_clip.Open())
-		return g_script.ScriptError(CANT_OPEN_CLIPBOARD_WRITE);
+		return g_script.RuntimeError(CANT_OPEN_CLIPBOARD_WRITE);
 	EmptyClipboard(); // Failure is not checked for since it's probably impossible under these conditions.
 
 	// In case the variable contents are incomplete or corrupted (such as having been read in from a
@@ -456,7 +527,7 @@ ResultType Var::SetClipboardAll(void *aData, size_t aDataSize)
 	HGLOBAL hglobal;
 	LPVOID hglobal_locked;
 	UINT format;
-	SIZE_T size;
+	UINT size;
 
 	while ((next = (char *)binary_contents + sizeof(format)) <= binary_contents_max
 		&& (format = *(UINT *)binary_contents)) // Get the format.  Relies on short-circuit boolean order.
@@ -476,7 +547,7 @@ ResultType Var::SetClipboardAll(void *aData, size_t aDataSize)
 		if (   !(hglobal = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size + (size == 0)))   )
 		{
 			g_clip.Close();
-			return g_script.ScriptError(ERR_OUTOFMEM); // Short msg since so rare.
+			return MemoryError();
 		}
 		if (size) // i.e. Don't try to lock memory of size zero.  It's not needed.
 		{
@@ -484,7 +555,7 @@ ResultType Var::SetClipboardAll(void *aData, size_t aDataSize)
 			{
 				GlobalFree(hglobal);
 				g_clip.Close();
-				return g_script.ScriptError(_T("GlobalLock")); // Short msg since so rare.
+				return g_script.RuntimeError(ERR_INTERNAL_CALL); // Generic msg since so rare.
 			}
 			memcpy(hglobal_locked, binary_contents, size);
 			GlobalUnlock(hglobal);
@@ -499,7 +570,7 @@ ResultType Var::SetClipboardAll(void *aData, size_t aDataSize)
 
 
 
-ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize, bool aObeyMaxMem)
+ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize)
 // Returns OK or FAIL.
 // If aBuf isn't NULL, caller must ensure that aLength is either VARSIZE_MAX (which tells us that the
 // entire strlen() of aBuf should be used) or an explicit length (can be zero) that the caller must
@@ -525,7 +596,7 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 		//    Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
 		// If that were done, bugs would be easy to introduce in a long function like this one
 		// if your forget at use the implicit "this" by accident.  So instead, just call self.
-		return mAliasFor->AssignString(aBuf, aLength, aExactSize, aObeyMaxMem);
+		return mAliasFor->AssignString(aBuf, aLength, aExactSize);
 
 	bool do_assign = true;        // Set defaults.
 	bool free_it_if_large = true; //
@@ -547,25 +618,15 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 	size_t space_needed = aLength + 1; // +1 for the zero terminator.
 	size_t space_needed_in_bytes = space_needed * sizeof(TCHAR);
 
-	if (mType == VAR_CLIPBOARD)
+	if (VarTypeIsVirtual(mType))
 	{
 		if (do_assign)
-			// Just return the result of this.  Note: The clipboard var's attributes,
-			// such as mLength, are not maintained because it's a variable whose
-			// contents usually aren't under our control.
-			return g_clip.Set(aBuf, aLength);
-		else
-			// We open it for write now, because some caller's don't call
-			// this function to write to the contents of the var, they
-			// do it themselves.  Note: Below call will have displayed
-			// any error that occurred:
-			return g_clip.PrepareForWrite(space_needed) ? OK : FAIL;
+			return AssignVirtual(ExprTokenType(const_cast<LPTSTR>(aBuf), aLength));
+		// Since above didn't return, the caller wants to allocate some temporary memory for
+		// writing the value into, and should call Close() in order to commit the actual value.
 	}
-
-	// Since above didn't return, this variable isn't the clipboard.
-	if (space_needed_in_bytes > g_MaxVarCapacity && aObeyMaxMem // v1.0.43.03: aObeyMaxMem was added since some callers aren't supposed to obey it.
-		&& space_needed_in_bytes > mByteCapacity) // v1.1.05: Fixed to allow assignment if a prior VarSetCapacity set the capacity high enough.
-		return g_script.ScriptError(ERR_MEM_LIMIT_REACHED);
+	else if (mType == VAR_CONSTANT) // Might be impossible due to prior validation of assignments/output vars.
+		return g_script.VarIsReadOnlyError(this);
 
 	if (space_needed < 2) // Variable is being assigned the empty string (or a deref that resolves to it).
 	{
@@ -573,20 +634,12 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 		return OK;
 	}
 
-	if (IsObject()) // L31: Release this variable's reference to its object.
-		ReleaseObject();
-
-	// The below is done regardless of whether the section that follows it fails and returns early because
-	// it's the correct thing to do in all cases.
-	// For simplicity, this is done unconditionally even though it should be needed only
-	// when do_assign is true. It's the caller's responsibility to turn on the binary-clip
-	// attribute (if appropriate) by calling Var::Close() with the right option.
-	mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_UNINITIALIZED);
-	// HOWEVER, other things like making mLength 0 and mContents blank are not done here for performance
+	// On failure, things like making mByteLength 0 and mCharContents blank are not done here for performance
 	// reasons (it seems too rare that early return/failure will occur below, since it's only due to
 	// out-of-memory... and even if it does happen, there are probably no consequences to leaving the variable
 	// the way it is now (rather than forcing it to be blank) since the script thread that caused the error
 	// will be ended.
+	// Another reason is that it seems more consistent with other causes of failure, such as for `x := 0/0`.
 
 	if (space_needed_in_bytes > mByteCapacity)
 	{
@@ -608,7 +661,7 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 				// case, it saves memory by avoiding the overhead incurred for each separate malloc'd block).
 				if (space_needed_in_bytes <= _TSIZE(4)) // Even for aExactSize, it seems best to prevent variables from having only a zero terminator in them because that would usually waste 3 bytes due to byte alignment in SimpleHeap.
 					new_size = _TSIZE(4); // v1.0.45: Increased from 2 to 4 to exploit byte alignment in SimpleHeap.
-				else if (aExactSize) // Allows VarSetCapacity() to make more flexible use of SimpleHeap.
+				else if (aExactSize) // Allows VarSetStrCapacity() to make more flexible use of SimpleHeap.
 					new_size = space_needed_in_bytes;
 				else
 				{
@@ -621,7 +674,7 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 				// from SimpleHeap even though the var already had one. This is by design because it can
 				// happen only a limited number of times per variable. See comments further above for details.
 				if (   !(new_mem = (char *) SimpleHeap::Malloc(new_size))   )
-					return FAIL; // It already displayed the error. Leave all var members unchanged so that they're consistent with each other. Don't bother making the var blank and its length zero for reasons described higher above.
+					return MemoryError(); // Leave all var members unchanged so that they're consistent with each other.
 				mHowAllocated = ALLOC_SIMPLE;  // In case it was previously ALLOC_NONE. This step must be done only after the alloc succeeded.
 				break;
 			}
@@ -648,8 +701,6 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 					new_size += (new_size / 100); // Produces smaller code than (new_size * 1.01) and benchmarks the same.
 				else  // 6400 KB or more: Cap the extra margin at some reasonable compromise of speed vs. mem usage: 64 KB
 					new_size += _TSIZE(64 * 1024);
-				if (new_size > g_MaxVarCapacity && aObeyMaxMem) // v1.0.43.03: aObeyMaxMem was added since some callers aren't supposed to obey it.
-					new_size = g_MaxVarCapacity;  // which has already been verified to be enough.
 			}
 			//else space_needed was already verified higher above to be within bounds.
 
@@ -660,44 +711,46 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 				free(mByteContents); // The other members are left temporarily out-of-sync for performance (they're resync'd only if an error occurs).
 			//else mContents contains a "" or it points to memory on SimpleHeap, so don't attempt to free it.
 
-			if (   (ptrdiff_t)new_size < 0 || !(new_mem = (char *)malloc(new_size))   ) // v1.0.44.10: Added a sanity limit of 2 GB so that small negatives like VarSetCapacity(Var, -2) [and perhaps other callers of this function] don't crash.
+			if (  !(new_mem = (char *)malloc(new_size))  )
 			{
 				if (memory_was_freed) // Resync members to reflect the fact that it was freed (it's done this way for performance).
 				{
+					mByteLength = 0;
 					mByteCapacity = 0;             // Invariant: Anyone setting mCapacity to 0 must also set
 					mCharContents = sEmptyString;  // mContents to the empty string.
+					if (mAttrib & (VAR_ATTRIB_IS_INT64 | VAR_ATTRIB_IS_DOUBLE))
+						mAttrib |= VAR_ATTRIB_CONTENTS_OUT_OF_DATE; // Since the cached string (if any) was freed.
+					else if ((mAttrib & VAR_ATTRIB_TYPES) == 0) // Value was a string and was freed above.
+						mAttrib |= VAR_ATTRIB_UNINITIALIZED; // Since it does not have either of its expected values.
 				}
 				else
 				{
 					// IMPORTANT: It's the empty string (a constant) or it points to memory on SimpleHeap, so don't
 					// change mContents/Capacity (that would cause a memory leak for reasons described elsewhere).
-					// Make the var empty for the following reasons:
-					//  1) This condition could be caused by the script requesting a very high (possibly invalid)
-					//     capacity with VarSetCapacity().  The script might be handling the failure using TRY/CATCH,
-					//     so we want the result to be sane.
-					//  2) It's safer and more maintainable.  For instance, VarSetCapacity() sets length to 0, which
-					//     can produce bad/undefined results if there is no null-terminator at mCharContents[Length()]
-					//     as some other parts of the code assume.
-					//  3) It's more consistent.  If this var contained a binary number or object, it has already
-					//     been cleared by "mAttrib &=" above.
-					*mCharContents = '\0'; // If it's sEmptyString, that's okay too because it's writable.
+					// Leave mAttrib as-is so that any existing value is left unchanged.  This is consistent
+					// with the ALLOC_SIMPLE failure case and other aborted assignments, such as `x := 0/0`.
 				}
-				mByteLength = 0; // mAttrib was already updated higher above.
-				return g_script.ScriptError(ERR_OUTOFMEM); // since an error is most likely to occur at runtime.
+				return MemoryError();
 			}
-
-			// Below is necessary because it might have fallen through from case ALLOC_SIMPLE.
-			// This step must be done only after the alloc succeeded (because otherwise, want to keep it
-			// set to ALLOC_SIMPLE (fall-through), if that's what it was).
-			mHowAllocated = ALLOC_MALLOC;
+			else
+			{
+				// Below is necessary because it might have fallen through from case ALLOC_SIMPLE.
+				// This step must be done only after the alloc succeeded (because otherwise, we want to keep it
+				// set to ALLOC_SIMPLE (fall-through), if that's what it was).
+				mHowAllocated = ALLOC_MALLOC;
+			}
 			break;
+		
+		default:
+			// ALLOC_DISABLED: Vars constructed with Var::Var(IObject*) use this for error detection.
+			ASSERT(FALSE);
+			return FAIL;
 		} // switch()
 
 		// Since above didn't return, the alloc succeeded.  Because that's true, all the members (except those
 		// set in their sections above) are updated together so that they stay consistent with each other:
 		mByteContents = new_mem;
 		mByteCapacity = (VarSizeType)new_size;
-		mAttrib &= ~VAR_ATTRIB_CACHE_DISABLED; // If the script previously took the address of this variable, that address is no longer valid; so there is no need to protect against the script directly accessing this variable. This is never reached for VAR_CLIPBOARD, so that isn't checked.
 	} // if (space_needed > mCapacity)
 
 	if (do_assign)
@@ -731,6 +784,52 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 
 	// Writing to union is safe because above already ensured that "this" isn't an alias.
 	mByteLength = aLength * sizeof(TCHAR); // aLength was verified accurate higher above.
+	
+	if (VarTypeIsVirtual(mType))
+	{
+		// This tells Contents() not to call mVV->Get():
+		mAttrib |= VAR_ATTRIB_VIRTUAL_OPEN;
+		return OK;
+	}
+
+	// Update mAttrib and release any object last, after it is known that the assignment has
+	// succeeded, and the new value is fully in place.  This avoids issues of reentrancy due
+	// to Release triggering a __Delete method.
+	auto release_me = (mAttrib & VAR_ATTRIB_IS_OBJECT) ? mObject : nullptr;
+	mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_IS_OBJECT);
+	if (release_me)
+		release_me->Release();
+	return OK;
+}
+
+
+
+ResultType Var::AssignBinaryNumber(__int64 aNumberAsInt64, VarAttribType aAttrib)
+{
+	if (mType == VAR_ALIAS)
+		return mAliasFor->AssignBinaryNumber(aNumberAsInt64, aAttrib);
+
+	if (VarTypeIsVirtual(mType))
+	{
+		// Virtual vars have no binary number cache, as their value may be calculated on-demand.
+		// Additionally, THE CACHE MUST NOT BE USED due to the union containing mVV.
+		ExprTokenType value;
+		value.symbol = (aAttrib & VAR_ATTRIB_IS_INT64) ? SYM_INTEGER : SYM_FLOAT;
+		value.value_int64 = aNumberAsInt64;
+		return AssignVirtual(value);
+	}
+	else if (mType == VAR_CONSTANT) // Might be impossible due to prior validation of assignments/output vars.
+		return g_script.VarIsReadOnlyError(this);
+
+	auto release_me = (mAttrib & VAR_ATTRIB_IS_OBJECT) ? mObject : nullptr;
+
+	mContentsInt64 = aNumberAsInt64;
+	mAttrib &= ~(VAR_ATTRIB_TYPES | VAR_ATTRIB_NOT_NUMERIC | VAR_ATTRIB_UNINITIALIZED);
+	mAttrib |= (VAR_ATTRIB_CONTENTS_OUT_OF_DATE | aAttrib); // aAttrib indicates the type of binary number.
+
+	// Call Release only after completing the assignment, as Release may cause __Delete to execute.
+	if (release_me)
+		release_me->Release();
 	return OK;
 }
 
@@ -738,237 +837,106 @@ ResultType Var::AssignString(LPCTSTR aBuf, VarSizeType aLength, bool aExactSize,
 
 ResultType Var::AssignSkipAddRef(IObject *aValueToAssign)
 {
-	// Relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()).
-	Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
+	if (mType == VAR_ALIAS)
+		return mAliasFor->AssignSkipAddRef(aValueToAssign);
 
-	if (var.mType != VAR_NORMAL)
+	if (VarTypeIsVirtual(mType))
 	{
-		aValueToAssign->Release();
-		return g_script.ScriptError(ERR_INVALID_VALUE, _T("An object."));
+		auto result = AssignVirtual(ExprTokenType(aValueToAssign));
+		aValueToAssign->Release(); // Caller wanted us to take responsibility for this.
+		return result;
 	}
 
-	var.Free(); // If var contains an object, this will Release() it.  It will also clear any string contents and free memory if appropriate.
-		
-	var.mObject = aValueToAssign;
+	if (mAttrib & VAR_ATTRIB_IS_OBJECT)
+	{
+		auto obj = mObject;
+		mObject = aValueToAssign; // Replace the object.  mAttrib should already be correct.
+		obj->Release(); // Called after the assignment in case it triggers __Delete.
+		return OK;
+	}
+
+	Free(); // Free any dynamic memory.
 		
 	// Already done by Free() above:
 	//mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_UNINITIALIZED);
 
-	// Mark this variable to indicate it contains an object.
-	// Currently nothing should attempt to cache a number in a variable which contains an object, but it may become
-	// possible if a "default property" mechanism is introduced for implicitly converting an object to a string/number.
-	// There are at least two ways the caching mechanism could conflict with objects:
-	//  1) Caching a number would overwrite mObject.
-	//	2) Caching a number or flagging the variable as "non-numeric" would give incorrect results if the object's
-	//	   default property can implicitly change (and this change cannot be detected in order to invalidate the cache).
-	// Including VAR_ATTRIB_CACHE_DISABLED below should prevent caching from ever occurring for a variable containing an object.
-	// Including VAR_ATTRIB_NOT_NUMERIC below allows IsNonBlankIntegerOrFloat to return early if it is passed an object.
-	var.mAttrib |= VAR_ATTRIB_OBJECT | VAR_ATTRIB_CACHE_DISABLED | VAR_ATTRIB_NOT_NUMERIC;
-
+	_SetObject(aValueToAssign);
+	
 	return OK;
 }
 
 
 
-VarSizeType Var::Get(LPTSTR aBuf)
-// Returns the length of this var's contents.  In addition, if aBuf isn't NULL, it will copy the contents into aBuf.
+void Var::Get(ResultToken &aResultToken)
 {
-	// Aliases: VAR_ALIAS is checked and handled further down than in most other functions.
-	//
-	// For v1.0.25, don't do the following because in some cases the existing contents of aBuf will not
-	// be altered.  Instead, it will be set to blank as needed further below.
-	//if (aBuf) *aBuf = '\0';  // Init early to get it out of the way, in case of early return.
-	DWORD result;
-	VarSizeType length;
-	TCHAR buf_temp[1]; // Just a fake buffer to pass to some API functions in lieu of a NULL, to avoid any chance of misbehavior. Keep the size at 1 so that API functions will always fail to copy to buf.
-
-	switch(mType)
+	if (mType == VAR_ALIAS)
+		return mAliasFor->Get(aResultToken);
+	if (mType == VAR_VIRTUAL)
 	{
-	case VAR_NORMAL: // Listed first for performance.
-		UpdateContents();  // Update mContents and mLength, if necessary.
-		if (!g_NoEnv && !mByteLength) // If auto-env retrieval is on and the var is empty, check to see if it's really an env. var.
-		{
-			// Regardless of whether aBuf is NULL or not, we don't know at this stage
-			// whether mName is the name of a valid environment variable.  Therefore,
-			// GetEnvironmentVariable() is currently called once in the case where
-			// aBuf is NULL and twice in the case where it's not.  There may be some
-			// way to reduce it to one call always, but that is an optimization for
-			// the future.  Another reason: Calling it twice seems safer, because we can't
-			// be completely sure that it wouldn't act on our (possibly undersized) aBuf
-			// buffer even if it doesn't find the env. var.
-			// UPDATE: v1.0.36.02: It turns out that GetEnvironmentVariable() is a fairly
-			// high overhead call. To improve the speed of accessing blank variables that
-			// aren't environment variables (and most aren't), cached_empty_var is used
-			// to indicate that the previous size-estimation call to us yielded "no such
-			// environment variable" so that the upcoming get-contents call to us can avoid
-			// calling GetEnvironmentVariable() again.  Testing shows that this doubles
-			// the speed of a simple loop that accesses an empty variable such as the following:
-			// SetBatchLines -1
-			// Loop 500000
-			//    if Var = Test
-			//    ...
-			static Var *cached_empty_var = NULL; // Doubles the speed of accessing empty variables that aren't environment variables (i.e. most of them).
-			if (!(cached_empty_var == this && aBuf) && (result = GetEnvironmentVariable(mName, buf_temp, 0)))
-			{
-				// This env. var exists.
-				cached_empty_var = NULL; // i.e. one use only to avoid cache from hiding the fact that an environment variable has newly come into existence since the previous call.
-				if (aBuf)
-				{
-					if (g_Warn_UseEnv)
-						g_script.ScriptWarning(g_Warn_UseEnv, WARNING_USE_ENV_VARIABLE, mName);
-					return GetEnvVarReliable(mName, aBuf); // The caller has ensured, probably via previous call to this function with aBuf == NULL, that aBuf is large enough to hold the result.
-				}
-				return result - 1;  // -1 because GetEnvironmentVariable() returns total size needed when called that way.
-			}
-			else // No matching env. var. or the cache indicates that GetEnvironmentVariable() need not be called.
-			{
-				if (aBuf)
-				{
-					MaybeWarnUninitialized();
-					*aBuf = '\0';
-					cached_empty_var = NULL; // i.e. one use only to avoid cache from hiding the fact that an environment variable has newly come into existence since the previous call.
-				}
-				else // Size estimation phase: Since there is no such env. var., flag it for the upcoming get-contents phase.
-					cached_empty_var = this;
-				return 0;
-			}
-		}
-		length = _CharLength();
-
-		// Otherwise (since above didn't return), it's not an environment variable (or it is, but there's
-		// a script variable of non-zero length that's eclipsing it).
-		if (!aBuf)
-			return length;
-		else // Caller provider buffer, so if mLength is zero, just make aBuf empty now and return early (for performance).
-			if (!mByteLength)
-			{
-				MaybeWarnUninitialized();
-				*aBuf = '\0';
-				return 0;
-			}
-			//else continue on below.
-		if (aBuf == mCharContents)
-			// When we're called from ExpandArg() that was called from PerformAssign(), PerformAssign()
-			// relies on this check to avoid the overhead of copying a variables contents onto itself.
-			return length;
-		else if (mByteLength < 100000)
-		{
-			// Copy the var contents into aBuf.  Although a little bit slower than CopyMemory() for large
-			// variables (say, over 100K), this loop seems much faster for small ones, which is the typical
-			// case.  Also of note is that this code section is the main bottleneck for scripts that manipulate
-			// large variables, such as this:
-			//start_time = %A_TICKCOUNT%
-			//my = 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789
-			//tempvar =
-			//loop, 2000
-			//	tempvar = %tempvar%%My%
-			//elapsed_time = %A_TICKCOUNT%
-			//elapsed_time -= %start_time%
-			//msgbox, elapsed_time = %elapsed_time%
-			//return
-			for (LPTSTR cp = mCharContents; *cp; *aBuf++ = *cp++); // UpdateContents() was already called higher above to update mContents.
-			*aBuf = '\0';
-		}
-		else
-		{
-			CopyMemory(aBuf, mByteContents, mByteLength); // Faster for large vars, but large vars aren't typical.
-			aBuf[length] = '\0'; // This is done as a step separate from above in case mLength is inaccurate (e.g. due to script's improper use of DllCall).
-		}
-		return length;
-
-	case VAR_ALIAS:
-		// For maintainability, it seems best not to use the following method:
-		//    Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
-		// If that were done, bugs would be easy to introduce in a long function like this one
-		// if your forget at use the implicit "this" by accident.  So instead, just call self.
-		return mAliasFor->Get(aBuf);
-
-	// Built-in vars with volatile contents:
-	case VAR_CLIPBOARD:
-	{
-		length = (VarSizeType)g_clip.Get(aBuf); // It will also copy into aBuf if it's non-NULL.
-		if (length == CLIPBOARD_FAILURE)
-		{
-			// Above already displayed the error, so just return.
-			// If we were called only to determine the size, the
-			// next call to g_clip.Get() will not put anything into
-			// aBuf (it will either fail again, or it will return
-			// a length of zero due to the clipboard not already
-			// being open & ready), so there's no danger of future
-			// buffer overflows as a result of returning zero here.
-			// Also, due to this function's return type, there's
-			// no easy way to terminate the current hotkey
-			// subroutine (or entire script) due to this error.
-			// However, due to the fact that multiple attempts
-			// are made to open the clipboard, failure should
-			// be extremely rare.  And the user will be notified
-			// with a MsgBox anyway, during which the subroutine
-			// will be suspended:
-			length = 0;
-		}
-		if (aBuf)
-			aBuf[length] = '\0'; // Might not be necessary, but kept in case it ever is.
-		return length;
+		aResultToken.symbol = SYM_INTEGER; // For _f_return_i() and consistency with BIFs.
+		return mVV->Get(aResultToken, mName);
 	}
-
-	case VAR_CLIPBOARDALL: // There's a slight chance this case is never executed; but even if true, it should be kept for maintainability.
-		// This variable is directly handled at a higher level.  As documented, any use of ClipboardAll outside of
-		// the supported modes yields an empty string.
-		if (aBuf)
-			*aBuf = '\0';
-		return 0;
-
-	default: // v1.0.46.16: VAR_BUILTIN: Call the function associated with this variable to retrieve its contents.  This change reduced uncompressed coded size by 6 KB.
-		return mBIV(aBuf, mName);
-	} // switch(mType)
+	if (mType != VAR_VIRTUAL_OBJ)
+		return ToToken(aResultToken);
+	if (mObject->Invoke(aResultToken, IT_GET | IF_BYPASS_METAFUNC, _T("__Value"), ExprTokenType(mObject), nullptr, 0) == INVOKE_NOT_HANDLED)
+		aResultToken.UnknownMemberError(ExprTokenType(mObject), IT_GET, _T("__Value"));
 }
 
 
 
-void Var::Free(int aWhenToFree, bool aExcludeAliasesAndRequireInit)
+void Var::Free(int aWhenToFree)
 // The name "Free" is a little misleading because this function:
 // ALWAYS sets the variable to be blank (except for static variables and aExcludeAliases==true).
 // BUT ONLY SOMETIMES frees the memory, depending on various factors described further below.
 // Caller must be aware that ALLOC_SIMPLE (due to its nature) is never freed.
-// aExcludeAliasesAndRequireInit may be split into two if any caller ever wants to pass
-// true for one and not the other (currently there is only one caller who passes true).
+// aClearAliasesAndRequireInit may be split into two if any caller ever wants to pass
+// true for one and not the other.
 {
-	// Not checked because even if it's not VAR_NORMAL, there are few if any consequences to continuing.
+	// Not checked because VAR_VIRTUAL uses this to free its temporary buffer:
 	//if (mType != VAR_NORMAL) // For robustness, since callers generally shouldn't call it this way.
 	//	return;
 
 	if (mType == VAR_ALIAS) // For simplicity and reduced code size, just make a recursive call to self.
 	{
-		if (!aExcludeAliasesAndRequireInit)
+		if (!(aWhenToFree & VAR_CLEAR_ALIASES))
+		{
 			// For maintainability, it seems best not to use the following method:
 			//    Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
 			// If that were done, bugs would be easy to introduce in a long function like this one
 			// if your forget at use the implicit "this" by accident.  So instead, just call self.
 			mAliasFor->Free(aWhenToFree);
-		//else caller didn't want the target of the alias freed, so do nothing.
-		return;
+			return;
+		}
+		mType = VAR_NORMAL; // Revert alias to normal variable.
 	}
-
-	// Must check this one first because caller relies not only on var not being freed in this case,
-	// but also on its contents not being set to an empty string:
-	if (aWhenToFree == VAR_ALWAYS_FREE_BUT_EXCLUDE_STATIC && IsStatic())
-		return; // This is the only case in which the variable ISN'T made blank.
-
-	if (IsObject()) // L31: Release this variable's reference to its object.
-		ReleaseObject();
+	else if (mType == VAR_VIRTUAL_OBJ)
+	{
+		if (!(aWhenToFree & VAR_CLEAR_ALIASES))
+		{
+			ASSERT(FALSE);
+			return;
+		}
+		mType = VAR_NORMAL; // Revert alias to normal variable.
+	}
 
 	mByteLength = 0; // Writing to union is safe because above already ensured that "this" isn't an alias.
 	// Even if it isn't free'd, variable will be made blank.  So it seems proper to always remove
-	// the binary_clip attribute (since it can't be used that way after it's been made blank) and
 	// the uninitialized attribute (since *we* are initializing it).  Some callers may rely on us
 	// removing these attributes:
-	mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_UNINITIALIZED);
+	mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_VIRTUAL_OPEN);
 
-	if (aExcludeAliasesAndRequireInit)
+	if (aWhenToFree & VAR_REQUIRE_INIT)
 		// Caller requires this var to be considered uninitialized from now on.  This attribute may
 		// have been removed above, but there was no cost involved.  It might not have been set in
 		// the first place, so we must add it here anyway:
 		mAttrib |= VAR_ATTRIB_UNINITIALIZED;
+
+	if (mAttrib & VAR_ATTRIB_IS_OBJECT)
+	{
+		mAttrib &= ~VAR_ATTRIB_IS_OBJECT;
+		mObject->Release(); // Called after removing the attribute in case it triggers __Delete.
+		return; // Must return at this point since __Delete may have assigned some other value.
+	}
 
 	switch (mHowAllocated)
 	{
@@ -993,16 +961,15 @@ void Var::Free(int aWhenToFree, bool aExcludeAliasesAndRequireInit)
 		// only free relatively large vars:
 		if (mByteCapacity)
 		{
-			// aWhenToFree==VAR_FREE_IF_LARGE: the memory is not freed if it is a small area because
+			// aWhenToFree & VAR_FREE_IF_LARGE: the memory is not freed if it is a small area because
 			// it might help reduce memory fragmentation and improve performance in cases where
 			// the memory will soon be needed again (in which case one free+malloc is saved).
-			if (   aWhenToFree < VAR_ALWAYS_FREE_LAST  // Fixed for v1.0.40.07 to prevent memory leak in recursive script-function calls.
-				|| aWhenToFree == VAR_FREE_IF_LARGE && mByteCapacity > (4 * 1024)   )
+			if (   (aWhenToFree & VAR_ALWAYS_FREE)
+				|| (aWhenToFree & VAR_FREE_IF_LARGE) && mByteCapacity > 4096   )
 			{
 				free(mByteContents);
 				mByteCapacity = 0;             // Invariant: Anyone setting mCapacity to 0 must also set
 				mCharContents = sEmptyString;  // mContents to the empty string.
-				mAttrib &= ~VAR_ATTRIB_CACHE_DISABLED; // If the script previously took the address of this variable, that address is no longer valid; so there is no need to protect against the script directly accessing this variable. This is never reached for VAR_CLIPBOARD, so that isn't checked.
 				// BUT DON'T CHANGE mHowAllocated to ALLOC_NONE (see comments further below).
 			}
 			else // Don't actually free it, but make it blank (callers rely on this).
@@ -1046,81 +1013,122 @@ void Var::Free(int aWhenToFree, bool aExcludeAliasesAndRequireInit)
 
 ResultType Var::AppendIfRoom(LPTSTR aStr, VarSizeType aLength)
 // Returns OK if there's room enough to append aStr and it succeeds.
-// Returns FAIL otherwise (also returns FAIL for VAR_CLIPBOARD).
+// Returns FAIL otherwise (also returns FAIL for VAR_VIRTUAL).
 // Environment variables aren't supported here; instead, aStr is appended directly onto the actual/internal
 // contents of the "this" variable.
 {
-	// Relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()):
-	Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
-	if (var.mType != VAR_NORMAL) // e.g. VAR_CLIPBOARD. Some callers do call it this way, but even if not it should be kept for maintainability.
+	if (mType == VAR_ALIAS)
+		return mAliasFor->AppendIfRoom(aStr, aLength);
+	if (mType != VAR_NORMAL // e.g. VAR_VIRTUAL. Some callers do call it this way, but even if not it should be kept for maintainability.
+		|| IsObject()) // Let caller free it; not worth handling here.
 		return FAIL; // CHECK THIS FIRST, BEFORE BELOW, BECAUSE CALLERS ALWAYS WANT IT TO BE A FAILURE.
-	if (!aLength) // Consider the appending of nothing to be a success.
-		return OK;
-	VarSizeType var_length = var.LengthIgnoreBinaryClip(); // Get the apparent length because one caller is a concat that wants consistent behavior of the .= operator regardless of whether this shortcut succeeds or not.
-	VarSizeType new_length = var_length + aLength;
-	if (new_length >= var._CharCapacity()) // Not enough room.
-		return FAIL;
-	tmemmove(var.mCharContents + var_length, aStr, aLength);  // mContents was updated via LengthIgnoreBinaryClip() above. Use memmove() vs. memcpy() in case there's any overlap between source and dest.
-	var.mCharContents[new_length] = '\0'; // Terminate it as a separate step in case caller passed a length shorter than the apparent length of aStr.
-	var.mByteLength = new_length * sizeof(TCHAR);
-	if (IsObject()) // L31: Release this variable's reference to its object.
-		ReleaseObject();
+	if (aLength)
+	{
+		VarSizeType var_length = Length(); // Get the apparent length because one caller is a concat that wants consistent behavior of the .= operator regardless of whether this shortcut succeeds or not.
+		VarSizeType new_length = var_length + aLength;
+		if (new_length >= _CharCapacity()) // Not enough room.
+			return FAIL;
+		tmemmove(mCharContents + var_length, aStr, aLength);  // mContents was updated via Length() above. Use memmove() vs. memcpy() in case there's any overlap between source and dest.
+		mCharContents[new_length] = '\0'; // Terminate it as a separate step in case caller passed a length shorter than the apparent length of aStr.
+		mByteLength = new_length * sizeof(TCHAR);
+	}
+	// Even if nothing was appended above, set the attributes so n:=1,n.="" produces a String, not an Integer.
 	// If this is a binary-clip variable, appending has probably "corrupted" it; so don't allow it to ever be
 	// put back onto the clipboard as binary data (the routine that does that is designed to detect corruption,
 	// but it might not be perfect since corruption is so rare).  Also remove the other flags that are no longer
 	// appropriate:
-	var.mAttrib &= ~VAR_ATTRIB_OFTEN_REMOVED; // This also removes VAR_ATTRIB_NOT_NUMERIC because appending some digits to an empty variable would make it numeric.
+	mAttrib &= ~VAR_ATTRIB_OFTEN_REMOVED; // This also removes VAR_ATTRIB_NOT_NUMERIC because appending some digits to an empty variable would make it numeric.
 	return OK;
 }
 
 
 
-void Var::AcceptNewMem(LPTSTR aNewMem, VarSizeType aLength)
+ResultType Var::Append(LPTSTR aStr, VarSizeType aLength)
+// Caller must ensure that Type() == VAR_NORMAL.
+{
+	if (mType == VAR_ALIAS)
+		return mAliasFor->Append(aStr, aLength);
+	if (AppendIfRoom(aStr, aLength))
+		return OK;
+	// Since above didn't return, we need to allocate space and postpone freeing our current value
+	// until after it is copied into the new buffer.  The following relies on AppendIfRoom() always
+	// succeeding if there is room and the var has non-zero length; otherwise AssignString() would
+	// null-terminate the old contents at position 0 and the result would be incorrect.
+	LPTSTR old_contents = mCharContents; // Caller has ensured UpdateContents() was called if necessary.
+	VarSizeType old_length = _CharLength();
+	VarSizeType old_capacity = (mHowAllocated == ALLOC_MALLOC) ? mByteCapacity : 0;
+	if (old_capacity)
+		mByteCapacity = 0; // Prevent the call below from freeing it.
+	if (!AssignString(NULL, _CharLength() + aLength))
+	{
+		mByteCapacity = old_capacity; // Restore this since the contents are being left as is.
+		return FAIL;
+	}
+	tmemcpy(mCharContents, old_contents, old_length);
+	tmemcpy(mCharContents + old_length, aStr, aLength + 1);
+	if (old_capacity)
+		free(old_contents);
+	return OK;
+}
+
+
+
+ResultType Var::AcceptNewMem(LPTSTR aNewMem, VarSizeType aLength)
 // Caller provides a new malloc'd memory block (currently must be non-NULL).  That block and its
 // contents are directly hung onto this variable in place of its old block, which is freed (except
-// in the case of VAR_CLIPBOARD, in which case the memory is copied onto the clipboard then freed).
-// Caller must ensure that mType == VAR_NORMAL or VAR_CLIPBOARD.
+// in the case of VAR_VIRTUAL, in which case the memory is passed to mVV->Set() then freed).
 // This function was added in v1.0.45 to aid callers in improving performance.
 {
-	// Relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()).
-	Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
-	if (var.mType == VAR_CLIPBOARD)
+	if (mType == VAR_ALIAS)
+		return mAliasFor->AcceptNewMem(aNewMem, aLength);
+	if (mType != VAR_NORMAL)
 	{
-		var.Assign(aNewMem, aLength); // Clipboard requires GlobalAlloc memory so can't directly accept aNewMem.  So just copy it the normal way.
+		auto result = Assign(aNewMem, aLength);
 		free(aNewMem); // Caller gave it to us to take charge of, but we have no further use for it.
+		return result;
 	}
 	else // VAR_NORMAL
 	{
-		var.Free(VAR_ALWAYS_FREE); // Release the variable's old memory. This also removes flags VAR_ATTRIB_OFTEN_REMOVED.
-		var.mHowAllocated = ALLOC_MALLOC; // Must always be this type to avoid complications and possible memory leaks.
-		var.mByteContents = (char *) aNewMem;
-		var.mByteLength = aLength * sizeof(TCHAR);
-		ASSERT( var.mByteLength + sizeof(TCHAR) <= _msize(aNewMem) );
-		var.mByteCapacity = (VarSizeType)_msize(aNewMem); // Get actual capacity in case it's a lot bigger than aLength+1. _msize() is only about 36 bytes of code and probably a very fast call.
-		var.mAttrib &= ~VAR_ATTRIB_CACHE_DISABLED; // This isn't always done by Free() above, so do it here in case it wasn't (it seems too unlikely to have to check whether aNewMem==the_old_mem_address).  Reason: If the script previously took the address of this variable, that address is no longer valid; so there is no need to protect against the script directly accessing this variable.
-		// Already done by Free() above:
-		//mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_UNINITIALIZED); // New memory is always non-binary-clip.  A new parameter could be added to change this if it's ever needed.
+		_AcceptNewMem(aNewMem, aLength);
+		return OK;
+	}
+}
 
-		// Shrink the memory if there's a lot of wasted space because the extra capacity is seldom utilized
-		// in real-world scripts.
-		// A simple rule seems best because shrinking is probably fast regardless of the sizes involved,
-		// plus and there's considerable rarity to ever needing capacity beyond what's in a variable
-		// (concat/append is one example).  This will leave a large percentage of extra space in small variables,
-		// but in those rare cases when a script needs to create thousands of such variables, there may be a
-		// current or future way to shrink an existing variable to contain only its current length, such as
-		// VarShrink().
-		if (var.mByteCapacity - var.mByteLength > 64)
-		{
-			var.mByteCapacity = var.mByteLength + sizeof(TCHAR); // This will become the new capacity.
-			// _expand() is only about 75 bytes of uncompressed code size and probably performs very quickly
-			// when shrinking.  Also, MSDN implies that when shrinking, failure won't happen unless something
-			// is terribly wrong (e.g. corrupted heap).  But for robustness it is checked anyway:
-			if (   !(var.mByteContents = (char *)_expand(var.mByteContents, var.mByteCapacity))   )
-			{
-				var.mByteLength = 0;
-				var.mByteCapacity = 0;
-			}
-		}
+
+
+void Var::_AcceptNewMem(LPTSTR aNewMem, VarSizeType aLength)
+// Called by AcceptNewMem() when mType == VAR_NORMAL.
+// Called by PopulateVirtualVar() when mType == VAR_VIRTUAL.
+{
+	Free(VAR_ALWAYS_FREE); // Release the variable's old memory. This also removes flags VAR_ATTRIB_OFTEN_REMOVED.
+	mHowAllocated = ALLOC_MALLOC; // Must always be this type to avoid complications and possible memory leaks.
+	mByteContents = (char *) aNewMem;
+	if (aLength == VARSIZE_MAX)
+		aLength = _tcslen(aNewMem);
+	mByteLength = aLength * sizeof(TCHAR);
+	ASSERT( mByteLength + sizeof(TCHAR) <= _msize(aNewMem) );
+	mByteCapacity = (VarSizeType)_msize(aNewMem); // Get actual capacity in case it's a lot bigger than aLength+1. _msize() is only about 36 bytes of code and probably a very fast call.
+	// Already done by Free() above:
+	//mAttrib &= ~VAR_ATTRIB_OFTEN_REMOVED; // New memory is always non-binary-clip.  A new parameter could be added to change this if it's ever needed.
+
+	// Shrink the memory if there's a lot of wasted space because the extra capacity is seldom utilized
+	// in real-world scripts.
+	// A simple rule seems best because shrinking is probably fast regardless of the sizes involved,
+	// plus and there's considerable rarity to ever needing capacity beyond what's in a variable
+	// (concat/append is one example).  This will leave a large percentage of extra space in small variables,
+	// but in those rare cases when a script needs to create thousands of such variables, there may be a
+	// current or future way to shrink an existing variable to contain only its current length, such as
+	// VarShrink().
+	if (mByteCapacity - mByteLength > 64)
+	{
+		// _expand() is only about 75 bytes of uncompressed code size and probably performs very quickly
+		// when shrinking.  MSDN implies that when shrinking, failure won't happen unless something is
+		// terribly wrong (e.g. corrupted heap), but it's known to fail in other cases, such as when
+		// called by AutoHotkey running as a Windows store app.
+		if (_expand(mByteContents, mByteLength + sizeof(TCHAR)))
+			// Update capacity only after successfully shrinking:
+			mByteCapacity = mByteLength + sizeof(TCHAR);
+		// The block is left unchanged on failure, so in that case leave everything as is.
 	}
 }
 
@@ -1130,27 +1138,37 @@ void Var::SetLengthFromContents()
 // Function added in v1.0.43.06.  It updates the mLength member to reflect the actual current length of mContents.
 // Caller must ensure that Type() is VAR_NORMAL.
 {
-	// Relies on the fact that aliases can't point to other aliases (enforced by UpdateAlias()).
-	Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
-	VarSizeType capacity = var.Capacity();
-	var.UpdateContents(); // Ensure mContents and mLength are up-to-date.
-	if (capacity > 0)
+	if (mType == VAR_ALIAS)
+		return mAliasFor->SetLengthFromContents();
+	if (mAttrib & VAR_ATTRIB_CONTENTS_OUT_OF_DATE)
 	{
- 		var.mCharContents[capacity - 1] = '\0';  // Caller wants us to ensure it's terminated, to avoid crashing strlen() below.
-		var.mByteLength = ((VarSizeType)_tcslen(var.mCharContents)) * sizeof(TCHAR);
+		UpdateContents(); // Set contents and length based on numeric value.
+		return;
 	}
-	//else it has no capacity, so do nothing (it could also be a reserved/built-in variable).
+	size_t length = 0;
+	LPTSTR contents = mCharContents;
+	size_t max_count = mByteCapacity / sizeof(TCHAR);
+	// Since the performance cost is low, ensure the string is terminated at the limit of its
+	// capacity (helps prevent crashes if DLL function didn't do its job and terminate the string,
+	// or when a function is called that deliberately doesn't terminate the string, such as
+	// RtlMoveMemory()).
+	if (max_count == 0)
+		max_count = 1; // Contents() == Var::sEmptyString in this case, so check it hasn't been tampered with.
+	length = _tcsnlen(contents, max_count);
+	if (length == max_count)
+		g_script.CriticalError(ERR_STRING_NOT_TERMINATED, mName);
+	mByteLength = _TSIZE(length);
 }
 
 
 
-ResultType Var::BackupFunctionVars(Func &aFunc, VarBkp *&aVarBackup, int &aVarBackupCount)
+ResultType Var::BackupFunctionVars(UserFunc &aFunc, VarBkp *&aVarBackup, int &aVarBackupCount)
 // All parameters except the first are output parameters that are set for our caller (though caller
 // is responsible for having initialized aVarBackup to NULL).
 // If there is nothing to backup, only the aVarBackupCount is changed (to zero).
 // Returns OK or FAIL.
 {
-	if (   !(aVarBackupCount = aFunc.mVarCount + aFunc.mLazyVarCount)   )  // Nothing needs to be backed up.
+	if (   !(aVarBackupCount = aFunc.mVars.mCount)   )  // Nothing needs to be backed up.
 		return OK; // Leave aVarBackup set to NULL as set by the caller.
 
 	// NOTES ABOUT MALLOC(): Apparently, the implementation of malloc() is quite good, at least for small blocks
@@ -1169,12 +1187,8 @@ ResultType Var::BackupFunctionVars(Func &aFunc, VarBkp *&aVarBackup, int &aVarBa
 
 	// Note that Backup() does not make the variable empty after backing it up because that is something
 	// that must be done by our caller at a later stage.
-	for (i = 0; i < aFunc.mVarCount; ++i)
-		if (!aFunc.mVar[i]->IsStatic()) // Don't bother backing up statics because they won't need to be restored.
-			aFunc.mVar[i]->Backup(aVarBackup[aVarBackupCount++]);
-	for (i = 0; i < aFunc.mLazyVarCount; ++i)
-		if (!aFunc.mLazyVar[i]->IsStatic()) // Don't bother backing up statics because they won't need to be restored.
-			aFunc.mLazyVar[i]->Backup(aVarBackup[aVarBackupCount++]);
+	for (i = 0; i < aFunc.mVars.mCount; ++i)
+		aFunc.mVars.mItem[i]->Backup(aVarBackup[aVarBackupCount++]);
 	return OK;
 }
 
@@ -1190,7 +1204,7 @@ void Var::Backup(VarBkp &aVarBkp)
 {
 	aVarBkp.mVar = this; // Allows the restoration process to always know its target without searching.
 	aVarBkp.mByteContents = mByteContents;
-	aVarBkp.mContentsInt64 = mContentsInt64; // This also copies the other member of the union: mContentsDouble.
+	aVarBkp.mContentsInt64 = mContentsInt64; // This also copies the other members of the union: mContentsDouble, mObject.
 	aVarBkp.mByteLength = mByteLength; // Since it's a union, it might actually be backing up mAliasFor (happens at least for recursive functions that pass parameters ByRef).
 	aVarBkp.mByteCapacity = mByteCapacity;
 	aVarBkp.mHowAllocated = mHowAllocated; // This might be ALLOC_SIMPLE or ALLOC_NONE if backed up variable was at the lowest layer of the call stack.
@@ -1208,13 +1222,9 @@ void Var::Backup(VarBkp &aVarBkp)
 	// its backup intact but allowing this variable (or formal parameter) to be given a new value in the future:
 	mByteCapacity = 0;             // Invariant: Anyone setting mCapacity to 0 must also set...
 	mCharContents = sEmptyString;  // ...mContents to the empty string.
-	if (mType != VAR_ALIAS) // Fix for v1.0.42.07: Don't reset mLength if the other member of the union is in effect.
-		mByteLength = 0;        // Otherwise, functions that recursively pass ByRef parameters can crash because mType stays as VAR_ALIAS.
+	mByteLength = 0;
+	mType = VAR_NORMAL;
 	mHowAllocated = ALLOC_MALLOC; // Never NONE because that would permit SIMPLE. See comments higher above.
-	//mAttrib &= ~(VAR_ATTRIB_OFTEN_REMOVED | VAR_ATTRIB_CACHE_DISABLED | VAR_ATTRIB_OBJECT);
-	// Above: Removing VAR_ATTRIB_CACHE_DISABLED doesn't cost anything in performance and might help cases where
-	// a recursively-called function does numeric, cache-only operations on a variable that has zero capacity.
-	// Since we're removing every attribute except the one we want to add, just reset mAttrib:
 	mAttrib = VAR_ATTRIB_UNINITIALIZED; // The function's new recursion layer should consider this var uninitialized, even if it was initialized by the previous layer.
 }
 
@@ -1233,13 +1243,11 @@ void Var::Restore(VarBkp &aVarBkp)
 
 
 
-void Var::FreeAndRestoreFunctionVars(Func &aFunc, VarBkp *&aVarBackup, int &aVarBackupCount)
+void Var::FreeAndRestoreFunctionVars(UserFunc &aFunc, VarBkp *&aVarBackup, int &aVarBackupCount)
 {
 	int i;
-	for (i = 0; i < aFunc.mVarCount; ++i)
-		aFunc.mVar[i]->Free(VAR_ALWAYS_FREE_BUT_EXCLUDE_STATIC, true); // Pass "true" to exclude aliases, since their targets should not be freed (they don't belong to this function). Also resets the "uninitialized" attribute.
-	for (i = 0; i < aFunc.mLazyVarCount; ++i)
-		aFunc.mLazyVar[i]->Free(VAR_ALWAYS_FREE_BUT_EXCLUDE_STATIC, true);
+	for (i = 0; i < aFunc.mVars.mCount; ++i)
+		aFunc.mVars.mItem[i]->Free(VAR_ALWAYS_FREE | VAR_CLEAR_ALIASES | VAR_REQUIRE_INIT); // Clear aliases, since their targets should not be freed (they don't belong to this function).
 
 	// The freeing (above) MUST be done prior to the restore-from-backup below (otherwise there would be
 	// a memory leak).  Static variables are never backed up and thus do not exist in the aVarBackup array.
@@ -1259,66 +1267,75 @@ void Var::FreeAndRestoreFunctionVars(Func &aFunc, VarBkp *&aVarBackup, int &aVar
 
 
 
+// Used by the debugger.
+void VarBkp::ToToken(ExprTokenType &aValue)
+{
+	switch (mAttrib & VAR_ATTRIB_TYPES)
+	{
+	case VAR_ATTRIB_IS_OBJECT: aValue.SetValue(mObject); break;
+	case VAR_ATTRIB_IS_INT64: aValue.SetValue(mContentsInt64); break;
+	case VAR_ATTRIB_IS_DOUBLE: aValue.SetValue(mContentsDouble); break;
+	default:
+		if (mAttrib & VAR_ATTRIB_UNINITIALIZED)
+			aValue.symbol = SYM_MISSING;
+		else
+			aValue.SetValue(mCharContents, mByteLength / sizeof(TCHAR));
+	}
+}
+
+
+
+// Without __declspec(noinline), this produced larger code than the original, which had
+// the code essentially repeated in ValidateName().  There's no good reason to inline
+// this function (or other functions which are only called to display an error dialog).
+__declspec(noinline)
+ResultType DisplayNameError(LPCTSTR aErrorFormat, int aDisplayError, LPCTSTR aName)
+{
+	if (!aDisplayError)
+		return FAIL;
+	static LPCTSTR sErrorSubject[] = VALIDATENAME_SUBJECTS;
+	TCHAR msg[512];
+	sntprintf(msg, _countof(msg), aErrorFormat
+		, sErrorSubject[VALIDATENAME_SUBJECT_INDEX(aDisplayError)]
+		, aName);
+	return g_script.ScriptError(msg);
+}
+
+
+
 ResultType Var::ValidateName(LPCTSTR aName, int aDisplayError)
 // Returns OK or FAIL.
 {
-	if (!*aName) return FAIL;
-	// Seems best to disallow variables that start with numbers so that more advanced
-	// parsing (e.g. expressions) can be more easily added in the future.  UPDATE: For
-	// backward compatibility with AutoIt2's technique of storing command line args in
-	// a numerically-named var (e.g. %1% is the first arg), decided not to do this:
-	//if (*aName >= '0' && *aName <= '9')
-	//	return g_script.ScriptError("This variable name starts with a number, which is not allowed.", aName);
-	TCHAR c;
-	LPCTSTR cp;
-	for (cp = aName; *cp; ++cp)
+	if (!*aName) return FAIL; // Shouldn't be called this way.
+	
+	// Seems best to disallow variables that start with numbers for purity, to allow
+	// something like 1e3 to be scientific notation, and possibly other reasons.
+	if (*aName >= '0' && *aName <= '9')
 	{
-		// ispunct(): @ # $ _ [ ] ? ! % & " ' ( ) * + - ^ . / \ : ; , < = > ` ~ | { }
-		// Of the above, it seems best to disallow the following:
-		// () reserved: user-defined functions, e.g. var = myfunc2(myfunc1() + 2)
-		// ! reserved: "not"
-		// % reserved: deref char
-		// & reserved: "and" or "bitwise and"
-		// ' seems too iffy
-		// " seems too iffy
-		// */-+ reserved: math
-		// , reserved: delimiter
-		// . reserved: objects
-		// : reserved: ternary
-		// ? reserved: ternary
-		// ; reserved: comment
-		// \ seems too iffy
-		// <=> reserved: comparison
-		// ^ reserved: "bitwise xor"
-		// ` reserved: escape char
-		// {} reserved: blocks
-		// | reserved: "or" or "bitwise or"
-		// ~ reserved: "bitwise not"
-		// [] reserved: array/object indexing
-
-		// Rewritten for v1.0.36.02 to enhance performance and also forbid characters such as linefeed and
-		// alert/bell inside variable names.  Ordered to maximize short-circuit performance for the most-often
-		// used characters in variables names:
-		c = *cp;  // For performance.
-		if (!cisalnum(c) // It's not a core/legacy alphanumeric.
-			&& !(c & ~0x7F) // It's not an extended ASCII character such as €/¶/¿ (for simplicity and backward compatibility, these are always allowed).
-			&& !_tcschr(_T("_$#@"), c)) // It's not a permitted punctuation mark.  L31: Removed [], now reserved for array/object indexing. Also removed ? while I was at it.
-		{
-			if (aDisplayError)
-			{
-				TCHAR msg[512];
-				sntprintf(msg, _countof(msg), _T("The following %s name contains an illegal character:\n\"%-1.300s\"")
-					, aDisplayError == DISPLAY_VAR_ERROR ? _T("variable") : _T("function")
-					, aName);
-				return g_script.ScriptError(msg);
-			}
-			else
-				return FAIL;
-		}
+		return DisplayNameError(_T("This %s name starts with a number, which is not allowed:\n\"%-1.300s\""), aDisplayError, aName);
+	}
+	if (*find_identifier_end(aName) != '\0')
+	{
+		return DisplayNameError(_T("The following %s name contains an illegal character:\n\"%-1.300s\""), aDisplayError, aName);
+	}
+	if (aDisplayError == DISPLAY_METHOD_ERROR || aDisplayError == DISPLAY_GROUP_ERROR)
+		return OK;
+	// Reserve names of control flow statements.  Aside from being more "pure" and allowing
+	// future improvements, it should also help catch syntax errors such as "if (foo) break".
+	// Note that since these statements allow parentheses, they only get here for variable names.
+	// Reserve operator keywords.  This makes ACT_ASSIGNEXPR more consistent with ACT_EXPRESSION,
+	// such as for "and := 1" vs. "(and := 1)", though a different error message is given.
+	if (   Script::ConvertActionType(aName)
+		|| Script::ConvertWordOperator(aName, _tcslen(aName))
+		|| !_tcsicmp(aName, _T("True")) || !_tcsicmp(aName, _T("False")) || !_tcsicmp(aName, _T("Throw"))   )
+	{
+		return DisplayNameError(_T("The following reserved word must not be used as a %s name:\n\"%-1.300s\""), aDisplayError, aName);
 	}
 	// Otherwise:
 	return OK;
 }
+
+
 
 ResultType Var::AssignStringFromCodePage(LPCSTR aBuf, int aLength, UINT aCodePage)
 {
@@ -1334,20 +1351,25 @@ ResultType Var::AssignStringFromCodePage(LPCSTR aBuf, int aLength, UINT aCodePag
 #else
 	int iLen = MultiByteToWideChar(aCodePage, 0, aBuf, aLength, NULL, 0);
 	if (iLen > 0) {
-		if (!AssignString(NULL, iLen, true, false))
+		if (!AssignString(NULL, iLen, true))
 			return FAIL;
-		LPWSTR aContents = Contents(TRUE, TRUE);
+		LPWSTR aContents = Contents(TRUE);
 		iLen = MultiByteToWideChar(aCodePage, 0, aBuf, aLength, (LPWSTR) aContents, iLen);
-		aContents[iLen] = 0;
-		if (!iLen)
-			return FAIL;
-		SetCharLength(aContents[iLen - 1] ? iLen : iLen - 1);
+		// A return value of 0 is not ambiguous here, but any failure is more likely to occur
+		// in the first call.  For consistency (see below), let the var be blank on error.
+		if (aLength == -1 && iLen)
+			--iLen; // Exclude the null-terminator.
+		else
+			aContents[iLen] = 0;
+		SetCharLength(iLen);
 	}
 	else
 		Assign(); // Return value is ambiguous in this case: may be zero-length input or an error.  For simplicity, return OK.
 	return OK;
 #endif
 }
+
+
 
 ResultType Var::AssignStringToCodePage(LPCWSTR aBuf, int aLength, UINT aCodePage, DWORD aFlags, char aDefChar)
 {
@@ -1360,9 +1382,9 @@ ResultType Var::AssignStringToCodePage(LPCWSTR aBuf, int aLength, UINT aCodePage
 		pDefChar = &aDefChar;
 	int iLen = WideCharToMultiByte(aCodePage, aFlags, aBuf, aLength, NULL, 0, pDefChar, NULL);
 	if (iLen > 0) {
-		if (!SetCapacity(iLen, true, false))
+		if (!SetCapacity(iLen, true))
 			return FAIL;
-		LPSTR aContents = (LPSTR) Contents(TRUE, TRUE);
+		LPSTR aContents = (LPSTR) Contents(TRUE);
 		iLen = WideCharToMultiByte(aCodePage, aFlags, aBuf, aLength, aContents, iLen, pDefChar, NULL);
 		aContents[iLen] = 0;
 		if (!iLen)
@@ -1376,14 +1398,47 @@ ResultType Var::AssignStringToCodePage(LPCWSTR aBuf, int aLength, UINT aCodePage
 	return OK;
 }
 
-__forceinline void Var::MaybeWarnUninitialized()
+
+
+LPTSTR ResultToken::Malloc(LPTSTR aValue, size_t aLength)
 {
-	if (IsUninitializedNormalVar())
+	if (aLength == -1)
+		aLength = _tcslen(aValue);
+	if (  !(mem_to_free = tmalloc(aLength + 1))  )
+		return NULL;
+	symbol = SYM_STRING;
+	marker_length = aLength;
+	return tmemcpy(marker = mem_to_free, aValue, aLength + 1); // +1 to include the null-terminator.
+}
+
+
+
+ResultType Var::InitializeConstant()
+{
+	// Caller has verified !IsInitialized() && Type() == VAR_CONSTANT.
+	Var &var = *ResolveAlias();
+	ASSERT(var.mType == VAR_CONSTANT && var.IsObject() && dynamic_cast<::Object*>(var.mObject));
+	var.mAttrib &= ~VAR_ATTRIB_UNINITIALIZED; // Only make one attempt; prevents infinite recursion.
+	FuncResult result_token;
+	auto cls = (::Object*)var.mObject;
+	cls->AddRef(); // Necessary because Construct() calls Release() on failure.
+	auto result = cls->Construct(result_token, nullptr, 0);
+	if (result == OK)
+		cls->Release();
+	return result;
+}
+
+
+
+void VarRef::__Value(ResultToken &aResultToken, int aID, int aFlags, ExprTokenType *aParam[], int aParamCount)
+{
+	if (IS_INVOKE_SET)
 	{
-		// The following should not be possible; if it is, there's a bug and we want to know about it:
-		//if (mByteLength != 0)
-		//	MarkInitialized();	// "self-correct" if we catch a var that has normal content but wasn't marked initialized
-		//else
-			g_script.WarnUninitializedVar(this);
+		if (aParamCount)
+			Assign(*aParam[0]) || aResultToken.SetExitResult(FAIL);
+		else
+			UninitializeNonVirtual();
 	}
+	else
+		ToToken(aResultToken);
 }

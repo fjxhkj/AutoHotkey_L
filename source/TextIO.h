@@ -15,6 +15,7 @@
 #define TEOF ((TCHAR)EOF)
 
 #include <locale.h> // For _locale_t, _create_locale and _free_locale.
+#include <algorithm>
 
 extern UINT g_ACP;
 
@@ -51,7 +52,6 @@ public:
 	};
 
 	TextStream()
-		: mFlags(0), mCodePage(-1), mLength(0), mBuffer(NULL), mPos(NULL), mLastRead(0)
 	{
 		SetCodePage(CP_ACP);
 	}
@@ -73,12 +73,12 @@ public:
 
 	DWORD Write(LPCTSTR aBuf, DWORD aBufLen = 0);
 	DWORD Write(LPCVOID aBuf, DWORD aBufLen);
-	DWORD Read(LPTSTR aBuf, DWORD aBufLen, int aNumLines = 0);
+	DWORD Read(LPTSTR aBuf, DWORD aBufLen, BOOL aReadLine = FALSE);
 	DWORD Read(LPVOID aBuf, DWORD aBufLen);
 
 	DWORD ReadLine(LPTSTR aBuf, DWORD aBufLen)
 	{
-		return Read(aBuf, aBufLen, 1);
+		return Read(aBuf, aBufLen, TRUE);
 	}
 
 	INT_PTR FormatV(LPCTSTR fmt, va_list ap)
@@ -108,7 +108,7 @@ public:
 	{
 		if (aCodePage == CP_ACP)
 			aCodePage = g_ACP; // Required by _create_locale.
-		//if (!IsValidCodePage(aCodePage)) // Returns FALSE for UTF-16 and possibly other valid code pages, so leave it up to the user to pass a valid codepage.
+		//if (!IsValidCodePage(aCodePage)) // Returns FALSE for UTF-16 and possibly other valid code pages, so leave it up to the caller to validate.
 			//return;
 
 		if (mCodePage != aCodePage)
@@ -125,6 +125,7 @@ public:
 	}
 	UINT GetCodePage() { return mCodePage; }
 	DWORD GetFlags() { return mFlags; }
+	int DecodingErrors() { return mDecodingErrors; }
 
 protected:
 	// IO abstraction
@@ -177,9 +178,6 @@ protected:
 		return true;
 	}
 
-	template<typename TCHR>
-	DWORD WriteTranslateCRLF(TCHR *aBuf, DWORD aBufLen); // Used by TextStream::Write(LPCSTR,DWORD).
-
 	// Functions for populating the read buffer.
 	DWORD Read(DWORD aReadSize = TEXT_IO_BLOCK)
 	{
@@ -220,23 +218,24 @@ protected:
 		return false;
 	}
 
-	DWORD mFlags;
-	DWORD mLength;		// The length of available data in the buffer, in bytes.
-	DWORD mLastRead;
-	UINT  mCodePage;
+	DWORD mFlags = 0;
+	DWORD mLength = 0;		// The length of available data in the buffer, in bytes.
+	DWORD mLastRead = 0;
+	UINT  mCodePage = -1;
 	CPINFO mCodePageInfo;
+	bool mDecodingErrors = 0;
 	
-	TCHAR mLastWriteChar;
+	TCHAR mLastWriteChar = 0;
 
 	union // Pointer to the next character to read in mBuffer.
 	{
-		LPBYTE  mPos;
+		LPBYTE  mPos = nullptr;
 		LPSTR   mPosA;
 		LPWSTR  mPosW;
 	};
 	union // Used by buffered/translated IO to hold raw file data. 
 	{
-		LPBYTE  mBuffer;
+		LPBYTE  mBuffer = nullptr;
 		LPSTR   mBufferA;
 		LPWSTR  mBufferW;
 	};
@@ -296,7 +295,7 @@ public:
 		if (!_Seek(aLength, SEEK_SET) || !SetEndOfFile(mFile))
 			return -1;
 		// Make sure we do not extend the file again.
-		_Seek(min(aLength, pos), SEEK_SET);
+		_Seek((std::min)(aLength, pos), SEEK_SET); // (std::min) - see https://stackoverflow.com/a/22023122/180275
 		return _Length();
 	}
 	HANDLE  Handle() { RollbackFilePointer(); FlushWriteBuffer(); return mFile; }

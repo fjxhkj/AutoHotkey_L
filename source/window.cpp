@@ -19,75 +19,33 @@ GNU General Public License for more details.
 #include "util.h" // for strlcpy()
 #include "application.h" // for MsgSleep()
 #include "psapi.h" // for ahk_exe
+#include <dwmapi.h>
+#include "script_gui.h"
 
 
 HWND WinActivate(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
 	, bool aFindLastMatch, HWND aAlreadyVisited[], int aAlreadyVisitedCount)
 {
-	// If window is already active, be sure to leave it that way rather than activating some
-	// other window that may match title & text also.  NOTE: An explicit check is done
-	// for this rather than just relying on EnumWindows() to obey the z-order because
-	// EnumWindows() is *not* guaranteed to enumerate windows in z-order, thus the currently
-	// active window, even if it's an exact match, might become overlapped by another matching
-	// window.  Also, use the USE_FOREGROUND_WINDOW vs. IF_USE_FOREGROUND_WINDOW macro for
-	// this because the active window can sometimes be NULL (i.e. if it's a hidden window
-	// and DetectHiddenWindows is off):
 	HWND target_window;
-	if (USE_FOREGROUND_WINDOW(aTitle, aText, aExcludeTitle, aExcludeText))
-	{
-		// User asked us to activate the "active" window, which by definition already is.
-		SET_TARGET_TO_ALLOWABLE_FOREGROUND(aSettings.DetectHiddenWindows)
-		// The documented behavior is "If a matching window is already active, that window
-		// will be kept active"; however, if the active (foreground) window is hidden and
-		// DetectHiddenWindows is off, that window isn't a match and so we should search
-		// for a matching window.
-		if (target_window) // Added in v1.1.20.
-		{
-			// The window is already active, but might be minimized.  The behavior in
-			// v1.1.19 and earlier was to leave it minimized, but it seems more useful
-			// and intuitive to restore it.  The documentation says "If the window is
-			// minimized, it is automatically restored prior to being activated."
-			if (IsIconic(target_window))
-				ShowWindow(target_window, SW_RESTORE);
-			return target_window;
-		}
-	}
-
-	if (!aFindLastMatch && !*aTitle && !*aText && !*aExcludeTitle && !*aExcludeText)
-	{
-		// User passed no params, so use the window most recently found by WinExist():
-		if (   !(target_window = GetValidLastUsedWindow(aSettings))   )
-			return NULL;
-	}
-	else
-	{
-		/*
-		// Might not help avg. performance any?
-		if (!aFindLastMatch) // Else even if the windows is already active, we want the bottommost one.
-			if (hwnd = WinActive(aTitle, aText, aExcludeTitle, aExcludeText)) // Already active.
-				return target_window;
-		*/
-		// Don't activate in this case, because the top-most window might be an
-		// always-on-top but not-meant-to-be-activated window such as AutoIt's
-		// splash text:
-		if (   !(target_window = WinExist(aSettings, aTitle, aText, aExcludeTitle, aExcludeText, aFindLastMatch
-			, false, aAlreadyVisited, aAlreadyVisitedCount))   )
-			return NULL;
-	}
+	// There are no checks for WinActivate("A") or WinActivate() since WinExist() handles both
+	// of those cases.
+	// There's no attempt to check whether the current active window is a match, because the
+	// established behaviour is to activate the top/bottom-most active window regardless, and
+	// that seems more useful than ignoring the call.
+	if (   !(target_window = WinExist(aSettings, aTitle, aText, aExcludeTitle, aExcludeText, aFindLastMatch
+		, false, aAlreadyVisited, aAlreadyVisitedCount))   )
+		return NULL;
 	// Above has ensured that target_window is non-NULL, that it is a valid window, and that
 	// it is eligible due to g->DetectHiddenWindows being true or the window not being hidden
 	// (or being one of the script's GUI windows).
-	return SetForegroundWindowEx(target_window);
+	HWND activated = SetForegroundWindowEx(target_window);
+	// Callers want the window found above, even if it isn't now active.
+	return target_window;
 }
 
 
 
-#ifdef _DEBUG_WINACTIVATE
-#define LOGF "c:\\AutoHotkey SetForegroundWindowEx.txt"
-HWND AttemptSetForeground(HWND aTargetWindow, HWND aForeWindow, LPTSTR aTargetTitle)
-#else
 HWND AttemptSetForeground(HWND aTargetWindow, HWND aForeWindow)
-#endif
 // Returns NULL if aTargetWindow or its owned-window couldn't be brought to the foreground.
 // Otherwise, on success, it returns either aTargetWindow or an HWND owned by aTargetWindow.
 {
@@ -116,35 +74,19 @@ HWND AttemptSetForeground(HWND aTargetWindow, HWND aForeWindow)
 	SLEEP_WITHOUT_INTERRUPTION(SLEEP_INTERVAL); // Specify param so that it will try to specifically sleep that long.
 	HWND new_fore_window = GetForegroundWindow();
 	if (new_fore_window == aTargetWindow)
-	{
-#ifdef _DEBUG_WINACTIVATE
-		if (!result)
-		{
-			FileAppend(LOGF, _T("SetForegroundWindow() indicated failure even though it succeeded: "), false);
-			FileAppend(LOGF, aTargetTitle);
-		}
-#endif
 		return aTargetWindow;
-	}
 	if (new_fore_window != aForeWindow && aTargetWindow == GetWindow(new_fore_window, GW_OWNER))
 		// The window we're trying to get to the foreground is the owner of the new foreground window.
 		// This is considered to be a success because a window that owns other windows can never be
 		// made the foreground window, at least if the windows it owns are visible.
 		return new_fore_window;
 	// Otherwise, failure:
-#ifdef _DEBUG_WINACTIVATE
-	if (result)
-	{
-		FileAppend(LOGF, _T("SetForegroundWindow() indicated success even though it failed: "), false);
-		FileAppend(LOGF, aTargetTitle);
-	}
-#endif
 	return NULL;
 }
 
 
 
-HWND SetForegroundWindowEx(HWND aTargetWindow)
+HWND SetForegroundWindowEx(HWND aTargetWindow, bool aBackgroundActivation)
 // Caller must have ensured that aTargetWindow is a valid window or NULL, since we
 // don't call IsWindow() here.
 {
@@ -158,21 +100,22 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 	if (target_thread != g_MainThreadID && IsWindowHung(aTargetWindow)) // Calls to IsWindowHung should probably be avoided if the window belongs to our thread.  Relies upon short-circuit boolean order.
 		return NULL;
 
-#ifdef _DEBUG_WINACTIVATE
-	TCHAR win_name[64];
-	GetWindowText(aTargetWindow, win_name, _countof(win_name));
-#endif
-
 	HWND orig_foreground_wnd = GetForegroundWindow();
 	// AutoIt3: If there is not any foreground window, then input focus is on the TaskBar.
 	// MY: It is definitely possible for GetForegroundWindow() to return NULL, even on XP.
-	if (!orig_foreground_wnd)
-		orig_foreground_wnd = FindWindow(_T("Shell_TrayWnd"), NULL);
+	// Lexikos: It can be easily reproduced by calling GetForegroundWindow() in a tight
+	//  loop on Windows 10 and switching windows with Alt+Esc.  In such cases the taskbar
+	//  is definitely NOT active, and if our caller requested activation of the taskbar,
+	//  it should not be skipped just because !orig_foreground_wnd.
+	// MSDN: "The foreground window can be NULL in certain circumstances, such as when a
+	//  window is losing activation."
+	//if (!orig_foreground_wnd)
+	//	orig_foreground_wnd = FindWindow(_T("Shell_TrayWnd"), NULL);
 
-	if (aTargetWindow == orig_foreground_wnd) // It's already the active window.
-		return aTargetWindow;
-
-	if (IsIconic(aTargetWindow))
+	// Fix for v1.1.28.02: Restore the window *before* checking if it is already active.
+	// This was supposed to be done in v1.1.20, but was only done for WinTitle = "A".
+	// See "IsIconic" in WinActivate() for comments.
+	if (IsIconic(aTargetWindow) && !aBackgroundActivation)
 		// This might never return if aTargetWindow is a hung window.  But it seems better
 		// to do it this way than to use the PostMessage() method, which might not work
 		// reliably with apps that don't handle such messages in a standard way.
@@ -182,6 +125,9 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 		// has been acted on prior to trying to activate the window (and all Async()
 		// does is post a message to its queue):
 		ShowWindow(aTargetWindow, SW_RESTORE);
+
+	if (aTargetWindow == orig_foreground_wnd) // It's already the active window.
+		return aTargetWindow;
 
 	// This causes more trouble than it's worth.  In fact, the AutoIt author said that
 	// he didn't think it even helped with the IE 5.5 related issue it was originally
@@ -193,14 +139,8 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 	HWND new_foreground_wnd;
 
 	if (!g_WinActivateForce)
-	// if (g_os.IsWin95() || (!g_os.IsWin9x() && !g_os.IsWin2000orLater())))  // Win95 or NT
-		// Try a simple approach first for these two OS's, since they don't have
-		// any restrictions on focus stealing:
-#ifdef _DEBUG_WINACTIVATE
-#define IF_ATTEMPT_SET_FORE if (new_foreground_wnd = AttemptSetForeground(aTargetWindow, orig_foreground_wnd, win_name))
-#else
+		// Try a simple approach first:
 #define IF_ATTEMPT_SET_FORE if (new_foreground_wnd = AttemptSetForeground(aTargetWindow, orig_foreground_wnd))
-#endif
 		IF_ATTEMPT_SET_FORE
 			return new_foreground_wnd;
 		// Otherwise continue with the more drastic methods below.
@@ -222,10 +162,6 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 	// as a side-effect, sometimes trigger the need for the "two-alts" case
 	// below.  So that's another reason to just keep it simple and do it this way
 	// only.
-
-#ifdef _DEBUG_WINACTIVATE
-	TCHAR buf[1024];
-#endif
 
 	bool is_attached_my_to_fore = false, is_attached_fore_to_target = false;
 	DWORD fore_thread;
@@ -259,23 +195,36 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 			is_attached_fore_to_target = AttachThreadInput(fore_thread, target_thread, TRUE) != 0;
 	}
 
+	static bool sTriedKeyUp = false;
+
 	// The log showed that it never seemed to need more than two tries.  But there's
 	// not much harm in trying a few extra times.  The number of tries needed might
 	// vary depending on how fast the CPU is:
 	for (int i = 0; i < 5; ++i)
 	{
-		IF_ATTEMPT_SET_FORE
+		if (i == (int)g_WinActivateForce && !sTriedKeyUp) // At least one attempt failed this time, and Alt-up hasn't been tried since the process started.
 		{
-#ifdef _DEBUG_WINACTIVATE
-			if (i > 0) // More than one attempt was needed.
-			{
-				sntprintf(buf, _countof(buf), _T("AttachThreadInput attempt #%d indicated success: %s")
-					, i + 1, win_name);
-				FileAppend(LOGF, buf);
-			}
-#endif
-			break;
+			sTriedKeyUp = true;
+			// Lexikos: Recent testing on Windows 10.0.19555 indicated that sending Alt-up was just as effective
+			// as sending double-Alt (the second Alt was probably just to counter the first one), but it should
+			// have lower risk of side-effects since there's no key-down.  One observable side-effect is that
+			// if the user happens to be holding Alt (and it wasn't suppressed due to being part of a hotkey),
+			// the window menu might light up for an instant before the window loses focus.  However, this also
+			// means that if the system is set to hide the menu mnemonics (underlines), that actually happens
+			// whereas they would normally be left visible because the window didn't catch Alt-up.
+			// The Alt-up seems to be effective at allowing ALL subsequent SetForegroundWindow() calls to succeed
+			// even without AttachThreadInput(), and even if Alt-up is just sent at program startup, so it's only
+			// done once per process.  In other words, this should stop subsequent calls from causing taskbar
+			// buttons to flash.  This doesn't seem to be necessary if AttachThreadInput() is used, so it's not
+			// done for #WinActivateForce unless there's been one failed attempt.
+			// KEY_BLOCK_THIS is used so that if this or any other scripts (running on v1.1.27+) have a hook
+			// installed, the Alt-up will be suppressed to further reduce the risk of side-effects.  Testing
+			// showed that the suppressed event worked just as well (in theory, because the system's handling
+			// of it isn't and can't be suppressed).
+			KeyEvent(KEYUP, VK_MENU, 0, NULL, false, KEY_BLOCK_THIS);
 		}
+		IF_ATTEMPT_SET_FORE
+			break;
 	}
 
 	// I decided to avoid the quick minimize + restore method of activation.  It's
@@ -321,26 +270,7 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 		//KeyEvent(KEYUP, VK_MENU);
 		// Also replacing "2-alts" with "alt-tab" below, for now:
 
-#ifndef _DEBUG_WINACTIVATE
 		new_foreground_wnd = AttemptSetForeground(aTargetWindow, orig_foreground_wnd);
-#else // debug mode
-		IF_ATTEMPT_SET_FORE
-			FileAppend(LOGF, _T("2-alts ok: "), false);
-		else
-		{
-			FileAppend(LOGF, _T("2-alts (which is the last resort) failed.  "), false);
-			HWND h = GetForegroundWindow();
-			if (h)
-			{
-				TCHAR fore_name[64];
-				GetWindowText(h, fore_name, _countof(fore_name));
-				FileAppend(LOGF, _T("Foreground: "), false);
-				FileAppend(LOGF, fore_name, false);
-			}
-			FileAppend(LOGF, _T(".  Was trying to activate: "), false);
-		}
-		FileAppend(LOGF, win_name);
-#endif
 	} // if()
 
 	// Very important to detach any threads whose inputs were attached above,
@@ -366,7 +296,7 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 	// is a bit messed up, because when you dismiss the MessageBox, an unexpected
 	// window (probably the one two levels down) becomes active rather than the
 	// window that's only 1 level down in the z-order:
-	if (new_foreground_wnd) // success.
+	if (new_foreground_wnd && !aBackgroundActivation) // success.
 	{
 		// Even though this is already done for the IE 5.5 "hack" above, must at
 		// a minimum do it here: The above one may be optional, not sure (safest
@@ -379,16 +309,14 @@ HWND SetForegroundWindowEx(HWND aTargetWindow)
 		// possible other issues:
 		BringWindowToTop(aTargetWindow);
 		//SetWindowPos(aTargetWindow, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-		return new_foreground_wnd; // Return this rather than aTargetWindow because it's more appropriate.
 	}
-	else
-		return NULL;
+	return new_foreground_wnd; // Return this rather than aTargetWindow because it's more appropriate.
 }
 
 
 
-HWND WinClose(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, int aTimeToWaitForClose
-	, LPTSTR aExcludeTitle, LPTSTR aExcludeText, bool aKillIfHung)
+HWND WinClose(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, int aTimeToWaitForClose
+	, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText, bool aKillIfHung)
 // Return the HWND of any found-window to the caller so that it has the option of waiting
 // for it to become an invalid (closed) window.
 {
@@ -480,7 +408,7 @@ HWND WinClose(HWND aWnd, int aTimeToWaitForClose, bool aKillIfHung)
 	// the values our params, some of which may be in the deref buffer.  So be sure not
 	// to refer to those strings once MsgSleep() has been done, below:
 
-	// This is the same basic code used for ACT_WINWAITCLOSE and such:
+	// This is the same basic code used for WinWaitClose and such:
 	for (;;)
 	{
 		// Seems best to always do the first one regardless of the value 
@@ -500,7 +428,7 @@ HWND WinClose(HWND aWnd, int aTimeToWaitForClose, bool aKillIfHung)
 
 
 	
-HWND WinActive(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
+HWND WinActive(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText
 	, bool aUpdateLastUsed)
 // This function must be kept thread-safe because it may be called (indirectly) by hook thread too.
 // In addition, it must not change the value of anything in aSettings except when aUpdateLastUsed==true.
@@ -529,7 +457,7 @@ HWND WinActive(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aEx
 
 	// Only after the above check should the below be done.  This is because "IfWinActive" (with no params)
 	// should be "true" if one of the script's GUI windows is active:
-	if (!(aSettings.DetectHiddenWindows || IsWindowVisible(fore_win))) // In this case, the caller's window can't be active.
+	if (!aSettings.DetectWindow(fore_win)) // In this case, the caller's window can't be active.
 		return NULL;
 
 	WindowSearch ws;
@@ -543,7 +471,7 @@ HWND WinActive(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aEx
 
 
 
-HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText
+HWND WinExist(global_struct &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText
 	, bool aFindLastMatch, bool aUpdateLastUsed, HWND aAlreadyVisited[], int aAlreadyVisitedCount)
 // This function must be kept thread-safe because it may be called (indirectly) by hook thread too.
 // In addition, it must not change the value of anything in aSettings except when aUpdateLastUsed==true.
@@ -563,8 +491,7 @@ HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExc
 	if (!(*aTitle || *aText || *aExcludeTitle || *aExcludeText))
 		// User passed no params, so use the window most recently found by WinExist().
 		// It's correct to do this even in this function because it's called by
-		// WINWAITCLOSE and IFWINEXIST specifically to discover if the Last-Used
-		// window still exists.
+		// WINWAITCLOSE specifically to discover if the Last-Used window still exists.
 		return GetValidLastUsedWindow(aSettings);
 
 	WindowSearch ws;
@@ -578,7 +505,7 @@ HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExc
 	if (ws.mCriteria & CRITERION_ID) // "ahk_id" will be satisfied if that HWND still exists and is valid.
 	{
 		// Explicitly allow HWND_BROADCAST for all commands that use WinExist (which is just about all
-		// window commands), even though it's only valid with ScriptPostSendMessage().
+		// window commands), even though it's only valid with BIF_PostSendMessage().
 		// This is because HWND_BROADCAST is probably never used as the HWND for a real window, so there
 		// should be no danger of any reasonable script ever passing that value in as a real target window,
 		// which should thus minimize the chance of a crash due to calling various API functions
@@ -586,7 +513,7 @@ HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExc
 		if (   ws.mCriterionHwnd != HWND_BROADCAST // It's not exempt from the other checks on the two lines below.
 			&& (!IsWindow(ws.mCriterionHwnd)    // And it's either not a valid window...
 				// ...or the window is not detectible (in v1.0.40.05, child windows are detectible even if hidden):
-				|| !(aSettings.DetectHiddenWindows || IsWindowVisible(ws.mCriterionHwnd)
+				|| !(aSettings.DetectWindow(ws.mCriterionHwnd)
 					|| (GetWindowLong(ws.mCriterionHwnd, GWL_STYLE) & WS_CHILD)))   )
 			return NULL;
 
@@ -596,8 +523,55 @@ HWND WinExist(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExc
 			return NULL;
 		//else fall through to the section below, since ws.mFoundCount and ws.mFoundParent were set by ws.IsMatch().
 	}
-	else // aWinTitle doesn't start with "ahk_id".  Try to find a matching window.
-		EnumWindows(EnumParentFind, (LPARAM)&ws);
+	else // aWinTitle doesn't contain "ahk_id".  Try to find a matching window.
+	{
+		if ((ws.mCriteria & CRITERION_CLASS) && aSettings.TitleMatchMode != FIND_REGEX && !aFindLastMatch)
+		{
+			// This should be a reliable way to find the first window with the given class name.
+			// Benchmarks showed FindWindow to be perhaps 20 times faster than using EnumWindows
+			// in the two very common scenarios where its result can be used:
+			//  1) The top-most window with a given class name also matches the other criteria.
+			//  2) There are no windows with a given class name.  It is especially fast if there
+			//     are no classes, window messages or clipboard formats currently registered with
+			//     this name (i.e. the name isn't registered in the user atom table).
+			// Because these cases are common and FindWindow is so fast in comparison to EnumWindows,
+			// it seems well worth trying FindWindow before EnumWindows.  The title parameter must be
+			// omitted in FIND_IN_LEADING_PART or FIND_ANYWHERE modes, otherwise it would exclude valid
+			// candidate windows.  For FIND_EXACT mode, specifying the title makes it more likely that
+			// the found window will be a match, but we still need to do a case-sensitive comparison.
+			LPCTSTR title = ((ws.mCriteria & CRITERION_TITLE) && aSettings.TitleMatchMode == FIND_EXACT) ? ws.mCriterionTitle : nullptr;
+			HWND hwnd = FindWindow(ws.mCriterionClass, title);
+			if (!hwnd)
+				return NULL; // There are definitely no matching windows, so skip EnumWindows.
+			if (aSettings.DetectWindow(hwnd))
+			{
+				ws.SetCandidate(hwnd);
+				ws.IsMatch();
+			}
+			// The following could be used to get the atom which corresponds to mCriterionClass,
+			// allowing EnumParentFind to compare atoms and avoid retrieving titles or class names
+			// in many cases.  It isn't done because:
+			//  - Although the atom value is known to be the same for all window classes with that
+			//    name (and all registered window messages and clipboard formats with that name),
+			//    if all such classes are unregistered, the atom is released and can be reused for
+			//    some other name.  This makes it difficult to disprove the possibility of a race
+			//    condition where the atom value changes meaning before we can use it.
+			//  - It would increase complexity, as GetClassName would still be needed in some cases.
+			//  - Benchmarks indicated that GetWindowText is almost as fast as GetClassWord on
+			//    average, and although GetClassName is slower, we don't call it if the title
+			//    doesn't match.  (But title vs atom comparison wasn't factored in.)
+			//ATOM atom = GetClassWord(hwnd, GCW_ATOM);
+		}
+		if (!ws.mFoundParent)
+			EnumWindows(EnumParentFind, (LPARAM)&ws);
+		// Performance note: Simple benchmarks confirmed the cost is proportionate to the number of
+		// top-level windows even when the callback is only called once (because it returns FALSE).
+		// The most plausible explanation is that EnumChildWindows/EnumWindows copies the list of HWNDs
+		// prior to calling the callback for the first time, to guarantee that changes to the Z-order
+		// won't interrupt the enumeration.  (Although the documentation for EnumWindows doesn't make
+		// such a guarantee, the documentation for EnumChildWindows does, and states that the two are
+		// equivalent when the hwndParent parameter is NULL.)
+	}
 
 	UPDATE_AND_RETURN_LAST_USED_WINDOW(ws.mFoundParent) // This also does a "return".
 }
@@ -614,7 +588,7 @@ HWND GetValidLastUsedWindow(global_struct &aSettings)
 {
 	if (!aSettings.hWndLastUsed || !IsWindow(aSettings.hWndLastUsed))
 		return NULL;
-	if (   aSettings.DetectHiddenWindows || IsWindowVisible(aSettings.hWndLastUsed)
+	if (   aSettings.DetectWindow(aSettings.hWndLastUsed)
 		|| (GetWindowLong(aSettings.hWndLastUsed, GWL_STYLE) & WS_CHILD)   ) // v1.0.40.05: Child windows (via ahk_id) are always detectible.
 		return aSettings.hWndLastUsed;
 	// Otherwise, DetectHiddenWindows is OFF and the window is not visible.  Return NULL
@@ -633,19 +607,7 @@ BOOL CALLBACK EnumParentFind(HWND aWnd, LPARAM lParam)
 // through every window), it returns TRUE:
 {
 	WindowSearch &ws = *(WindowSearch *)lParam;  // For performance and convenience.
-	// According to MSDN, GetWindowText() will hang only if it's done against
-	// one of your own app's windows and that window is hung.  I suspect
-	// this might not be true in Win95, and possibly not even Win98, but
-	// it's not really an issue because GetWindowText() has to be called
-	// eventually, either here or in an EnumWindowsProc.  The only way
-	// to prevent hangs (if indeed it does hang on Win9x) would be to
-	// call something like IsWindowHung() before every call to
-	// GetWindowText(), which might result in a noticeable delay whenever
-	// we search for a window via its title (or even worse: by the title
-	// of one of its controls or child windows).  UPDATE: Trying GetWindowTextTimeout()
-	// now, which might be the best compromise.  UPDATE: It's annoyingly slow,
-	// so went back to using the old method.
-	if (!(ws.mSettings->DetectHiddenWindows || IsWindowVisible(aWnd))) // Skip windows the script isn't supposed to detect.
+	if (!ws.mSettings->DetectWindow(aWnd)) // Skip windows the script isn't supposed to detect.
 		return TRUE;
 	ws.SetCandidate(aWnd);
 	// If this window doesn't match, continue searching for more windows (via TRUE).  Likewise, if
@@ -732,6 +694,9 @@ BOOL CALLBACK EnumChildFind(HWND aWnd, LPARAM lParam)
 		else // For backward compatibility, all modes other than RegEx behave as follows.
 			if (_tcsstr(win_text, ws.mCriterionText)) // Match found.
 				ws.mFoundChild = aWnd;
+
+		if (ws.mFoundChild && !*ws.mCriterionExcludeText)
+			return FALSE; // Match found and no ExcludeText to evaluate against later controls, so stop searching.
 	}
 
 	// UPDATE to the below: The MSDN docs state that EnumChildWindows() already handles the
@@ -754,19 +719,14 @@ BOOL CALLBACK EnumChildFind(HWND aWnd, LPARAM lParam)
 
 
 
-ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR aTextToWaitFor
-	, int aWaitTime, int aCheckInterval)
-// aOutputVar is allowed to be NULL if aTextToWaitFor isn't NULL or blank. aBarHwnd is allowed
-// to be NULL because in that case, the caller wants us to set ErrorLevel appropriately and also
-// make aOutputVar empty.
+FResult StatusBarUtil(HWND aWindow, int aPartNumber, StrRet *aRetVal
+	, LPCTSTR aTextToWaitFor, int aWaitTime, int aCheckInterval)
+// aBarHwnd is allowed to be NULL because in that case, the caller wants us to set aresultToken appropriately.
 {
-	if (aOutputVar)
-		aOutputVar->Assign(); // Init to blank in case of early return.
+	HWND aBarHwnd = ControlExist(aWindow, _T("msctls_statusbar321"));
+	if (!aBarHwnd)
+		return FError(ERR_NO_STATUSBAR, nullptr, ErrorPrototype::Target);
 
-	// Legacy: Waiting 500ms in place of a "0" seems more useful than a true zero, which doens't need
-	// to be supported because it's the same thing as something like "IfWinExist":
-	if (!aWaitTime)
-		aWaitTime = 500;
 	if (aCheckInterval < 1)
 		aCheckInterval = SB_DEFAULT_CHECK_INTERVAL; // Caller relies on us doing this.
 	if (aPartNumber < 1)
@@ -774,7 +734,7 @@ ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR
 
 	// Must have at least one of these.  UPDATE: We want to allow this so that the command can be
 	// used to wait for the status bar text to become blank:
-	//if (!aOutputVar && !*aTextToWaitFor) return OK;
+	//if (aTextToWaitFor && !*aTextToWaitFor) return OK;
 
 	// Whenever using SendMessageTimeout(), our app will be unresponsive until
 	// the call returns, since our message loop isn't running.  In addition,
@@ -788,11 +748,12 @@ ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR
 	HANDLE handle;
 	LPVOID remote_buf;
 	LRESULT part_count; // The number of parts this status bar has.
-	if (!aBarHwnd  // These conditions rely heavily on short-circuit boolean order.
-		|| !SendMessageTimeout(aBarHwnd, SB_GETPARTS, 0, 0, SMTO_ABORTIFHUNG, SB_TIMEOUT, (PDWORD_PTR)&part_count) // It failed or timed out.
-		|| aPartNumber > part_count
-		|| !(remote_buf = AllocInterProcMem(handle, _TSIZE(WINDOW_TEXT_SIZE + 1), aBarHwnd))) // Alloc mem last.
-		goto error;
+	if (!SendMessageTimeout(aBarHwnd, SB_GETPARTS, 0, 0, SMTO_ABORTIFHUNG, SB_TIMEOUT, (PDWORD_PTR)&part_count)) // It failed or timed out.
+		return FR_E_WIN32;
+	if (aPartNumber > part_count)
+		return FR_E_ARG(aTextToWaitFor ? 2 : 0);
+	if (  !(remote_buf = AllocInterProcMem(handle, _TSIZE(WINDOW_TEXT_SIZE + 1), aBarHwnd))  )
+		return FR_E_WIN32;
 
 	TCHAR local_buf[WINDOW_TEXT_SIZE + 1]; // The local counterpart to the buf allocated remotely above.
 
@@ -809,7 +770,7 @@ ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR
 		{
 			// Testing confirms that LOWORD(result) [the length] does not include the zero terminator.
 			if (LOWORD(result) > WINDOW_TEXT_SIZE) // Text would be too large (very unlikely but good to check for security).
-				break; // Abort the operation and leave ErrorLevel set to its default to indicate the problem.
+				break; // Abort the operation.
 			// Retrieve the bar's text:
 			if (SendMessageTimeout(aBarHwnd, SB_GETTEXT, aPartNumber, (LPARAM)remote_buf, SMTO_ABORTIFHUNG, SB_TIMEOUT, &result))
 			{
@@ -823,11 +784,8 @@ ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR
 				// Check if the retrieved text matches the caller's criteria. In addition to
 				// normal/intuitive matching, a match is also achieved if both are empty strings.
 				// In fact, IsTextMatch() yields "true" whenever aTextToWaitFor is the empty string:
-				if (IsTextMatch(local_buf, aTextToWaitFor))
-				{
-					g_ErrorLevel->Assign(ERRORLEVEL_NONE); // Indicate "match found".
-					break;
-				}
+				if (aTextToWaitFor && IsTextMatch(local_buf, aTextToWaitFor))
+					return TRUE; // Indicate "match found".
 			}
 			//else SB_GETTEXT msg timed out or failed.  Leave local_buf unaltered.  See comment below.
 		}
@@ -836,50 +794,35 @@ ResultType StatusBarUtil(Var *aOutputVar, HWND aBarHwnd, int aPartNumber, LPTSTR
 		// when the target window (or the entire system) is unresponsive for a long time, perhaps due
 		// to a drive spinning up, etc.
 
-		// Only when above didn't break are the following secondary conditions checked.  When aOutputVar
-		// is non-NULL, the caller wanted a single check only (no waiting) [however, in most such cases,
-		// the checking above would already have done a "break" because of aTextToWaitFor being blank when
-		// passed to IsTextMatch()].  Also, don't continue to wait if the status bar no longer exists
-		// (which is usually caused by the parent window having been destroyed):
-		if (aOutputVar || !IsWindow(aBarHwnd))
-			break; // Leave ErrorLevel at its default to indicate bar text retrieval problem in both cases.
+		// When aTextToWaitFor is NULL, the caller wanted a single check only (no waiting).
+		if (!aTextToWaitFor)
+			break;
 
 		// Since above didn't break, we're in "wait" mode (more than one iteration).
 		// In the following, must cast to int or any negative result will be lost due to DWORD type.
 		// Note: A negative aWaitTime means we're waiting indefinitely for a match to appear.
-		if (aWaitTime < 0 || (int)(aWaitTime - (GetTickCount() - start_time)) > SLEEP_INTERVAL_HALF)
+		// Don't continue to wait if the status bar no longer exists (which is usually caused
+		// by the parent window having been destroyed).
+		if (   IsWindow(aBarHwnd)
+			&& (aWaitTime < 0 || (int)(aWaitTime - (GetTickCount() - start_time)) > SLEEP_INTERVAL_HALF)   )
 			MsgSleep(aCheckInterval);
 		else // Timed out.
-		{
-			g_ErrorLevel->Assign(ERRORLEVEL_ERROR); // Indicate "timeout".
-			break;
-		}
+			return FALSE; // Indicate "timeout".
 	} // for()
 
-	// Consider this to be always successful, even if aBarHwnd == NULL
-	// or the status bar didn't have the part number provided, unless the below fails.
-	// Note we use a temp buf rather than writing directly to the var contents above, because
-	// we don't know how long the text will be until after the above operation finishes.
-	ResultType result_to_return = aOutputVar ? aOutputVar->Assign(local_buf) : OK;
 	FreeInterProcMem(handle, remote_buf);
-	return result_to_return;
-
-error:
-	return g_script.SetErrorLevelOrThrowStr(aOutputVar ? ERRORLEVEL_ERROR : ERRORLEVEL_ERROR2);
+	// Consider this to be always successful, even if aBarHwnd == NULL.
+	if (aRetVal && !aRetVal->Copy(local_buf))
+		return FR_E_OUTOFMEM;
+	return OK;
 }
 
 
 
-HWND ControlExist(HWND aParentWindow, LPTSTR aClassNameAndNum)
-// This can return target_window itself for cases such as ahk_id %ControlHWND%.
+HWND ControlExist(HWND aParentWindow, LPCTSTR aClassNameAndNum)
 {
-	if (!aParentWindow)
+	if (!aParentWindow || !aClassNameAndNum || !*aClassNameAndNum)
 		return NULL;
-	if (!aClassNameAndNum || !*aClassNameAndNum)
-		return (GetWindowLong(aParentWindow, GWL_STYLE) & WS_CHILD) ? aParentWindow : GetTopChild(aParentWindow);
-		// Above: In v1.0.43.06, the parent window itself is returned if it's a child rather than its top child
-		// because it seems more useful and intuitive.  This change allows ahk_id %ControlHwnd% to always operate
-		// directly on the specified control's HWND rather than some sub-child.
 
 	WindowSearch ws;
 	bool is_class_name = _istdigit(aClassNameAndNum[_tcslen(aClassNameAndNum) - 1]);
@@ -888,12 +831,12 @@ HWND ControlExist(HWND aParentWindow, LPTSTR aClassNameAndNum)
 	{
 		// Tell EnumControlFind() to search by Class+Num.  Don't call ws.SetCriteria() because
 		// that has special handling for ahk_id, ahk_class, etc. in the first parameter.
-		tcslcpy(ws.mCriterionClass, aClassNameAndNum, _countof(ws.mCriterionClass));
+		ws.mCriterionClass = aClassNameAndNum;
 		ws.mCriterionText = _T("");
 	}
 	else // Tell EnumControlFind() to search the control's text.
 	{
-		*ws.mCriterionClass = '\0';
+		ws.mCriterionClass = _T("");
 		ws.mCriterionText = aClassNameAndNum;
 	}
 
@@ -905,7 +848,7 @@ HWND ControlExist(HWND aParentWindow, LPTSTR aClassNameAndNum)
 		// to match the title/text of another control), search again only after the search
 		// for the ClassNameAndNum didn't turn up anything.
 		// Tell EnumControlFind() to search the control's text.
-		*ws.mCriterionClass = '\0';
+		ws.mCriterionClass = _T("");
 		ws.mCriterionText = aClassNameAndNum;
 		EnumChildWindows(aParentWindow, EnumControlFind, (LPARAM)&ws); // ws.mFoundChild is already initialized to NULL due to the above check.
 	}
@@ -998,7 +941,7 @@ int MsgBox(int aValue)
 
 
 
-int MsgBox(LPCTSTR aText, UINT uType, LPTSTR aTitle, double aTimeout, HWND aOwner)
+int MsgBox(LPCTSTR aText, UINT uType, LPCTSTR aTitle, double aTimeout, HWND aOwner)
 // Returns 0 if the attempt failed because of too many existing MessageBox windows,
 // or if MessageBox() itself failed.
 // MB_SETFOREGROUND or some similar setting appears to dismiss some types of screen savers (if active).
@@ -1007,27 +950,13 @@ int MsgBox(LPCTSTR aText, UINT uType, LPTSTR aTitle, double aTimeout, HWND aOwne
 	// Set the below globals so that any WM_TIMER messages dispatched by this call to
 	// MsgBox() (which may result in a recursive call back to us) know not to display
 	// any more MsgBoxes:
-	if (g_nMessageBoxes > MAX_MSGBOXES + 1)  // +1 for the final warning dialog.  Verified correct.
-		return 0;
+	if (g_nMessageBoxes >= MAX_MSGBOXES)
+		return AHK_TOO_MANY_MSGBOXES;
 
-	if (g_nMessageBoxes == MAX_MSGBOXES)
-	{
-		// Do a recursive call to self so that it will be forced to the foreground.
-		// But must increment this so that the recursive call allows the last MsgBox
-		// to be displayed:
-		++g_nMessageBoxes;
-		MsgBox(_T("The maximum number of MsgBoxes has been reached."));
-		--g_nMessageBoxes;
-		return 0;
-	}
-
-	// Set these in case the caller explicitly called it with a NULL, overriding the default:
-	if (!aText)
-		aText = _T("");
-	if (!aTitle || !*aTitle)
-		// If available, the script's filename seems a much better title in case the user has
-		// more than one script running:
-		aTitle = (g_script.mFileName && *g_script.mFileName) ? g_script.mFileName : T_AHK_NAME_VERSION;
+	if (!aText) // In case the caller explicitly called it with a NULL, overriding the default.
+		aText = (uType & 0xF) ? _T("") : _T("Press OK to continue."); // Use default text only if OK is the only button.
+	if (!aTitle) // Caller omitted it or explicitly requested the default.
+		aTitle = g_script.DefaultDialogTitle();
 
 	// It doesn't feel safe to modify the contents of the caller's aText and aTitle,
 	// even if the caller were to tell us it is modifiable.  This is because the text
@@ -1132,9 +1061,9 @@ int MsgBox(LPCTSTR aText, UINT uType, LPTSTR aTitle, double aTimeout, HWND aOwne
 	POST_AHK_DIALOG((DWORD)(aTimeout * 1000))
 
 	++g_nMessageBoxes;  // This value will also be used as the Timer ID if there's a timeout.
-	g->MsgBoxResult = MessageBox(aOwner, text, title, uType);
+	int result = MessageBox(aOwner, text, title, uType);
 	--g_nMessageBoxes;
-	// Above's use of aOwner: MsgBox, FileSelectFile, and other dialogs seem to consider aOwner to be NULL
+	// Above's use of aOwner: MsgBox, FileSelect, and other dialogs seem to consider aOwner to be NULL
 	// when aOwner is minimized or hidden.
 
 	DIALOG_END
@@ -1162,12 +1091,12 @@ int MsgBox(LPCTSTR aText, UINT uType, LPTSTR aTitle, double aTimeout, HWND aOwne
 	// and why the behavior varies:
 	// Unfortunately, it appears that MessageBox() will return zero rather
 	// than AHK_TIMEOUT that was specified in EndDialog() at least under WinXP.
-	if (g->MsgBoxTimedOut || (!g->MsgBoxResult && aTimeout > 0)) // v1.0.33: Added g->MsgBoxTimedOut, see comment higher above.
+	if (g->MsgBoxTimedOut || (!result && aTimeout > 0)) // v1.0.33: Added g->MsgBoxTimedOut, see comment higher above.
 		// Assume it timed out rather than failed, since failure should be VERY rare.
-		g->MsgBoxResult = AHK_TIMEOUT;
+		result = AHK_TIMEOUT;
 	// else let the caller handle the display of the error message because only it knows
 	// whether to also tell the user something like "the script will not continue".
-	return g->MsgBoxResult;
+	return result;
 }
 
 
@@ -1204,44 +1133,15 @@ BOOL CALLBACK EnumDialog(HWND aWnd, LPARAM lParam)
 	GetWindowThreadProcessId(aWnd, &pid);
 	if (pid == pah.pid)
 	{
-		TCHAR buf[32];
-		GetClassName(aWnd, buf, _countof(buf));
-		// This is the class name for windows created via MessageBox(), GetOpenFileName(), and probably
-		// other things that use modal dialogs:
-		if (!_tcscmp(buf, _T("#32770")))
+		// This checks for the standard dialog window class (#32770), for windows created via MessageBox(),
+		// GetOpenFileName(), and other things that use modal dialogs:
+		if (IsWindowStandardDialog(aWnd))
 		{
 			pah.hwnd = aWnd;  // An output value for the caller.
 			return FALSE;  // We're done.
 		}
 	}
 	return TRUE;  // Keep searching.
-}
-
-
-
-struct owning_struct {HWND owner_hwnd; HWND first_child;};
-HWND WindowOwnsOthers(HWND aWnd)
-// Only finds owned windows if they are visible, by design.
-{
-	owning_struct own = {aWnd, NULL};
-	EnumWindows(EnumParentFindOwned, (LPARAM)&own);
-	return own.first_child;
-}
-
-
-
-BOOL CALLBACK EnumParentFindOwned(HWND aWnd, LPARAM lParam)
-{
-	HWND owner_hwnd = GetWindow(aWnd, GW_OWNER);
-	// Note: Many windows seem to own other invisible windows that have blank titles.
-	// In our case, require that it be visible because we don't want to return an invisible
-	// window to the caller because such windows aren't designed to be activated:
-	if (owner_hwnd && owner_hwnd == ((owning_struct *)lParam)->owner_hwnd && IsWindowVisible(aWnd))
-	{
-		((owning_struct *)lParam)->first_child = aWnd;
-		return FALSE; // Match found, we're done.
-	}
-	return TRUE;  // Continue enumerating.
 }
 
 
@@ -1351,18 +1251,7 @@ bool IsWindowHung(HWND aWnd)
 	// thread and calls the appropriate window procedure.  Messages sent between threads are
 	// processed only when the receiving thread executes message retrieval code. The sending
 	// thread is blocked until the receiving thread processes the message."
-#ifdef CONFIG_WIN9X
-	if (g_os.IsWin9x())
-	{
-		typedef BOOL (WINAPI *MyIsHungThread)(DWORD);
-		static MyIsHungThread IsHungThread = (MyIsHungThread)GetProcAddress(GetModuleHandle(_T("user32"))
-			, "IsHungThread");
-		// When function not available, fall back to the old method:
-		return IsHungThread ? IsHungThread(GetWindowThreadProcessId(aWnd, NULL)) : Slow_IsWindowHung;
-	}
-#endif
 
-	// Otherwise: NT/2k/XP/2003 or later, so try to use the newer method.
 	// The use of IsHungAppWindow() (supported under Win2k+) is discouraged by MS,
 	// but it's useful to prevent the script from getting hung when it tries to do something
 	// to a hung window.
@@ -1370,6 +1259,32 @@ bool IsWindowHung(HWND aWnd)
 	static MyIsHungAppWindow IsHungAppWindow = (MyIsHungAppWindow)GetProcAddress(GetModuleHandle(_T("user32"))
 		, "IsHungAppWindow");
 	return IsHungAppWindow ? IsHungAppWindow(aWnd) : Slow_IsWindowHung;
+}
+
+
+
+bool IsWindowCloaked(HWND aWnd)
+{
+	int cloaked = 0;
+	const int DWMWA_CLOAKED = 14; // Work around SDK troubles.
+	auto result = DwmGetWindowAttribute(aWnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+	return SUCCEEDED(result) && cloaked; // Result is "invalid parameter" on Windows 7.
+}
+
+
+
+bool ScriptThreadSettings::DetectWindow(HWND aWnd)
+{
+	return DetectHiddenWindows || (IsWindowVisible(aWnd) && !IsWindowCloaked(aWnd));
+}
+
+
+
+bool IsWindowStandardDialog(HWND aWnd)
+{
+	// This only checks for the standard dialog window class (#32770), which is enough
+	// for our purposes, although dialogs in general can have other window classes.
+	return (LPTSTR)(ULONG_PTR)GetClassLong(aWnd, GCW_ATOM) == WC_DIALOG;
 }
 
 
@@ -1397,10 +1312,6 @@ int GetWindowTextTimeout(HWND aWnd, LPTSTR aBuf, INT_PTR aBufSize, UINT aTimeout
 {
 	if (!aWnd || (aBuf && aBufSize < 1)) // No HWND or no room left in buffer (some callers rely on this check).
 		return 0; // v1.0.40.04: Fixed to return 0 rather than setting aBuf to NULL and continuing (callers don't want that).
-
-	// Override for Win95 because AutoIt3 author says it might crash otherwise:
-	if (aBufSize > WINDOW_TEXT_SIZE && g_os.IsWin95())
-		aBufSize = WINDOW_TEXT_SIZE;
 
 	LRESULT result, length;
 	if (aBuf)
@@ -1491,7 +1402,7 @@ int GetWindowTextTimeout(HWND aWnd, LPTSTR aBuf, INT_PTR aBufSize, UINT aTimeout
 
 
 
-ResultType WindowSearch::SetCriteria(global_struct &aSettings, LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText)
+ResultType WindowSearch::SetCriteria(ScriptThreadSettings &aSettings, LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText)
 // Returns FAIL if the new criteria can't possibly match a window (due to ahk_id being in invalid
 // window or the specified ahk_group not existing).  Otherwise, it returns OK.
 // Callers must ensure that aText, aExcludeTitle, and aExcludeText point to buffers whose contents
@@ -1507,183 +1418,153 @@ ResultType WindowSearch::SetCriteria(global_struct &aSettings, LPTSTR aTitle, LP
 	// here, nor does there seem to be a risk that deref buffer's contents will get overwritten
 	// while this set of criteria is in effect because our callers never allow interrupting script-threads
 	// *during* the duration of any one set of criteria.
-	bool exclude_title_became_non_blank = *aExcludeTitle && !*mCriterionExcludeTitle;
+	bool criterion_path_was_name_only = mCriterionPathIsNameOnly;
 	mCriterionExcludeTitle = aExcludeTitle;
 	mCriterionExcludeTitleLength = _tcslen(mCriterionExcludeTitle); // Pre-calculated for performance.
 	mCriterionText = aText;
 	mCriterionExcludeText = aExcludeText;
 	mSettings = &aSettings;
 
-	DWORD orig_criteria = mCriteria;
-	TCHAR *ahk_flag, *cp, buf[MAX_VAR_NAME_LENGTH + 1];
-	int criteria_count;
-	size_t size;
+	DWORD this_criterion = CRITERION_TITLE, next_criterion;
+	LPCTSTR start, end, value, next_value = nullptr;
+	size_t value_length, buf_used = 0;
 
-	for (mCriteria = 0, ahk_flag = aTitle, criteria_count = 0;; ++criteria_count, ahk_flag += 4) // +4 only since an "ahk_" string that isn't qualified may have been found.
+	for (mCriteria = 0, start = aTitle; this_criterion; start = next_value, this_criterion = next_criterion)
 	{
-		if (   !(ahk_flag = tcscasestr(ahk_flag, _T("ahk_")))   ) // No other special strings are present.
+		for (next_criterion = 0, end = start; end = tcscasestr(end, _T("ahk_")); end += 4)
 		{
-			if (!criteria_count) // Since no special "ahk_" criteria were present, it is CRITERION_TITLE by default.
-			{
-				mCriteria = CRITERION_TITLE; // In this case, there is only one criterion.
-				tcslcpy(mCriterionTitle, aTitle, _countof(mCriterionTitle));
-				mCriterionTitleLength = _tcslen(mCriterionTitle); // Pre-calculated for performance.
-			}
+			// To reduce ambiguity, the following requires that any "ahk_" criteria beyond the first
+			// be preceded by at least one space or tab:
+			if (end > aTitle && !IS_SPACE_OR_TAB(end[-1]))
+				continue;
+			auto cp = end + 4;
+			if (!_tcsnicmp(cp, _T("id"), 2))
+				cp += 2, next_criterion = CRITERION_ID;
+			else if (!_tcsnicmp(cp, _T("pid"), 3))
+				cp += 3, next_criterion = CRITERION_PID;
+			else if (!_tcsnicmp(cp, _T("group"), 5))
+				cp += 5, next_criterion = CRITERION_GROUP;
+			else if (!_tcsnicmp(cp, _T("exe"), 3))
+				cp += 3, next_criterion = CRITERION_PATH;
+			else if (!_tcsnicmp(cp, _T("class"), 5))
+				cp += 5, next_criterion = CRITERION_CLASS;
+			else
+				continue;
+			next_value = cp;
 			break;
 		}
-		// Since above didn't break, another instance of "ahk_" has been found. To reduce ambiguity,
-		// the following requires that any "ahk_" criteria beyond the first be preceded by at least
-		// one space or tab:
-		if (criteria_count && !IS_SPACE_OR_TAB(ahk_flag[-1])) // Relies on short-circuit boolean order.
+
+		switch (this_criterion)
 		{
-			--criteria_count; // Decrement criteria_count to compensate for the loop's increment.
-			continue;
-		}
-		// Since above didn't "continue", it meets the basic test.  But is it an exact match for one of the
-		// special criteria strings?  If not, it's really part of the title criterion instead.
-		cp = ahk_flag + 4;
-		if (!_tcsnicmp(cp, _T("id"), 2))
-		{
-			cp += 2;
-			mCriteria |= CRITERION_ID;
-			mCriterionHwnd = (HWND)ATOU64(cp);
+		case CRITERION_ID:
+			HWND hwnd;
+			hwnd = (HWND)ATOU64(start);
 			// Note that this can validly be the HWND of a child window; i.e. ahk_id %ChildWindowHwnd% is supported.
-			if (mCriterionHwnd != HWND_BROADCAST && !IsWindow(mCriterionHwnd)) // Checked here once rather than each call to IsMatch().
+			if (hwnd != HWND_BROADCAST && !IsWindow(hwnd) // Checked here once rather than each call to IsMatch().
+				|| (mCriteria & CRITERION_ID) && hwnd != mCriterionHwnd) // Two different IDs have been specified, so there can never be a match.
 			{
 				mCriterionHwnd = NULL;
 				return FAIL; // Inform caller of invalid criteria.  No need to do anything else further below.
 			}
-		}
-		else if (!_tcsnicmp(cp, _T("pid"), 3))
-		{
-			cp += 3;
-			mCriteria |= CRITERION_PID;
-			mCriterionPID = ATOU(cp);
-		}
-		else if (!_tcsnicmp(cp, _T("group"), 5))
-		{
-			cp += 5;
-			mCriteria |= CRITERION_GROUP;
-			tcslcpy(buf, omit_leading_whitespace(cp), _countof(buf));
-			if (cp = StrChrAny(buf, _T(" \t"))) // Group names can't contain spaces, so terminate at the first one to exclude any "ahk_" criteria that come afterward.
-				*cp = '\0';
-			if (   !(mCriterionGroup = g_script.FindGroup(buf))   )
-				return FAIL; // No such group: Inform caller of invalid criteria.  No need to do anything else further below.
-		}
-		else
-		{
-			// Fix for v1.1.09: ahk_exe is handled with ahk_class so that it can be followed by
-			// another criterion, such as in "ahk_exe explorer.exe ahk_class CabinetWClass".
-			TCHAR *criterion = NULL;
-			if (!_tcsnicmp(cp, _T("exe"), 3))
-			{
-				cp += 3;
-				mCriteria |= CRITERION_PATH;
-				criterion = mCriterionPath;
-				
-			}
-			else if (!_tcsnicmp(cp, _T("class"), 5))
-			{
-				cp += 5;
-				mCriteria |= CRITERION_CLASS;
-				criterion = mCriterionClass;
-			}
-			else // It doesn't qualify as a special criteria name even though it starts with "ahk_".
-			{
-				--criteria_count; // Decrement criteria_count to compensate for the loop's increment.
-				continue;
-			}
-
+			mCriterionHwnd = hwnd;
+			break;
+		case CRITERION_PID:
+			mCriterionPID = ATOU(start);
+			break;
+		default:
 			// In the following line, it may have been preferable to skip only zero or one spaces rather than
 			// calling omit_leading_whitespace().  But now this should probably be kept for backward compatibility.
 			// Besides, even if it's possible for a class name to start with a space, a RegEx dot or other symbol
 			// can be used to match it via SetTitleMatchMode RegEx.
-			tcslcpy(criterion, omit_leading_whitespace(cp), SEARCH_PHRASE_SIZE); // Copy all of the remaining string to simplify the below.
-			for (cp = criterion; cp = tcscasestr(cp, _T("ahk_")); cp += 4)  // Fix for v1.0.47.06: strstr() changed to strcasestr() for consistency with the other sections.
+			start = omit_leading_whitespace(start);
+			if (end == start) // Empty or consists entirely of whitespace.
 			{
-				// This loop truncates any other criteria from the class criteria.  It's not a complete
-				// solution because it doesn't validate that what comes after the "ahk_" string is a
-				// valid criterion name. But for it not to be and yet also be part of some valid class
-				// name seems far too unlikely to worry about.  It would have to be a legitimate class name
-				// such as "ahk_class SomeClassName ahk_wrong".
-				if (cp == criterion) // This check prevents underflow in the next check.
+				// For backward compatibility, disqualify any title consisting entirely of whitespace,
+				// but otherwise include any trailing whitespace aside from the final delimiting space.
+				if (this_criterion == CRITERION_TITLE) // Only title, since it has no explicit keyword.
+					continue;
+				value = _T(""); // For backward-compatibility.  An empty value is an automatic pass for RegEx mode and fail for other modes.
+			}
+			else if (end) // Because end != start, this implies end[-1] is the delimiting space.
+			{
+				if (!buf_used) // mCriterionBuf hasn't been used by this call, but may have been used by a previous call.
 				{
-					*cp = '\0';
-					break;
-				}
-				else
-					if (IS_SPACE_OR_TAB(cp[-1]))
+					// Allow for space in the buffer for all remaining options, to minimize realloc and avoid the need
+					// to update previously stored addresses.  Some options don't need buffer space, but this is just
+					// an estimate, and we will allow extra space for future calls anyway.
+					size_t max_size = _tcschr(end, '\0') - start + 1;
+					if (max_size > mCriterionBufSize)
 					{
-						cp[-1] = '\0';
-						break;
+						// Use a generous initial size and exponential growth to minimize the number of reallocs
+						// while evaluating window groups.
+						if (mCriterionBufSize < 1024)
+							mCriterionBufSize = 1024;
+						while (mCriterionBufSize < max_size)
+							mCriterionBufSize <<= 1;
+						free(mCriterionBuf); // The previous content is not needed, so free/malloc rather than realloc.
+						if (!(mCriterionBuf = tmalloc(mCriterionBufSize)))
+						{
+							mCriterionBufSize = 0;
+							return FAIL;
+						}
 					}
-					//else assume this "ahk_" string is part of the literal text, continue looping in case
-					// there is a legitimate "ahk_" string after this one.
-			} // for()
+				}
+				// Omit exactly one space or tab from the title criterion. That space or tab is the one
+				// required to delimit the special "ahk_" string.  Any other spaces or tabs to the left of
+				// that one are considered literal (for flexibility).
+				value_length = end - start - 1; // -1 to omit the delimiting space.
+				auto buf = mCriterionBuf + buf_used;
+				tmemcpy(buf, start, value_length);
+				buf[value_length] = '\0';
+				buf_used += value_length + 1;
+				value = buf;
+			}
+			else
+				value = start;
 
-			if (criterion == mCriterionPath)
+			switch (this_criterion)
 			{
+			case CRITERION_TITLE:
+				// Due to checks above, there is always at least one non-whitespace character.
+				mCriterionTitle = value;
+				mCriterionTitleLength = end ? value_length : _tcslen(value);
+				break;
+			case CRITERION_GROUP:
+				if (   !(mCriterionGroup = g_script.FindGroup(value))   )
+					return FAIL; // No such group: Inform caller of invalid criteria.  No need to do anything else further below.
+				break;
+			case CRITERION_PATH:
+				mCriterionPath = value;
 				// Allow something like "ahk_exe firefox.exe" to be an exact match for the process name
 				// instead of full path, but for flexibility, always use full path when in regex mode.
 				mCriterionPathIsNameOnly = mSettings->TitleMatchMode != FIND_REGEX && !_tcschr(mCriterionPath, '\\');
+				break;
+			case CRITERION_CLASS:
+				mCriterionClass = value;
+				break;
 			}
 		}
-		// Since above didn't return or continue, a valid "ahk_" criterion has been discovered.
-		// If this is the first such criterion, any text that lies to its left should be interpreted
-		// as CRITERION_TITLE.  However, for backward compatibility it seems best to disqualify any title
-		// consisting entirely of whitespace.  This is because some scripts might have a variable containing
-		// whitespace followed by the string ahk_class, etc. (however, any such whitespace is included as a
-		// literal part of the title criterion for flexibility and backward compatibility).
-		if (!criteria_count && ahk_flag > omit_leading_whitespace(aTitle))
-		{
-			mCriteria |= CRITERION_TITLE;
-			// Omit exactly one space or tab from the title criterion. That space or tab is the one
-			// required to delimit the special "ahk_" string.  Any other spaces or tabs to the left of
-			// that one are considered literal (for flexibility):
-			size = ahk_flag - aTitle; // This will always be greater than one due to other checks above, which will result in at least one non-whitespace character in the title criterion.
-			if (size > _countof(mCriterionTitle)) // Prevent overflow.
-				size = _countof(mCriterionTitle);
-			tcslcpy(mCriterionTitle, aTitle, size); // Copy only the eligible substring as the criteria.
-			mCriterionTitleLength = _tcslen(mCriterionTitle); // Pre-calculated for performance.
-		}
+		mCriteria |= this_criterion;
 	}
 
-	// Since this function doesn't change mCandidateParent, there is no need to update the candidate's
-	// attributes unless the type of criterion has changed or if mExcludeTitle became non-blank as
-	// a result of our action above:
-	if (mCriteria != orig_criteria || exclude_title_became_non_blank)
-		UpdateCandidateAttributes(); // In case mCandidateParent isn't NULL, fetch different attributes based on what was set above.
-	//else for performance reasons, avoid unnecessary updates.
+	// Any previously retrieved attributes of mCandidateParent remain valid, except:
+	if (criterion_path_was_name_only != mCriterionPathIsNameOnly)
+		mCandidateInfo &= ~CRITERION_PATH;
+
 	return OK;
 }
 
 
 
-void WindowSearch::UpdateCandidateAttributes()
-// This function must be kept thread-safe because it may be called (indirectly) by hook thread too.
+void WindowSearch::SetCriteria(global_struct &aSettings, WinGroup &aGroup)
 {
-	// Nothing to do until SetCandidate() is called with a non-NULL candidate and SetCriteria()
-	// has been called for the first time (otherwise, mCriterionExcludeTitle and other things
-	// are not yet initialized:
-	if (!mCandidateParent || !mCriteria)
-		return;
-	if ((mCriteria & CRITERION_TITLE) || *mCriterionExcludeTitle) // Need the window's title in both these cases.
-		if (!GetWindowText(mCandidateParent, mCandidateTitle, _countof(mCandidateTitle)))
-			*mCandidateTitle = '\0'; // Failure or blank title is okay.
-	if (mCriteria & CRITERION_PID) // In which case mCriterionPID should already be filled in, though it might be an explicitly specified zero.
-		GetWindowThreadProcessId(mCandidateParent, &mCandidatePID);
-	if (mCriteria & CRITERION_PATH)
-	{
-		DWORD dwPid;
-		if (GetWindowThreadProcessId(mCandidateParent, &dwPid))
-			if (!GetProcessName(dwPid, mCandidatePath, _countof(mCandidatePath), mCriterionPathIsNameOnly))
-				*mCandidatePath = '\0';
-	}
-	if (mCriteria & CRITERION_CLASS)
-		GetClassName(mCandidateParent, mCandidateClass, _countof(mCandidateClass)); // Limit to WINDOW_CLASS_SIZE in this case since that's the maximum that can be searched.
-	// Nothing to do for these:
-	//CRITERION_GROUP:    Can't be pre-processed at this stage.
-	//CRITERION_ID:       It is mCandidateParent, which has already been set by SetCandidate().
+	mCriterionExcludeTitle = _T("");
+	mCriterionExcludeTitleLength = 0;
+	mCriterionText = _T("");
+	mCriterionExcludeText = _T("");
+	mSettings = &aSettings;
+	mCriterionGroup = &aGroup;
+	mCriteria = CRITERION_GROUP;
 }
 
 
@@ -1696,10 +1577,43 @@ HWND WindowSearch::IsMatch(bool aInvert)
 // in case previous match(es) were found when mFindLastMatch is in effect.
 // Thread-safety: With the following exception, this function must be kept thread-safe because it may be
 // called (indirectly) by hook thread too: The hook thread must never call here directly or indirectly with
-// mArrayStart!=NULL because the corresponding section below is probably not thread-safe.
+// mArray!=NULL because the corresponding section below is probably not thread-safe.
 {
 	if (!mCandidateParent || !mCriteria) // Nothing to check, so no match.
 		return NULL;
+
+	// Candidate attributes are retrieved only here when it is known that they will actually be used,
+	// and are retrieved only once per candidate even if criteria changes (unlike the previous method).
+	// Benchmarks showed this performs:
+	//  - Far better for window groups with many varied criteria.
+	//  - Far better when it allows GetProcessName to be skipped.
+	//  - Somewhat better when it allows GetClassName to be skipped.
+	// Keep in mind that most windows don't match even the first criterion, so the other criteria can
+	// be skipped many times when enumerating through windows.  The effect can be significant even if
+	// the window exists and is toward the top of the Z-order.
+	
+	if (mCriteria & CRITERION_PID)
+	{
+		// Retrieving PID unconditionally doesn't particularly help code size and had a negative
+		// impact on benchmarks with ahk_pid used in a window group.
+		if (!(mCandidateInfo & CRITERION_PID))
+		{
+			if (!GetWindowThreadProcessId(mCandidateParent, &mCandidatePID))
+				mCandidatePID = -1;
+			mCandidateInfo |= CRITERION_PID;
+		}
+		if (mCandidatePID != mCriterionPID)
+			return NULL;
+		//else it's a match so far, but continue onward in case there are other criteria.
+	}
+
+	if (((mCriteria & CRITERION_TITLE) || *mCriterionExcludeTitle) // Need the window's title in both these cases.
+		&& !(mCandidateInfo & CRITERION_TITLE))
+	{
+		if (!GetWindowText(mCandidateParent, mCandidateTitle, _countof(mCandidateTitle)))
+			*mCandidateTitle = '\0'; // Failure or blank title is okay.
+		mCandidateInfo |= CRITERION_TITLE;
+	}
 
 	if ((mCriteria & CRITERION_TITLE) && *mCriterionTitle) // For performance, avoid the calls below (especially RegEx) when mCriterionTitle is blank (assuming it's even possible for it to be blank under these conditions).
 	{
@@ -1726,24 +1640,37 @@ HWND WindowSearch::IsMatch(bool aInvert)
 
 	if (mCriteria & CRITERION_CLASS) // mCriterionClass is probably always non-blank when CRITERION_CLASS is present (harmless even if it isn't), so *mCriterionClass isn't checked.
 	{
+		if (!(mCandidateInfo & CRITERION_CLASS))
+		{
+			if (!GetClassName(mCandidateParent, mCandidateClass, _countof(mCandidateClass)))
+				*mCandidateClass = '\0';
+			mCandidateInfo |= CRITERION_CLASS;
+		}
 		if (mSettings->TitleMatchMode == FIND_REGEX)
 		{
 			if (!RegExMatch(mCandidateClass, mCriterionClass))
 				return NULL;
 		}
 		else // For backward compatibility, all other modes use exact-match for Class.
-			if (_tcscmp(mCandidateClass, mCriterionClass)) // Doesn't match the required class name.
+			// v2.1: Use case-insensitive comparison because even if two classes are registered with the
+			// same name, they always have the same case due to the way class names are registered in the
+			// user atom table.  For instance, if we register "notepad" when Notepad isn't running and
+			// then open Notepad, its window class will be "notepad", not "Notepad".
+			if (_tcsicmp(mCandidateClass, mCriterionClass)) // Doesn't match the required class name.
 				return NULL;
 		// If nothing above returned, it's a match so far so continue onward to the other checks.
 	}
 
-	// For the following, mCriterionPID would already be filled in, though it might be an explicitly specified zero.
-	if ((mCriteria & CRITERION_PID) && mCandidatePID != mCriterionPID) // Doesn't match required PID.
-		return NULL;
-	//else it's a match so far, but continue onward in case there are other criteria.
-
 	if (mCriteria & CRITERION_PATH)
 	{
+		if (!(mCandidateInfo & CRITERION_PATH))
+		{
+			DWORD pid;
+			if (GetWindowThreadProcessId(mCandidateParent, &pid))
+				if (!GetProcessName(pid, mCandidatePath, _countof(mCandidatePath), mCriterionPathIsNameOnly))
+					*mCandidatePath = '\0';
+			mCandidateInfo |= CRITERION_PATH;
+		}
 		if (mSettings->TitleMatchMode == FIND_REGEX)
 		{
 			if (!RegExMatch(mCandidatePath, mCriterionPath))
@@ -1825,21 +1752,14 @@ HWND WindowSearch::IsMatch(bool aInvert)
 	if (!aInvert)
 	{
 		mFoundParent = mCandidateParent;
-		++mFoundCount; // This must be done prior to the mArrayStart section below.
+		++mFoundCount; // This must be done prior to the mArray section below.
 	}
 	//else aInvert==true, which means caller doesn't want the above set.
 
-	if (mArrayStart) // Probably not thread-safe due to FindOrAddVar(), so hook thread must call only with NULL mArrayStart.
+	if (mArray) // Probably not thread-safe, so hook thread must call only with NULL mArray.
 	{
-		// Make it longer than Max var name so that FindOrAddVar() will be able to spot and report
-		// var names that are too long:
-		TCHAR var_name[MAX_VAR_NAME_LENGTH + 20];
-		Var *array_item = g_script.FindOrAddVar(var_name
-			, sntprintf(var_name, _countof(var_name), _T("%s%u"), mArrayStart->mName, mFoundCount)
-			, mArrayStart->IsLocal() ? FINDVAR_LOCAL : FINDVAR_GLOBAL);
-		if (array_item)
-			array_item->AssignHWND(mFoundParent);
-		//else no error reporting currently, since should be very rare.
+		mArray->Append((__int64)(size_t)mFoundParent);
+		// No error reporting currently, since should be very rare.
 	}
 
 	// Fix for v1.0.30.01: Don't return mFoundParent because its NULL when aInvert is true.
@@ -1853,39 +1773,11 @@ HWND WindowSearch::IsMatch(bool aInvert)
 
 
 
-void SetForegroundLockTimeout()
-{
-	// Even though they may not help in all OSs and situations, this lends peace-of-mind.
-	// (it doesn't appear to help on my XP?)
-	if (g_os.IsWin98orLater() || g_os.IsWin2000orLater())
-	{
-		// Don't check for failure since this operation isn't critical, and don't want
-		// users continually haunted by startup error if for some reason this doesn't
-		// work on their system:
-		if (SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, &g_OriginalTimeout, 0))
-			if (g_OriginalTimeout) // Anti-focus stealing measure is in effect.
-			{
-				// Set it to zero instead, disabling the measure:
-				SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0, SPIF_SENDCHANGE);
-//				if (!SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID)0, SPIF_SENDCHANGE))
-//					MsgBox("Enable focus-stealing: set-call to SystemParametersInfo() failed.");
-			}
-//			else
-//				MsgBox("Enable focus-stealing: it was already enabled.");
-//		else
-//			MsgBox("Enable focus-stealing: get-call to SystemParametersInfo() failed.");
-	}
-//	else
-//		MsgBox("Enable focus-stealing: neither needed nor supported under Win95 and WinNT.");
-}
-
-
-
-bool DialogPrep()
+void DialogPrep()
 // Having it as a function vs. macro should reduce code size due to expansion of macros inside.
 {
-	bool thread_was_critical = g->ThreadIsCritical;
-	g->ThreadIsCritical = false;
+	// Make the thread immediately interruptible but don't change g->ThreadIsCritical,
+	// since DIALOG_END will refer to it when resetting g->AllowThreadToBeInterrupted.
 	g->AllowThreadToBeInterrupted = true;
 	if (g_KeybdHook) // Workaround added in v1.1.22.01.
 	{
@@ -1895,16 +1787,20 @@ bool DialogPrep()
 		// issue.  If one L/R modifier is logically down and the opposite side is physically
 		// down, the workaround isn't wanted/needed, because the dialog *should* act like
 		// the key is down, and it does so until the key is released.
-		modLR_type mods_not_to_release = ConvertModifiers(ConvertModifiersLR(g_modifiersLR_logical) & (MOD_CONTROL | MOD_SHIFT));
+		// UPDATE: I'm not able to reproduce this problem on Windows 10, but it's done there
+		// too just in case.
+		mod_type mods_logical = ConvertModifiersLR(g_modifiersLR_logical);
+		modLR_type mods_not_to_release = ConvertModifiers(mods_logical & (MOD_CONTROL | MOD_SHIFT))
+			| MOD_LALT | MOD_RALT | MOD_LWIN | MOD_RWIN; // v1.1.23.05: No need to release these keys.
 		modLR_type mods_to_release = g_modifiersLR_physical & ~mods_not_to_release;
 		if (mods_to_release)
 		{
-			if (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN))
+			if (mods_logical == MOD_WIN) // Fixed in v1.1.23.05 to exclude combinations like MOD_WIN|MOD_CONTROL, which don't need this.
 			{
 				// Even though the Win key isn't being released, sending a Shift or Control key-up
 				// triggers the Start menu.  To prevent that, we send the mask key.  This has been
 				// confirmed to apply to #Control, #Shift and the left/right variants.
-				KeyEvent(KEYDOWNANDUP, g_MenuMaskKey, 0, NULL, false, KEY_IGNORE_ALL_EXCEPT_MODIFIER);
+				KeyEventMenuMask(KEYDOWNANDUP, KEY_IGNORE_ALL_EXCEPT_MODIFIER);
 				// Releasing the Win key now does not prevent it from being "masked" again later:
 				//mods_to_release |= (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN));
 			}
@@ -1913,5 +1809,4 @@ bool DialogPrep()
 	}
 	if (HIWORD(GetQueueStatus(QS_ALLEVENTS))) // See DIALOG_PREP for explanation.
 		MsgSleep(-1);
-	return thread_was_critical; // Caller is responsible for using this to later restore g->ThreadIsCritical.
 }

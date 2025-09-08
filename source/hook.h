@@ -26,7 +26,7 @@ GNU General Public License for more details.
 // Also, it has been announced in OnMessage() that message numbers between WM_USER and 0x1000 are earmarked
 // for possible future use by the program, so don't use a message above 0x1000 without good reason.
 enum UserMessages {AHK_HOOK_HOTKEY = WM_USER, AHK_HOTSTRING, AHK_USER_MENU, AHK_DIALOG, AHK_NOTIFYICON
-	, AHK_RETURN_PID, AHK_EXIT_BY_RELOAD, AHK_EXIT_BY_SINGLEINSTANCE, AHK_CHECK_DEBUGGER
+	, AHK_UNUSED_MSG, AHK_EXIT_BY_RELOAD, AHK_EXIT_BY_SINGLEINSTANCE, AHK_CHECK_DEBUGGER
 	// Allow some room here in between for more "exit" type msgs to be added in the future (see below comment).
 	, AHK_GUI_ACTION = WM_USER+20 // Avoid WM_USER+100/101 and vicinity.  See below comment.
 	// v1.0.43.05: On second thought, it seems better to stay close to WM_USER because the OnMessage page
@@ -37,7 +37,10 @@ enum UserMessages {AHK_HOOK_HOTKEY = WM_USER, AHK_HOTSTRING, AHK_USER_MENU, AHK_
 	// start of a range used by other common controls too).  So trying a higher number that's (hopefully) very
 	// unlikely to be used by OS features.
 	, AHK_CLIPBOARD_CHANGE, AHK_HOOK_TEST_MSG, AHK_CHANGE_HOOK_STATE, AHK_GETWINDOWTEXT
-	, AHK_HOT_IF_EXPR	// L4: HotCriterionAllowsFiring uses this to ensure expressions are evaluated only on the main thread.
+	, AHK_HOT_IF_EVAL	// HotCriterionAllowsFiring uses this to ensure expressions are evaluated only on the main thread.
+	, AHK_HOOK_SYNC // For WaitHookIdle().
+	, AHK_INPUT_END, AHK_INPUT_KEYDOWN, AHK_INPUT_CHAR, AHK_INPUT_KEYUP
+	, AHK_HOOK_SET_KEYHISTORY
 };
 // NOTE: TRY NEVER TO CHANGE the specific numbers of the above messages, since some users might be
 // using the Post/SendMessage commands to automate AutoHotkey itself.  Here is the original order
@@ -48,7 +51,7 @@ enum UserMessages {AHK_HOOK_HOTKEY = WM_USER, AHK_HOTSTRING, AHK_USER_MENU, AHK_
 // a custom menu item if the current quasi-thread is uninterruptible.  This is exactly the same way
 // hotkeys are buffered.  By making a thread truly uninterruptible, behavior is more consistent with
 // what most users would want, though it should be noted that this also makes it impossible for the
-// OnExit subroutine to be interrupted by a custom menu item, even one that is designed to simply
+// OnExit function to be interrupted by a custom menu item, even one that is designed to simply
 // exit the script (by means of aborting the on-exit subroutine).  Another reason to buffer the
 // selection of a custom menu item is that we don't want to interrupt the current thread if is
 // right in the middle of executing a single line, e.g. doing something with the deref buffer
@@ -87,7 +90,7 @@ enum UserMessages {AHK_HOOK_HOTKEY = WM_USER, AHK_HOTSTRING, AHK_USER_MENU, AHK_
 // enabled).  My only concern about this is that on some OS's, or on slower CPUs, the message may be
 // received too soon (before the dialog window actually exists) resulting in our window proc not
 // being able to ensure that it's the foreground window.  That seems unlikely, however, since
-// MessageBox() and the other dialog invocating API calls (for FileSelectFile/Folder) likely
+// MessageBox() and the other dialog invocating API calls (for FileSelect/DirSelect) likely
 // ensures its window really exists before dispatching messages.
 #define POST_AHK_DIALOG(timeout) PostMessage(g_hWnd, WM_COMMNOTIFY, AHK_DIALOG, (LPARAM)timeout);
 
@@ -118,16 +121,17 @@ struct sc_hotkey
 struct key_type
 {
 	ToggleValueType *pForceToggle;  // Pointer to a global variable for toggleable keys only.  NULL for others.
-	modLR_type as_modifiersLR; // If this key is a modifier, this will have the corresponding bit(s) for that key.
-	HotkeyIDType hotkey_to_fire_upon_release; // A up-event hotkey queued by a prior down-event.
 	// Keep sub-32-bit members contiguous to save memory without having to sacrifice performance of
 	// 32-bit alignment:
+	HotkeyIDType hotkey_to_fire_upon_release; // A up-event hotkey queued by a prior down-event.
+	HotkeyIDType first_hotkey; // The first hotkey using this key as a suffix.
+	modLR_type as_modifiersLR; // If this key is a modifier, this will have the corresponding bit(s) for that key.
 	#define PREFIX_ACTUAL 1 // Values for used_as_prefix below, for places that need to distinguish between type of prefix.
 	#define PREFIX_FORCED 2 // v1.0.44: Added so that a neutral hotkey like Control can be forced to fire on key-up even though it isn't actually a prefix key.
 	UCHAR used_as_prefix; // Whether a given virtual key or scan code is even used by a hotkey.
 	bool used_as_suffix;  //
 	bool used_as_key_up;  // Whether this suffix also has an enabled key-up hotkey.
-	UCHAR no_suppress; // Contains bitwise flags such as NO_SUPPRESS_PREFIX.
+	UCHAR no_suppress; // Contains bitwise flags such as NO_SUPPRESS_NEXT_UP_EVENT.
 	bool is_down; // this key is currently down.
 	bool it_put_alt_down;  // this key resulted in ALT being pushed down (due to alt-tab).
 	bool it_put_shift_down;  // this key resulted in SHIFT being pushed down (due to shift-alt-tab).
@@ -138,14 +142,8 @@ struct key_type
 	// And these are the values for the above (besides 0):
 	#define AS_PREFIX 1
 	#define AS_PREFIX_FOR_HOTKEY 2
+	#define AS_PASSTHROUGH_PREFIX -1 // v1.1.34.02: Indicates the suffix key-up hotkey of this prefix key should fire even if a combo was activated.
 	bool sc_takes_precedence; // used only by the scan code array: this scan code should take precedence over vk.
-	UCHAR nModifierVK;
-	UCHAR nModifierSC;
-	// User is likely to use more modifying vks than we do sc's, since sc's are rare:
-	#define MAX_MODIFIER_VKS_PER_SUFFIX 50
-	#define MAX_MODIFIER_SCS_PER_SUFFIX 16
-	vk_hotkey ModifierVK[MAX_MODIFIER_VKS_PER_SUFFIX];
-	sc_hotkey ModifierSC[MAX_MODIFIER_SCS_PER_SUFFIX];
 }; // Keep the macro below in sync with the above.
 
 // Fix for v1.0.43.01: Caller wants item.no_suppress initialized to remove all flags except NO_SUPPRESS_STATES.
@@ -155,8 +153,7 @@ struct key_type
 //   RButton::return
 #define RESET_KEYTYPE_ATTRIB(item) \
 {\
-	item.nModifierVK = 0;\
-	item.nModifierSC = 0;\
+	item.first_hotkey = HOTKEY_ID_INVALID;\
 	item.used_as_prefix = 0;\
 	item.used_as_suffix = false;\
 	item.used_as_key_up = false;\
@@ -169,46 +166,101 @@ struct key_type
 #define VK_ARRAY_COUNT (VK_MAX + 1)
 #define SC_ARRAY_COUNT (SC_MAX + 1)
 
-#define INPUT_BUFFER_SIZE 16384
+#define INPUT_BUFFER_SIZE 16384 // Default buffer size for Input.  Used to be the absolute max.
+#define INPUTHOOK_BUFFER_SIZE 1024 // Default buffer size for InputHook.
 
 enum InputStatusType {INPUT_OFF, INPUT_IN_PROGRESS, INPUT_TIMED_OUT, INPUT_TERMINATED_BY_MATCH
 	, INPUT_TERMINATED_BY_ENDKEY, INPUT_LIMIT_REACHED};
 
-// Bitwise flags for the end-key arrays:
-#define END_KEY_ENABLED 0x01
-#define END_KEY_WITH_SHIFT 0x02
-#define END_KEY_WITHOUT_SHIFT 0x04
+// Bitwise flags for the Key arrays:
+#define END_KEY_WITH_SHIFT 0x01
+#define END_KEY_WITHOUT_SHIFT 0x02
+#define END_KEY_ENABLED (END_KEY_WITH_SHIFT | END_KEY_WITHOUT_SHIFT)
+#define INPUT_KEY_SUPPRESS 0x04
+#define INPUT_KEY_VISIBLE 0x08
+#define INPUT_KEY_VISIBILITY_MASK (INPUT_KEY_SUPPRESS | INPUT_KEY_VISIBLE)
+#define INPUT_KEY_IGNORE_TEXT 0x10
+#define INPUT_KEY_NOTIFY 0x20
+#define INPUT_KEY_OPTION_MASK 0x3F
+#define INPUT_KEY_IS_TEXT 0x40
+#define INPUT_KEY_DOWN_SUPPRESSED 0x80
 
+class InputObject;
 struct input_type
 {
-	InputStatusType status;
-	UCHAR *EndVK; // A sparse array that indicates which VKs terminate the input.
-	UCHAR *EndSC; // A sparse array that indicates which SCs terminate the input.
-	TCHAR *EndChars; // A string of characters that should terminate the input.
-	vk_type EndingVK; // The hook puts the terminating key into one of these if that's how it was terminated.
-	sc_type EndingSC;
-	TCHAR EndingChar;
-	bool EndedBySC;  // Whether the Ending key was one handled by VK or SC.
-	bool EndingRequiredShift;  // Whether the key that terminated the input was one that needed the SHIFT key.
-	LPTSTR *match; // Array of strings, each string is a match-phrase which if entered, terminates the input.
+	InputStatusType Status = INPUT_OFF;
+	input_type *Prev = nullptr;
+	InputObject *ScriptObject = nullptr;
+	LPTSTR Buffer = nullptr; // Stores the user's actual input.
+	int BufferLength = 0; // The current length of what the user entered.
+	int BufferLengthMax = INPUTHOOK_BUFFER_SIZE - 1; // The maximum allowed length of the input.
+	TCHAR *EndChars = nullptr; // A string of characters that should terminate the input.
+	UINT EndCharsMax = 0; // Current size of EndChars buffer.
+	LPTSTR *match = nullptr; // Array of strings, each string is a match-phrase which if entered, terminates the input.
 	UINT MatchCount; // The number of strings currently in the array.
 	UINT MatchCountMax; // The maximum number of strings that the match array can contain.
 	#define INPUT_ARRAY_BLOCK_SIZE 1024  // The increment by which the above array expands.
-	LPTSTR MatchBuf; // The is the buffer whose contents are pointed to by the match array.
-	UINT MatchBufSize; // The capacity of the above buffer.
-	bool BackspaceIsUndo;
-	bool CaseSensitive;
-	bool IgnoreAHKInput; // Whether input from any AHK script is ignored for the purpose of finding a match.
-	bool TranscribeModifiedKeys; // Whether the input command will attempt to transcribe modified keys such as ^c.
-	bool Visible;
-	bool FindAnywhere;
-	LPTSTR buffer; // Stores the user's actual input.
-	int BufferLength; // The current length of what the user entered.
-	int BufferLengthMax; // The maximum allowed length of the input.
-	input_type::input_type() // A simple constructor to initialize the fields that need it.
-		: status(INPUT_OFF), match(NULL), MatchBuf(NULL), MatchBufSize(0), buffer(NULL)
-	{}
+	LPTSTR MatchBuf = nullptr; // The is the buffer whose contents are pointed to by the match array.
+	UINT MatchBufSize = 0; // The capacity of the above buffer.
+	int Timeout = 0;
+	DWORD TimeoutAt;
+	SendLevelType MinSendLevel = 0; // The minimum SendLevel that can be captured by this input (0 allows all).
+	bool BackspaceIsUndo = true;
+	bool CaseSensitive = false;
+	bool TranscribeModifiedKeys = false; // Whether the input command will attempt to transcribe modified keys such as ^c.
+	bool VisibleText = false, VisibleNonText = true;
+	bool NotifyNonText = false;
+	bool FindAnywhere = false;
+	bool EndCharMode = false;
+	bool BeforeHotkeys = false;
+	vk_type EndingVK; // The hook puts the terminating key into one of these if that's how it was terminated.
+	sc_type EndingSC;
+	TCHAR EndingChar;
+	bool EndingBySC; // Whether the Ending key was one handled by VK or SC.
+	bool EndingRequiredShift; // Whether the key that terminated the input was one that needed the SHIFT key.
+	modLR_type EndingMods = 0;
+	UINT EndingMatchIndex;
+	UCHAR KeyVK[VK_ARRAY_COUNT] {}; // A sparse array of key flags by VK.
+	UCHAR KeySC[SC_ARRAY_COUNT] {}; // A sparse array of key flags by SC.
+	
+	input_type::input_type() {}
+	~input_type()
+	{
+		free(Buffer);
+		free(match);
+		free(MatchBuf);
+		if (EndCharsMax) // If zero, EndChars may point to static memory.
+			free(EndChars);
+	}
+
+	inline bool InProgress() { return Status == INPUT_IN_PROGRESS; }
+	bool IsEarly() { return BeforeHotkeys; }
+	bool IsInteresting(KBDLLHOOKSTRUCT &aEvent);
+	ResultType Setup(LPCTSTR aOptions, LPCTSTR aEndKeys, LPCTSTR aMatchList);
+	void ParseOptions(LPCTSTR aOptions);
+	void SetTimeoutTimer();
+	ResultType SetKeyFlags(LPCTSTR aKeys, bool aEndKeyMode = true, UCHAR aFlagsRemove = 0, UCHAR aFlagsAdd = END_KEY_ENABLED);
+	ResultType SetMatchList(LPCTSTR aMatchList);
+	void Start();
+	void EndByMatch(UINT aMatchIndex);
+	void EndByKey(vk_type aVK, sc_type aSC, bool aBySC, bool aRequiredShift);
+	void EndByChar(TCHAR aChar);
+	void EndByTimeout() { EndByReason(INPUT_TIMED_OUT); }
+	void EndByLimit() { EndByReason(INPUT_LIMIT_REACHED); }
+	void Stop() { EndByReason(INPUT_OFF); }
+	void CollectChar(TCHAR *ch, int char_count);
+	LPTSTR GetEndReason(LPTSTR aKeyBuf, int aKeyBufSize);
+private:
+	void EndByReason(InputStatusType aReason);
 };
+
+#include "input_object.h"
+
+void InputStart(input_type &input);
+input_type **InputFindLink(input_type *aInput);
+input_type *InputUnlinkIfStopped(input_type *aInput);
+input_type *InputRelease(input_type *aInput);
+input_type *InputFind(InputObject *object);
 
 
 //-------------------------------------------
@@ -232,6 +284,14 @@ struct KeyHistoryItem
 	TCHAR target_window[KEY_HISTORY_WINDOW_TITLE_SIZE];
 };
 
+struct CollectInputState
+{
+	bool early_collected, used_dead_key_non_destructively;
+	TCHAR ch[2];
+	int char_count;
+	HWND active_window;
+	HKL keyboard_layout;
+};
 
 //-------------------------------------------
 
@@ -242,28 +302,34 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 	, sc_type aSC, bool aKeyUp, ULONG_PTR aExtraInfo, DWORD aEventFlags);
 
 #define HOTSTRING_INDEX_INVALID INT_MAX  // Use a signed maximum rather than unsigned, in case indexes ever become signed.
-#define SuppressThisKey SuppressThisKeyFunc(aHook, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post)
+#define SuppressThisKey SuppressThisKeyFunc(aHook, lParam, aVK, aSC, aKeyUp, aExtraInfo, pKeyHistoryCurr, hotkey_id_to_post)
 LRESULT SuppressThisKeyFunc(const HHOOK aHook, LPARAM lParam, const vk_type aVK, const sc_type aSC
-	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost
+	, bool aKeyUp, ULONG_PTR aExtraInfo, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost
 	, WPARAM aHSwParamToPost = HOTSTRING_INDEX_INVALID, LPARAM aHSlParamToPost = 0);
 
-#define AllowKeyToGoToSystem AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post, false)
-#define AllowKeyToGoToSystemButDisguiseWinAlt AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post, true)
+#define AllowKeyToGoToSystem AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, aExtraInfo, collect_input_state, pKeyHistoryCurr, hotkey_id_to_post)
 LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, const vk_type aVK, const sc_type aSC
-	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost, bool aDisguiseWinAlt);
+	, bool aKeyUp, ULONG_PTR aExtraInfo, CollectInputState &aState, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost);
 
+bool EarlyCollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, bool aKeyUp, bool aIsIgnored
+	, CollectInputState &aState, KeyHistoryItem *pKeyHistoryCurr);
 bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, bool aKeyUp, bool aIsIgnored
+	, CollectInputState &aState, KeyHistoryItem *pKeyHistoryCurr, WPARAM &aHotstringWparamToPost, LPARAM &aHotstringLparamToPost);
+bool CollectHotstring(KBDLLHOOKSTRUCT &aEvent, TCHAR aChar[], int aCharCount, HWND aActiveWindow
 	, KeyHistoryItem *pKeyHistoryCurr, WPARAM &aHotstringWparamToPost, LPARAM &aHotstringLparamToPost);
+bool CollectInputHook(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, TCHAR aChar[], int aCharCount, bool aIsIgnored, bool aEarly);
+bool IsHotstringWordChar(TCHAR aChar);
 void UpdateKeybdState(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, bool aKeyUp, bool aIsSuppressed);
 bool KeybdEventIsPhysical(DWORD aEventFlags, const vk_type aVK, bool aKeyUp);
-bool DualStateNumpadKeyIsDown();
-bool IsDualStateNumpadKey(const vk_type aVK, const sc_type aSC);
 
 void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType aWhichHookAlways);
 void AddRemoveHooks(HookType aHooksToBeActive, bool aChangeIsTemporary = false);
+bool HookAdjustMaxHotkeys(Hotkey **&aHK, int &aCurrentMax, int aNewMax);
 bool SystemHasAnotherKeybdHook();
 bool SystemHasAnotherMouseHook();
 DWORD WINAPI HookThreadProc(LPVOID aUnused);
+
+void LinkKeysForCustomCombo(vk_type aNeutral, vk_type aLeft, vk_type aRight);
 
 void ResetHook(bool aAllModifiersUp = false, HookType aWhichHook = (HOOK_KEYBD | HOOK_MOUSE)
 	, bool aResetKVKandKSC = false);
@@ -271,5 +337,7 @@ HookType GetActiveHooks();
 void FreeHookMem();
 void ResetKeyTypeState(key_type &key);
 void GetHookStatus(LPTSTR aBuf, int aBufSize);
+
+void WaitHookIdle();
 
 #endif

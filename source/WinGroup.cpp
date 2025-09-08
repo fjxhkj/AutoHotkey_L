@@ -26,13 +26,16 @@ HWND *WinGroup::sAlreadyVisited = NULL;
 int WinGroup::sAlreadyVisitedCount = 0;
 
 
-ResultType WinGroup::AddWindow(LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText)
+ResultType WinGroup::AddWindow(LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText)
 // Caller should ensure that at least one param isn't NULL/blank.
-// GroupActivate will tell its caller to jump to aJumpToLabel if a WindowSpec isn't found.
 // This function is not thread-safe because it adds an entry to the list of window specs.
 // In addition, if this function is being called by one thread while another thread is calling IsMember(),
 // the thread-safety notes in IsMember() apply.
 {
+	if (!aTitle) aTitle = _T("");
+	if (!aText) aText = _T("");
+	if (!aExcludeTitle) aExcludeTitle = _T("");
+	if (!aExcludeText) aExcludeText = _T("");
 	// v1.0.41: If a window group can ever be deleted (or its window specs), that might defeat the
 	// thread-safety of WinExist/WinActive.
 	// v1.0.36.05: If all four window parameters are blank, allow it to be added but provide
@@ -65,8 +68,6 @@ ResultType WinGroup::AddWindow(LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle
 	// some other thread calls IsMember() in the middle of the operation.  But any changes
 	// must be carefully reviewed:
 	WindowSpec *the_new_win = new WindowSpec(new_title, new_text, new_exclude_title, new_exclude_text);
-	if (the_new_win == NULL)
-		return g_script.ScriptError(ERR_OUTOFMEM);
 	if (mFirstWindow == NULL)
 		mFirstWindow = the_new_win;
 	else
@@ -81,10 +82,11 @@ ResultType WinGroup::AddWindow(LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle
 
 
 
-ResultType WinGroup::ActUponAll(ActionTypeType aActionType, int aTimeToWaitForClose)
+void WinGroup::ActUponAll(BuiltInFunctionID aActionType, int aTimeToWaitForClose)
 {
-	if (IsEmpty())
-		return OK;  // OK since this is the expected behavior in this case.
+	// A group should never be empty, since it is created by "adding" a set of criteria.
+	//if (IsEmpty())
+	//	return;
 	// Don't need to call Update() in this case.
 	WindowSearch ws;
 	ws.mFirstWinSpec = mFirstWindow; // Act upon all windows that match any WindowSpec in the group.
@@ -93,17 +95,16 @@ ResultType WinGroup::ActUponAll(ActionTypeType aActionType, int aTimeToWaitForCl
 	EnumWindows(EnumParentActUponAll, (LPARAM)&ws);
 	if (ws.mFoundParent) // It acted upon least one window.
 		DoWinDelay;
-	return OK;
 }
 
 
 
-ResultType WinGroup::CloseAndGoToNext(bool aStartWithMostRecent)
+void WinGroup::CloseAndGoToNext(bool aStartWithMostRecent)
 // If the foreground window is a member of this group, close it and activate
 // the next member.
 {
 	if (IsEmpty())
-		return OK;  // OK since this is the expected behavior in this case.
+		return;
 	// Otherwise:
 	// Don't call Update(), let (De)Activate() do that.
 
@@ -136,166 +137,91 @@ ResultType WinGroup::CloseAndGoToNext(bool aStartWithMostRecent)
 			WinClose(fore_win, 500);
 			DoWinDelay;
 		}
+		if (mIsModeActivate)
+		{
+			HWND new_fore_win = GetForegroundWindow();
+			if (new_fore_win != fore_win && IsMember(new_fore_win, *g))
+			{
+				// new_fore_win appears to have been activated as a result of closing fore_win.
+				// Since new_fore_win belongs to the group, avoid activating some other window
+				// even if !aStartWithMostRecent, since it would be a bit jarring.  Historical
+				// behaviour was to leave it active only if it belonged to the same *spec*,
+				// which doesn't make a lot of sense.
+				return;
+			}
+		}
 	}
 	//else do the activation below anyway, even though no close was done.
-	return mIsModeActivate ? Activate(aStartWithMostRecent, win_spec) : Deactivate(aStartWithMostRecent);
+	if (mIsModeActivate)
+		Activate(aStartWithMostRecent);
+	else
+		Deactivate(aStartWithMostRecent);
 }
 
 
 
-ResultType WinGroup::Activate(bool aStartWithMostRecent, WindowSpec *aWinSpec, Label **aJumpToLabel)
+HWND WinGroup::Activate(bool aStartWithMostRecent)
 {
-	if (aJumpToLabel) // Initialize early in case of early return.
-		*aJumpToLabel = NULL;
 	if (IsEmpty())
-		return OK;  // OK since this is the expected behavior in this case.
-	// Otherwise:
-	if (!Update(true)) // Update our private member vars.
-		return FAIL;  // It already displayed the error for us.
-	WindowSpec *win, *win_to_activate_next = aWinSpec;
-	bool group_is_active = false; // Set default.
-	HWND activate_win, active_window = GetForegroundWindow(); // This value is used in more than one place.
-	if (win_to_activate_next)
+		return NULL;
+	Update(true); // Update our private member vars.
+	HWND active_window = GetForegroundWindow();
+	bool group_is_active = IsMember(active_window, *g);
+	if (!group_is_active) // Foreground window is not a member of this group.
 	{
-		// The caller told us which WindowSpec to start off trying to activate.
-		// If the foreground window matches that WindowSpec, do nothing except
-		// marking it as visited, because we want to stay on this window under
-		// the assumption that it was newly revealed due to a window on top
-		// of it having just been closed:
-		if (win_to_activate_next == IsMember(active_window, *g))
-		{
-			group_is_active = true;
-			MarkAsVisited(active_window);
-			return OK;
-		}
-		// else don't mark as visited even if it's a member of the group because
-		// we're about to attempt to activate a different window: the next
-		// unvisited member of this same WindowSpec.  If the below doesn't
-		// find any of those, it continue on through the list normally.
-	}
-	else // Caller didn't tell us which, so determine it.
-	{
-		if (win_to_activate_next = IsMember(active_window, *g)) // Foreground window is a member of this group.
-		{
-			// Set it to activate this same WindowSpec again in case there's
-			// more than one that matches (e.g. multiple notepads).  But first,
-			// mark the current window as having been visited if it hasn't
-			// already by marked by a prior iteration.  Update: This method
-			// doesn't work because if a unvisited matching window became the
-			// foreground window by means other than using GroupActivate
-			// (e.g. launching a new instance of the app: now there's another
-			// matching window in the foreground).  So just call it straight
-			// out.  It has built-in dupe-checking which should prevent the
-			// list from filling up with dupes if there are any special
-			// situations in which that might otherwise happen:
-			//if (!sAlreadyVisitedCount)
-			group_is_active = true;
-			MarkAsVisited(active_window);
-		}
-		else // It's not a member.
-		{
-			win_to_activate_next = mFirstWindow;  // We're starting fresh, so start at the first window.
-			// Reset the list of visited windows:
-			sAlreadyVisitedCount = 0;
-		}
+		// Reset the list of visited windows:
+		sAlreadyVisitedCount = 0;
 	}
 
-	// Activate any unvisited window that matches the win_to_activate_next spec.
-	// If none, activate the next window spec in the series that does have an
-	// existing window:
-	// If the spec we're starting at already has some windows marked as visited,
-	// set this variable so that we know to retry the first spec again in case
-	// a full circuit is made through the window specs without finding a window
-	// to activate.  Note: Using >1 vs. >0 might protect against any infinite-loop
-	// conditions that may be lurking:
-	bool retry_starting_win_spec = (sAlreadyVisitedCount > 1);
-	bool retry_is_in_effect = false;
-	for (win = win_to_activate_next;;)
+	// Find the first/last unvisited window that matches any spec in the group.
+	WindowSearch ws;
+	// This next line is whether to find last or first match.  We always find the oldest
+	// (bottommost) match except when the user has specifically asked to start with the
+	// most recent AND the group isn't currently active (i.e. we're starting fresh).
+	// This allows the order to be the same each time the sequence repeats, instead of
+	// reversing due to the nature of the window z-order.
+	ws.mFindLastMatch = !aStartWithMostRecent || group_is_active;
+	ws.mAlreadyVisited = sAlreadyVisited;
+	ws.mAlreadyVisitedCount = sAlreadyVisitedCount;
+	ws.SetCriteria(*g, *this);
+
+	for (bool retry_needed = sAlreadyVisitedCount > 0; ; retry_needed = false)
 	{
-		// Call this in the mode to find the last match, which  makes things nicer
-		// because when the sequence wraps around to the beginning, the windows will
-		// occur in the same order that they did the first time, rather than going
-		// backwards through the sequence (which is counterintuitive for the user):
-		if (   activate_win = WinActivate(*g, win->mTitle, win->mText, win->mExcludeTitle, win->mExcludeText
-			// This next line is whether to find last or first match.  We always find the oldest
-			// (bottommost) match except when the user has specifically asked to start with the
-			// most recent.  But it only makes sense to start with the most recent if the
-			// group isn't currently active (i.e. we're starting fresh), because otherwise
-			// windows would be activated in an order different from what was already shown
-			// the first time through the enumeration, which doesn't seem to be ever desirable:
-			, !aStartWithMostRecent || group_is_active
-			, sAlreadyVisited, sAlreadyVisitedCount)   )
+		if (group_is_active) // Foreground window is a member of this group.
+		{
+			// Ensure the active window is excluded from both attempts to find a match.
+			MarkAsVisited(active_window);
+		}
+		ws.mAlreadyVisitedCount = sAlreadyVisitedCount;
+		EnumWindows(EnumParentFind, (LPARAM)&ws);
+		if (ws.mFoundParent)
 		{
 			// We found a window to activate, so we're done.
-			// Probably best to do this before WinDelay in case another hotkey fires during the delay:
-			MarkAsVisited(activate_win);
+			SetForegroundWindowEx(ws.mFoundParent);
+			MarkAsVisited(ws.mFoundParent);
 			DoWinDelay;
-			//MsgBox(win->mText, 0, win->mTitle);
-			break;
+			return ws.mFoundParent;
 		}
-		// Otherwise, no window was found to activate.
-		if (retry_is_in_effect)
-			// This was the final attempt because we've already gone all the
-			// way around the circular linked list of WindowSpecs.  This check
-			// must be done, otherwise an infinite loop might result if the windows
-			// that formed the basis for determining the value of
-			// retry_starting_win_spec have since been destroyed:
+		if (!retry_needed)
 			break;
-		// Otherwise, go onto the next one in the group:
-		win = win->mNextWindow;
-        // Even if the above didn't change the value of <win> (because there's only
-		// one WinSpec in the list), it's still correct to reset this count because
-		// we want to start the fresh again after all the windows have been
-		// visited.  Note: The only purpose of sAlreadyVisitedCount as used by
-		// this function is to indicate which windows in a given WindowSpec have
-		// been visited, not which windows altogether (i.e. it's not necessary to
-		// remember which windows have been visited once we move on to a new
-		// WindowSpec).
+		// Try again without excluding previously visited windows.
 		sAlreadyVisitedCount = 0;
-		if (win == win_to_activate_next)
-		{
-			// We've made one full circuit of the circular linked list without
-			// finding an existing window to activate. At this point, the user
-			// has pressed a hotkey to do a GroupActivate, but nothing has happened
-			// yet.  We always want something to happen unless there's absolutely
-			// no existing windows to activate, or there's only a single window in
-			// the system that matches the group and it's already active.
-			if (retry_starting_win_spec)
-			{
-				// Mark the foreground window as visited so that it won't be
-				// mistakenly activated again by the next iteration:
-				MarkAsVisited(active_window);
-				retry_is_in_effect = true;
-				// Now continue with the next iteration of the loop so that it
-				// will activate a different instance of this WindowSpec rather
-				// than getting stuck on this one.
-			}
-			else 
-			{
-				if (aJumpToLabel && mJumpToLabel)
-				{
-					// Caller asked us to return in this case, so that it can
-					// use this value to execute a user-specified Gosub:
-					*aJumpToLabel = mJumpToLabel;  // Set output param for the caller.
-				}
-				return FAIL; // Let GroupActivate set ErrorLevel to indicate what happened.
-			}
-		}
 	}
-	return OK;
+	// No window was found to activate.
+	return NULL;
 }
 
 
 
-ResultType WinGroup::Deactivate(bool aStartWithMostRecent)
+void WinGroup::Deactivate(bool aStartWithMostRecent)
 {
-	if (IsEmpty())
-		return OK;  // OK since this is the expected behavior in this case.
-	// Otherwise:
-	if (!Update(false)) // Update our private member vars.
-		return FAIL;  // It already displayed the error for us.
+	Update(false); // Update our private member vars.
 
 	HWND active_window = GetForegroundWindow();
+	// Since EnumParentFindAnyExcept does not evaluate owned windows but one may have
+	// been activated by a previous call, evaluate the owner of active_window, if any.
+	while (HWND owner = GetWindow(active_window, GW_OWNER))
+		active_window = owner;
 	if (IsMember(active_window, *g))
 		sAlreadyVisitedCount = 0;
 
@@ -310,24 +236,16 @@ ResultType WinGroup::Deactivate(bool aStartWithMostRecent)
 
 	if (ws.mFoundParent)
 	{
-		// If the window we're about to activate owns other visible parent windows, it can
-		// never truly be activated because it must always be below them in the z-order.
-		// Thus, instead of activating it, activate the first (and usually the only?)
-		// visible window that it owns.  Doing this makes things nicer for some apps that
-		// have a pair of main windows, such as MS Visual Studio (and probably many more),
-		// because it avoids activating such apps twice in a row as the user progresses
-		// through the sequence:
-		HWND first_visible_owned = WindowOwnsOthers(ws.mFoundParent);
-		if (first_visible_owned)
-		{
-			MarkAsVisited(ws.mFoundParent);  // Must mark owner as well as the owned window.
-			// Activate the owned window instead of the owner because it usually
-			// (probably always, given the comments above) is the real main window:
-			ws.mFoundParent = first_visible_owned;
-		}
-		SetForegroundWindowEx(ws.mFoundParent);
+		// Contrary to comments previously found here, a window that owns other windows can be
+		// (and often is) activated, unless the window is also disabled.  However, when the
+		// window is activated via the Taskbar, Alt-Tab or due to closing or minimizing some
+		// other window, the OS activates the *last active owned window* if it was active more
+		// recently than the owner.  Doing it this way will activate either the owner or one
+		// of its owned windows, instead of the old way, activating *every one* of the owned
+		// windows in turn and never the owner.
+		SetForegroundWindowEx(GetLastActivePopup(ws.mFoundParent));
 		// Probably best to do this before WinDelay in case another hotkey fires during the delay:
-		MarkAsVisited(ws.mFoundParent);
+		MarkAsVisited(ws.mFoundParent); // Mark the found HWND, not necessarily the one that was activated.
 		DoWinDelay;
 	}
 	else // No window was found to activate (they have all been visited).
@@ -351,14 +269,19 @@ ResultType WinGroup::Deactivate(bool aStartWithMostRecent)
 				Deactivate(false); // Seems best to ignore aStartWithMostRecent in this case?
 			}
 		}
+		else
+		{
+			// Since there are apparently no eligible windows, deactivate the window by
+			// activating the taskbar, which is usually what happens when you minimize
+			// the last non-minimized top-level window.
+			SetForegroundWindowEx(FindWindow(_T("Shell_TrayWnd"), nullptr));
+		}
 	}
-	// Even if a window wasn't found, we've done our job so return OK:
-	return OK;
 }
 
 
 
-inline ResultType WinGroup::Update(bool aIsModeActivate)
+inline void WinGroup::Update(bool aIsModeActivate)
 {
 	mIsModeActivate = aIsModeActivate;
 	if (sGroupLastUsed != this)
@@ -369,15 +292,13 @@ inline ResultType WinGroup::Update(bool aIsModeActivate)
 	if (!sAlreadyVisited) // Allocate the array on first use.
 		// Getting it from SimpleHeap reduces overhead for the avg. case (i.e. the first
 		// block of SimpleHeap is usually never fully used, and this array won't even
-		// be allocated for short scripts that don't even using window groups.
-		if (   !(sAlreadyVisited = (HWND *)SimpleHeap::Malloc(MAX_ALREADY_VISITED * sizeof(HWND)))   )
-			return FAIL;  // It already displayed the error for us.
-	return OK;
+		// be allocated for short scripts that don't even use window groups.
+		sAlreadyVisited = SimpleHeap::Alloc<HWND>(MAX_ALREADY_VISITED);
 }
 
 
 
-WindowSpec *WinGroup::IsMember(HWND aWnd, global_struct &aSettings)
+WindowSpec *WinGroup::IsMember(HWND aWnd, ScriptThreadSettings &aSettings)
 // Thread-safety: This function is thread-safe even when the main thread happens to be calling AddWindow()
 // and changing the linked list while it's being traversed here by the hook thread.  However, any subsequent
 // changes to this function or AddWindow() must be carefully reviewed.
@@ -415,32 +336,46 @@ BOOL CALLBACK EnumParentFindAnyExcept(HWND aWnd, LPARAM lParam)
 	// Since the following two sections apply only to GroupDeactivate (since that's our only caller),
 	// they both seem okay even in light of the ahk_group method.
 
-	if (!IsWindowVisible(aWnd))
-		// Skip these because we always want them to stay invisible, regardless
-		// of the setting for g->DetectHiddenWindows:
+	DWORD style = GetWindowLong(aWnd, GWL_STYLE);
+	if (!(style & WS_VISIBLE) || (style & WS_DISABLED) && GetLastActivePopup(aWnd) == aWnd)
+		// Skip hidden windows because we always want them to stay invisible, regardless
+		// of the setting for g->DetectHiddenWindows.  v2.0: Also skip disabled windows,
+		// except those which own a popup window (such as a modal dialog).
+		// Since these are top-level windows, IsWindowVisible() shouldn't be necessary.
 		return TRUE;
 
 	// UPDATE: Because the window of class Shell_TrayWnd (the taskbar) is also always-on-top,
 	// the below prevents it from ever being activated too, which is almost always desirable.
-	// However, this prevents the addition of WS_DISABLED as an extra criteria for skipping
-	// a window.  Maybe that's best for backward compatibility anyway.
 	// Skip always-on-top windows, such as SplashText, because probably shouldn't
 	// be activated (especially in this mode, which is often used to visit the user's
 	// "non-favorite" windows).  In addition, they're already visible so the user already
 	// knows about them, so there's no need to have them presented for review.
-	if (GetWindowLong(aWnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+	// v2.0:
+	//  - Windows with WS_EX_NOACTIVATE are excluded because they probably aren't intended
+	//    to be activated.  Past testing indicated they were omitted from Alt-Tab and/or
+	//    the taskbar on some OSes, but there must be some other factor as I currently can't
+	//    reproduce that.  However, they are skipped by the Alt+Esc/Alt+Shift+Esc hotkeys.
+	//  - Windows with WS_EX_TOOLWINDOW but without WS_EX_APPWINDOW are excluded from the
+	//    taskbar and Alt-Tab.  They are also usually owned anyway, except for the WorkerW
+	//    window which contains some of the Desktop content on Windows 10 (and 7, but it's
+	//    hidden there).  Excluding this style avoids the need to check for WorkerW, which
+	//    also means we don't need to retrieve the window class.
+	DWORD ex_style = GetWindowLong(aWnd, GWL_EXSTYLE);
+	if ((ex_style & (WS_EX_TOPMOST | WS_EX_NOACTIVATE))
+		|| (ex_style & (WS_EX_TOOLWINDOW | WS_EX_APPWINDOW)) == WS_EX_TOOLWINDOW)
 		return TRUE;
 
-	// It probably would have been better to use the class name (ProgMan?) for this instead,
-	// but there is doubt that the same class name is used across all OSes.  The reason for
-	// doing that is to avoid ambiguity with other windows that just happen to be called
-	// "Program Manager".  See similar section in EnumParentActUponAll().
-	// Skip "Program Manager" too because activating it would serve no purpose.  This is probably
-	// the same HWND that GetShellWindow() returns, but GetShellWindow() isn't supported on
-	// Win9x or WinNT, so don't bother using it.  And GetDeskTopWindow() apparently doesn't
-	// return "Program Manager" (something with a blank title I think):
-	TCHAR win_title[20]; // Just need enough size to check for Program Manager
-	if (GetWindowText(aWnd, win_title, _countof(win_title)) && !_tcsicmp(win_title, _T("Program Manager")))
+	// Exclude owned windows.  The owner should be considered by a subsequent call.
+	// If eligible, either the owner or its last active owned window will be activated.
+	if (GetWindow(aWnd, GW_OWNER))
+		return TRUE;
+
+	if (IsWindowCloaked(aWnd)) // This is probably higher cost than the style checks, so done after.
+		return TRUE;
+	
+	// Skip "Program Manager" (the Desktop) because the user probably doesn't want it
+	// activated (although that would serve the purpose of deactivating any other window).
+	if (aWnd == GetShellWindow())
 		return TRUE;
 
 	WindowSearch &ws = *(WindowSearch *)lParam;  // For performance and convenience.
@@ -489,7 +424,7 @@ BOOL CALLBACK EnumParentActUponAll(HWND aWnd, LPARAM lParam)
 
 	// Skip windows the command isn't supposed to detect.  ACT_WINSHOW is exempt because
 	// hidden windows are always detected by the WinShow command:
-	if (!(g->DetectHiddenWindows || ws.mActionType == ACT_WINSHOW || IsWindowVisible(aWnd)))
+	if (!(ws.mActionType == FID_WinShow || g->DetectWindow(aWnd)))
 		return TRUE;
 
 	int nCmdShow;
@@ -502,32 +437,29 @@ BOOL CALLBACK EnumParentActUponAll(HWND aWnd, LPARAM lParam)
 		{
 			// Match found, so aWnd is a member of the group.  In addition, IsMatch() has set
 			// the value of ws.mFoundParent to tell our caller that at least one window was acted upon.
-			// See Line::PerformShowWindow() for comments about the following section.
+			// See BIF_WinShow for comments about the following section.
 			nCmdShow = SW_NONE; // Set default each time.
 			switch (ws.mActionType)
 			{
-			case ACT_WINCLOSE:
-			case ACT_WINKILL:
+			case FID_WinClose:
+			case FID_WinKill:
 				// mTimeToWaitForClose is not done in a very efficient way here: to keep code size
 				// in check, it closes each window individually rather than sending WM_CLOSE to all
 				// the windows simultaneously and then waiting until all have vanished:
-				WinClose(aWnd, ws.mTimeToWaitForClose, ws.mActionType == ACT_WINKILL); // DoWinDelay is done by our caller.
+				WinClose(aWnd, ws.mTimeToWaitForClose, ws.mActionType == FID_WinKill); // DoWinDelay is done by our caller.
 				return TRUE; // All done with the current window, so fetch the next one.
 
-			case ACT_WINMINIMIZE:
+			case FID_WinMinimize:
 				if (IsWindowHung(aWnd))
-				{
-					if (g_os.IsWin2000orLater())
-						nCmdShow = SW_FORCEMINIMIZE;
-				}
+					nCmdShow = SW_FORCEMINIMIZE;
 				else
 					nCmdShow = SW_MINIMIZE;
 				break;
 
-			case ACT_WINMAXIMIZE: if (!IsWindowHung(aWnd)) nCmdShow = SW_MAXIMIZE; break;
-			case ACT_WINRESTORE:  if (!IsWindowHung(aWnd)) nCmdShow = SW_RESTORE;  break;
-			case ACT_WINHIDE: nCmdShow = SW_HIDE; break;
-			case ACT_WINSHOW: nCmdShow = SW_SHOW; break;
+			case FID_WinMaximize: if (!IsWindowHung(aWnd)) nCmdShow = SW_MAXIMIZE; break;
+			case FID_WinRestore:  if (!IsWindowHung(aWnd)) nCmdShow = SW_RESTORE;  break;
+			case FID_WinHide: nCmdShow = SW_HIDE; break;
+			case FID_WinShow: nCmdShow = SW_SHOW; break;
 			}
 
 			if (nCmdShow != SW_NONE)

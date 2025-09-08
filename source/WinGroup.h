@@ -40,14 +40,15 @@ public:
 		: mTitle(aTitle), mText(aText), mExcludeTitle(aExcludeTitle), mExcludeText(aExcludeText)
 		, mNextWindow(NULL) // mNextWindow(NULL) is also required for thread-safety.
 	{}
-	void *operator new(size_t aBytes) {return SimpleHeap::Malloc(aBytes);}
-	void *operator new[](size_t aBytes) {return SimpleHeap::Malloc(aBytes);}
+	void *operator new(size_t aBytes) {return SimpleHeap::Alloc(aBytes);}
+	void *operator new[](size_t aBytes) {return SimpleHeap::Alloc(aBytes);}
 	void operator delete(void *aPtr) {}
 	void operator delete[](void *aPtr) {}
 };
 
 
 
+enum BuiltInFunctionID;
 class WinGroup
 {
 private:
@@ -72,22 +73,21 @@ private:
 		sAlreadyVisited[sAlreadyVisitedCount++] = aWnd;
 	}
 
-	ResultType Update(bool aIsModeActivate);
+	void Update(bool aIsModeActivate);
 
 public:
 	LPTSTR mName;    // The name of the group.
 	WindowSpec *mFirstWindow, *mLastWindow;
-	Label *mJumpToLabel;
 	WinGroup *mNextGroup;  // Next item in linked list.
 	UINT mWindowCount;
 
-	ResultType AddWindow(LPTSTR aTitle, LPTSTR aText, LPTSTR aExcludeTitle, LPTSTR aExcludeText);
-	ResultType ActUponAll(ActionTypeType aActionType, int aTimeToWaitForClose);
-	ResultType CloseAndGoToNext(bool aStartWithMostRecent);
-	ResultType Activate(bool aStartWithMostRecent, WindowSpec *aWinSpec = NULL, Label **aJumpToLabel = NULL);
-	ResultType Deactivate(bool aStartWithMostRecent);
+	ResultType AddWindow(LPCTSTR aTitle, LPCTSTR aText, LPCTSTR aExcludeTitle, LPCTSTR aExcludeText);
+	void ActUponAll(BuiltInFunctionID aActionType, int aTimeToWaitForClose);
+	void CloseAndGoToNext(bool aStartWithMostRecent);
+	HWND Activate(bool aStartWithMostRecent);
+	void Deactivate(bool aStartWithMostRecent);
 	bool IsEmpty() {return mFirstWindow == NULL;}
-	WindowSpec *IsMember(HWND aWnd, global_struct &aSettings);
+	WindowSpec *IsMember(HWND aWnd, ScriptThreadSettings &aSettings);
 	WinGroup(LPTSTR aGroupName)
 		// The caller must ensure that aGroupName is non-null and non-empty-string.
 		: mName(aGroupName) // Caller gave us a pointer to dynamic memory for this.
@@ -95,10 +95,9 @@ public:
 		, mWindowCount(0)
 		, mNextGroup(NULL) // v1.0.41: Required for thread-safety, but also for maintainability.
 		, mIsModeActivate(true) // arbitrary default.
-		, mJumpToLabel(NULL)
 	{}
-	void *operator new(size_t aBytes) {return SimpleHeap::Malloc(aBytes);}
-	void *operator new[](size_t aBytes) {return SimpleHeap::Malloc(aBytes);}
+	void *operator new(size_t aBytes) {return SimpleHeap::Alloc(aBytes);}
+	void *operator new[](size_t aBytes) {return SimpleHeap::Alloc(aBytes);}
 	void operator delete(void *aPtr) {}
 	void operator delete[](void *aPtr) {}
 };

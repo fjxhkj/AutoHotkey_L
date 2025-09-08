@@ -19,7 +19,7 @@ GNU General Public License for more details.
 
 #include "hook.h" // For KeyHistoryItem and probably other things.
 #include "clipboard.h"  // For the global clipboard object
-#include "script.h" // For the global script object and g_ErrorLevel
+#include "script.h" // For the global script object
 #include "os_version.h" // For the global OS_Version object
 
 #include "Debugger.h"
@@ -34,10 +34,9 @@ extern UINT g_DefaultScriptCodepage;
 extern bool g_DestroyWindowCalled;
 extern HWND g_hWnd;  // The main window
 extern HWND g_hWndEdit;  // The edit window, child of main.
-extern HWND g_hWndSplash;  // The SplashText window.
 extern HFONT g_hFontEdit;
-extern HFONT g_hFontSplash;
 extern HACCEL g_hAccelTable; // Accelerator table for main menu shortcut keys.
+extern MSG *g_CalledByIsDialogMessageOrDispatch; // Helps avoid launching a monitor function twice for the same message.
 
 typedef int (WINAPI *StrCmpLogicalW_type)(LPCWSTR, LPCWSTR);
 extern StrCmpLogicalW_type g_StrCmpLogicalW;
@@ -46,6 +45,12 @@ extern WNDPROC g_TabClassProc;
 extern modLR_type g_modifiersLR_logical;   // Tracked by hook (if hook is active).
 extern modLR_type g_modifiersLR_logical_non_ignored;
 extern modLR_type g_modifiersLR_physical;  // Same as above except it's which modifiers are PHYSICALLY down.
+extern modLR_type g_modifiersLR_numpad_mask;  // Shift keys temporarily released by Numpad.
+extern modLR_type g_modifiersLR_ctrlaltdel_mask; // For excluding AltGr from Ctrl+Alt+Del handling.
+extern modLR_type g_modifiersLR_last_pressed;
+extern DWORD g_modifiersLR_last_pressed_time;
+
+extern key_type *pPrefixKey;
 
 #ifdef FUTURE_USE_MOUSE_BUTTONS_LOGICAL
 extern WORD g_mouse_buttons_logical; // A bitwise combination of MK_LBUTTON, etc.
@@ -55,11 +60,10 @@ extern WORD g_mouse_buttons_logical; // A bitwise combination of MK_LBUTTON, etc
 #define STATE_ON 0x01
 extern BYTE g_PhysicalKeyState[VK_ARRAY_COUNT];
 extern bool g_BlockWinKeys;
-extern DWORD g_HookReceiptOfLControlMeansAltGr;
-extern DWORD g_IgnoreNextLControlDown;
-extern DWORD g_IgnoreNextLControlUp;
+extern DWORD g_AltGrExtraInfo;
 
-extern BYTE g_MenuMaskKey; // L38: See #MenuMaskKey.
+extern BYTE g_MenuMaskKeyVK; // For #MenuMaskKey.
+extern USHORT g_MenuMaskKeySC;
 
 // If a SendKeys() operation takes longer than this, hotkey's modifiers won't be pressed back down:
 extern int g_HotkeyModifierTimeout;
@@ -70,64 +74,48 @@ extern HHOOK g_MouseHook;
 extern HHOOK g_PlaybackHook;
 extern bool g_ForceLaunch;
 extern bool g_WinActivateForce;
-extern bool g_RunStdIn;
-extern WarnMode g_Warn_UseUnsetLocal;
-extern WarnMode g_Warn_UseUnsetGlobal;
-extern WarnMode g_Warn_UseEnv;
-extern WarnMode g_Warn_LocalSameAsGlobal;
+extern WarnMode g_WarnMode;
 extern SingleInstanceType g_AllowOnlyOneInstance;
 extern bool g_persistent;
 extern bool g_NoTrayIcon;
-#ifdef AUTOHOTKEYSC
-	extern bool g_AllowMainWindow;
-#endif
+extern bool g_AllowMainWindow;
 extern bool g_DeferMessagesForUnderlyingPump;
 extern bool g_MainTimerExists;
-extern bool g_AutoExecTimerExists;
 extern bool g_InputTimerExists;
 extern bool g_DerefTimerExists;
 extern bool g_SoundWasPlayed;
 extern bool g_IsSuspended;
-extern BOOL g_WriteCacheDisabledInt64;
-extern BOOL g_WriteCacheDisabledDouble;
-extern BOOL g_NoEnv;
+extern bool g_OnExitIsRunning;
 extern BOOL g_AllowInterruption;
 extern int g_nLayersNeedingTimer;
 extern int g_nThreads;
 extern int g_nPausedThreads;
 extern int g_MaxHistoryKeys;
+extern DWORD g_InputTimeoutAt;
 
-extern VarSizeType g_MaxVarCapacity;
 extern UCHAR g_MaxThreadsPerHotkey;
 extern int g_MaxThreadsTotal;
-extern int g_MaxHotkeysPerInterval;
-extern int g_HotkeyThrottleInterval;
+extern UINT g_MaxHotkeysPerInterval;
+extern UINT g_HotkeyThrottleInterval;
 extern bool g_MaxThreadsBuffer;
+extern bool g_SuspendExempt;
+extern bool g_SuspendExemptHS;
 extern SendLevelType g_InputLevel;
-extern HotCriterionType g_HotCriterion;
-extern LPTSTR g_HotWinTitle;
-extern LPTSTR g_HotWinText;
 extern HotkeyCriterion *g_FirstHotCriterion, *g_LastHotCriterion;
 
-// Global variables for #if (expression). See globaldata.cpp for comments.
-extern int g_HotExprIndex;
-extern Line **g_HotExprLines;
-extern int g_HotExprLineCount;
-extern int g_HotExprLineCountMax;
+// Global variables for #HotIf (expression). See globaldata.cpp for comments.
 extern UINT g_HotExprTimeout;
 extern HWND g_HotExprLFW;
+extern HotkeyCriterion *g_FirstHotExpr, *g_LastHotExpr;
 
 extern int g_ScreenDPI;
-extern MenuTypeType g_MenuIsVisible;
+extern bool g_MenuIsVisible;
+extern HMENU g_MenuIsTempModeless;
+extern bool g_MenuIsTempTopmost;
 extern int g_nMessageBoxes;
-extern int g_nInputBoxes;
 extern int g_nFileDialogs;
 extern int g_nFolderDialogs;
-extern InputBoxType g_InputBox[MAX_INPUTBOXES];
-extern SplashType g_Progress[MAX_PROGRESS_WINDOWS];
-extern SplashType g_SplashImage[MAX_SPLASHIMAGE_WINDOWS];
-extern GuiType **g_gui;
-extern int g_guiCount, g_guiCountMax;
+extern GuiType *g_firstGui, *g_lastGui;
 extern HWND g_hWndToolTip[MAX_TOOLTIPS];
 extern MsgMonitorList g_MsgMonitor;
 
@@ -135,11 +123,13 @@ extern UCHAR g_SortCaseSensitive;
 extern bool g_SortNumeric;
 extern bool g_SortReverse;
 extern int g_SortColumnOffset;
-extern Func *g_SortFunc;
+extern IObject *g_SortFunc;
+extern ResultType g_SortFuncResult;
 
-extern TCHAR g_delimiter;
-extern TCHAR g_DerefChar;
-extern TCHAR g_EscapeChar;
+#define g_DerefChar   '%' // As of v2 these are constant, so even more parts of the code assume they
+#define g_EscapeChar  '`' // are at their usual default values to reduce code size/complexity.
+#define g_delimiter   ',' // Also, g_delimiter was never used in expressions (i.e. for SYM_COMMA).
+#define g_CommentChar ';'
 
 // Hot-string vars:
 extern TCHAR g_HSBuf[HS_BUF_SIZE];
@@ -150,20 +140,21 @@ extern HWND g_HShwnd;
 extern int g_HSPriority;
 extern int g_HSKeyDelay;
 extern SendModes g_HSSendMode;
+extern SendRawType g_HSSendRaw;
 extern bool g_HSCaseSensitive;
 extern bool g_HSConformToCase;
 extern bool g_HSDoBackspace;
 extern bool g_HSOmitEndChar;
-extern bool g_HSSendRaw;
 extern bool g_HSEndCharRequired;
 extern bool g_HSDetectWhenInsideWord;
 extern bool g_HSDoReset;
 extern bool g_HSResetUponMouseClick;
+extern bool g_HSSameLineAction;
 extern TCHAR g_EndChars[HS_MAX_END_CHARS + 1];
 
 // Global objects:
-extern Var *g_ErrorLevel;
-extern input_type g_input;
+extern input_type *g_input;
+extern int g_inputBeforeHotkeysCount;
 EXTERN_SCRIPT;
 EXTERN_CLIPBOARD;
 EXTERN_OSVER;
@@ -171,15 +162,13 @@ EXTERN_OSVER;
 extern HICON g_IconSmall;
 extern HICON g_IconLarge;
 
-extern DWORD g_OriginalTimeout;
-
 EXTERN_G;
-extern global_struct g_default, *g_array;
+extern global_struct *g_array;
+#define g_default g_array[0]
 
-extern TCHAR g_WorkingDir[MAX_PATH];  // Explicit size needed here in .h file for use with sizeof().
+extern CString g_WorkingDir;
 extern LPTSTR g_WorkingDirOrig;
 
-extern bool g_ContinuationLTrim;
 extern bool g_ForceKeybdHook;
 extern ToggleValueType g_ForceNumLock;
 extern ToggleValueType g_ForceCapsLock;
@@ -205,10 +194,8 @@ extern DWORD g_HistoryTickNow;
 extern DWORD g_HistoryTickPrev;
 extern HWND g_HistoryHwndPrev;
 extern DWORD g_TimeLastInputPhysical;
-
-#ifdef ENABLE_KEY_HISTORY_FILE
-extern bool g_KeyHistoryToFile;
-#endif
+extern DWORD g_TimeLastInputKeyboard;
+extern DWORD g_TimeLastInputMouse;
 
 
 // 9 might be better than 10 because if the granularity/timer is a little
@@ -280,18 +267,21 @@ if (!g_MainTimerExists)\
 // More info: Since AutoExecSection() never calls InitNewThread(), it never used to set the uninterruptible
 // timer.  Instead, it had its own timer.  But now that IsInterruptible() checks for the timeout of
 // "Thread Interrupt", AutoExec might become interruptible prematurely unless it uses the new method below.
+//
+// v2.0: There's no longer an AutoExec timer, so this just sets the uninterruptible duration.
 #define SET_AUTOEXEC_TIMER(aTimeoutValue) \
 {\
 	g->AllowThreadToBeInterrupted = false;\
 	g->ThreadStartTime = GetTickCount();\
 	g->UninterruptibleDuration = aTimeoutValue;\
-	if (!g_AutoExecTimerExists)\
-		g_AutoExecTimerExists = SetTimer(g_hWnd, TIMER_ID_AUTOEXEC, aTimeoutValue, AutoExecSectionTimeout);\
-} // v1.0.39 for above: Removed the call to ExitApp() upon failure.  See SET_MAIN_TIMER for details.
+}
 
-#define SET_INPUT_TIMER(aTimeoutValue) \
-if (!g_InputTimerExists)\
-	g_InputTimerExists = SetTimer(g_hWnd, TIMER_ID_INPUT, aTimeoutValue, InputTimeout);
+#define SET_INPUT_TIMER(aTimeoutValue, aTimeoutAt) \
+{ \
+g_InputTimeoutAt = aTimeoutAt; \
+g_InputTimerExists = SetTimer(g_hWnd, TIMER_ID_INPUT, aTimeoutValue, InputTimeout); \
+}
+
 
 // For this one, SetTimer() is called unconditionally because our caller wants the timer reset
 // (as though it were killed and recreated) unconditionally.  MSDN's comments are a little vague
@@ -304,13 +294,6 @@ if (!g_InputTimerExists)\
 #define KILL_MAIN_TIMER \
 if (g_MainTimerExists && KillTimer(g_hWnd, TIMER_ID_MAIN))\
 	g_MainTimerExists = false;
-
-// See above comment about g->AllowThreadToBeInterrupted.
-#define KILL_AUTOEXEC_TIMER \
-{\
-	if (g_AutoExecTimerExists && KillTimer(g_hWnd, TIMER_ID_AUTOEXEC))\
-		g_AutoExecTimerExists = false;\
-}
 
 #define KILL_INPUT_TIMER \
 if (g_InputTimerExists && KillTimer(g_hWnd, TIMER_ID_INPUT))\

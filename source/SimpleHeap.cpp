@@ -24,7 +24,7 @@ SimpleHeap *SimpleHeap::sLast  = NULL;
 char *SimpleHeap::sMostRecentlyAllocated = NULL;
 UINT SimpleHeap::sBlockCount = 0;
 
-LPTSTR SimpleHeap::Malloc(LPTSTR aBuf, size_t aLength)
+LPTSTR SimpleHeap::strDup(LPCTSTR aBuf, size_t aLength)
 // v1.0.44.14: Added aLength to improve performance in cases where callers already know the length.
 // If aLength is at its default of -1, the length will be calculated here.
 // Caller must ensure that aBuf isn't NULL.
@@ -35,15 +35,28 @@ LPTSTR SimpleHeap::Malloc(LPTSTR aBuf, size_t aLength)
 		aLength = _tcslen(aBuf);
 	LPTSTR new_buf;
 	if (   !(new_buf = (LPTSTR)SimpleHeap::Malloc((aLength + 1) * sizeof(TCHAR)))   ) // +1 for the zero terminator.
-	{
-		g_script.ScriptError(ERR_OUTOFMEM, aBuf);
 		return NULL; // Callers may rely on NULL vs. "" being returned in the event of failure.
-	}
 	if (aLength)
 		tmemcpy(new_buf, aBuf, aLength); // memcpy() typically benchmarks slightly faster than strcpy().
 	//else only a terminator is needed.
 	new_buf[aLength] = '\0'; // Terminate here for when aLength==0 and for the memcpy above so that caller's aBuf doesn't have to be terminated.
 	return new_buf;
+}
+
+LPTSTR SimpleHeap::Malloc(LPCTSTR aBuf, size_t aLength)
+{
+	auto new_buf = strDup(aBuf, aLength);
+	if (!new_buf)
+		MemoryError();
+	return new_buf; // May be null.
+}
+
+LPTSTR SimpleHeap::Alloc(LPCTSTR aBuf, size_t aLength)
+{
+	auto new_buf = strDup(aBuf, aLength);
+	if (!new_buf)
+		CriticalFail(); // This terminates the program.
+	return new_buf; // Always non-null.
 }
 
 void* SimpleHeap::Malloc(size_t aSize)
@@ -56,14 +69,18 @@ void* SimpleHeap::Malloc(size_t aSize)
 // potentially large linked list or maintaining and traversing an array of
 // "under-utilized" blocks.
 {
-	if (aSize < 1 || aSize > BLOCK_SIZE)
+	if (aSize < 1)
 		return NULL;
 	if (!sFirst) // We need at least one block to do anything, so create it.
 		if (   !(sFirst = CreateBlock())   )
 			return NULL;
 	if (aSize > sLast->mSpaceAvailable)
-		if (   !(sLast->mNextBlock = CreateBlock())   )
+	{
+		if (aSize > MAX_ALLOC_IN_NEW_BLOCK) // Also covers aSize > BLOCK_SIZE.
+			return malloc(aSize); // Avoid wasting the remainder of the block.
+		if (!(sLast->mNextBlock = CreateBlock()))
 			return NULL;
+	}
 	sMostRecentlyAllocated = sLast->mFreeMarker; // THIS IS NOW THE NEWLY ALLOCATED BLOCK FOR THE CALLER, which is 32-bit aligned because the previous call to this function (i.e. the logic below) set it up that way.
 	// v1.0.40.04: Set up the NEXT chunk to be aligned on a 32-bit boundary (the first chunk in each block
 	// should always be aligned since the block's address came from malloc()).  On average, this change
@@ -82,6 +99,14 @@ void* SimpleHeap::Malloc(size_t aSize)
 	sLast->mFreeMarker += size_consumed;
 	sLast->mSpaceAvailable -= size_consumed;
 	return (void *)sMostRecentlyAllocated;
+}
+
+void* SimpleHeap::Alloc(size_t aSize)
+{
+	auto p = Malloc(aSize);
+	if (!p)
+		CriticalFail();
+	return p;
 }
 
 
@@ -123,9 +148,7 @@ SimpleHeap *SimpleHeap::CreateBlock()
 // (compared to using "new" on a class that contains a large buffer such as "char mBlock[BLOCK_SIZE]").
 // In a 200 KB script, it saves 8 KB of VM Size as shown by Task Manager.
 {
-	SimpleHeap *block;
-	if (   !(block = new SimpleHeap)   )
-		return NULL;
+	SimpleHeap *block = new SimpleHeap;
 	// The new block's mFreeMarker starts off pointing to the first byte in the new block:
 	if (   !(block->mBlock = block->mFreeMarker = (char *)malloc(BLOCK_SIZE))   )
 	{

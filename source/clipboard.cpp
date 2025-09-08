@@ -23,15 +23,9 @@ GNU General Public License for more details.
 size_t Clipboard::Get(LPTSTR aBuf)
 // If aBuf is NULL, it returns the length of the text on the clipboard and leaves the
 // clipboard open.  Otherwise, it copies the clipboard text into aBuf and closes
-// the clipboard (UPDATE: But only if the clipboard is still open from a prior call
-// to determine the length -- see later comments for details).  In both cases, the
-// length of the clipboard text is returned (or the value CLIPBOARD_FAILURE if error).
-// If the clipboard is still open when the next MsgSleep() is called -- presumably
-// because the caller never followed up with a second call to this function, perhaps
-// due to having insufficient memory -- MsgSleep() will close it so that our
-// app doesn't keep the clipboard tied up.  Note: In all current cases, the caller
-// will use MsgBox to display an error, which in turn calls MsgSleep(), which will
-// immediately close the clipboard.
+// the clipboard.  In both cases, the length of the clipboard text is returned
+// (or the value CLIPBOARD_FAILURE if error).  Caller must Close() the clipboard
+// if aborting after calling Get(nullptr).
 {
 	// Seems best to always have done this even if we return early due to failure:
 	if (aBuf)
@@ -67,44 +61,26 @@ size_t Clipboard::Get(LPTSTR aBuf)
 		{
 			// Since this should be very rare, a shorter message is now used.  Formerly, it was
 			// "Could not open clipboard for reading after many timed attempts. Another program is probably holding it open."
-			Close(CANT_OPEN_CLIPBOARD_READ);
-			return CLIPBOARD_FAILURE;
+			return Close(CANT_OPEN_CLIPBOARD_READ) ? 0 : CLIPBOARD_FAILURE;
 		}
-		if (   !(mClipMemNow = g_clip.GetClipboardDataTimeout(clipboard_contains_text ? CF_NATIVETEXT : CF_HDROP))   )
+		if (   !(mClipMemNow = GetClipboardDataTimeout(clipboard_contains_text ? CF_NATIVETEXT : CF_HDROP))   )
 		{
-			// v1.0.47.04: Commented out the following that had been in effect when clipboard_contains_files==false:
-			//    Close("GetClipboardData"); // Short error message since so rare.
-			//    return CLIPBOARD_FAILURE;
-			// This was done because there are situations when GetClipboardData can fail indefinitely.
-			// For example, in Firefox, pulling down the Bookmarks menu then right-clicking "Bookmarks Toolbar
-			// Folder" then selecting "Copy" puts one or more formats on the clipboard that cause this problem.
-			// For details, search the forum for TYMED_NULL.
-			//
-			// v1.0.42.03: For the fix below, GetClipboardDataTimeout() knows not to try more than once
-			// for CF_HDROP.
-			// Fix for v1.0.31.02: When clipboard_contains_files==true, tolerate failure, which happens
-			// as a normal/expected outcome when there are files on the clipboard but either:
-			// 1) zero of them;
-			// 2) the CF_HDROP on the clipboard is somehow misformatted.
-			// If you select the parent ".." folder in WinRar then use the following hotkey, the script
-			// would previously yield a runtime error:
-			//#q::
-			//Send, ^c
-			//ClipWait, 0.5, 1
-			//msgbox %Clipboard%
-			//Return
+			// v2.0.18: Always tolerate NULL return from GetClipboardData.  Although it is difficult to see how
+			// CF_TEXT might fail to be retrieved, a NULL return can be the result of the source app doing the
+			// wrong thing; i.e. setting a NULL handle and failing to respond to WM_RENDERFORMAT correctly.
+			// Because most apps would likely not report any failure of GetClipboardData, this "violation of
+			// the contract" would go unnoticed in normal use.
 			Close();
 			if (aBuf)
 				*aBuf = '\0';
-			return CLIPBOARD_FAILURE; // Return this because otherwise, Contents() returns mClipMemNowLocked, which is NULL.
+			return 0;
 		}
 		// Although GlobalSize(mClipMemNow) can yield zero in some cases -- in which case GlobalLock() should
 		// not be attempted -- it probably can't yield zero for CF_HDROP and CF_TEXT because such a thing has
 		// never been reported by anyone.  Therefore, GlobalSize() is currently not called.
 		if (   !(mClipMemNowLocked = (LPTSTR)GlobalLock(mClipMemNow))   )
 		{
-			Close(_T("GlobalLock"));  // Short error message since so rare.
-			return CLIPBOARD_FAILURE;
+			return Close(_T("GlobalLock")) ? 0 : CLIPBOARD_FAILURE;  // Short error message since so rare.
 		}
 		// Otherwise: Update length after every successful new open&lock:
 		// Determine the length (size - 1) of the buffer than would be
@@ -131,21 +107,16 @@ size_t Clipboard::Get(LPTSTR aBuf)
 	if (!aBuf)
 		return mLength;
 		// Above: Just return the length; don't close the clipboard because we expect
-		// to be called again soon.  If for some reason we aren't called, MsgSleep()
-		// will automatically close the clipboard and clean up things.  It's done this
-		// way to avoid the chance that the clipboard contents (and thus its length)
-		// will change while we don't have it open, possibly resulting in a buffer
-		// overflow.  In addition, this approach performs better because it avoids
-		// the overhead of having to close and reopen the clipboard.
+		// to be called again soon.  Otherwise, caller must ensure Close() is called.
+		// It's done this way to avoid the chance that the clipboard contents (and thus
+		// its length) will change while we don't have it open, possibly resulting in a
+		// buffer overflow.
 
 	// Otherwise:
 	if (clipboard_contains_text) // Fixed for v1.1.16.02: Prefer text over files if both are present.
 	{
 		// Because the clipboard is being retrieved as text, return this text even if
-		// the clipboard also contains files.  Contents() relies on this since it only
-		// calls Get() once and does not provide a buffer.  Contents() would be used
-		// in "c := Clipboard" or "MsgBox %Clipboard%" because ArgMustBeDereferenced()
-		// returns true only if the clipboard contains files but not text.
+		// the clipboard also contains files.
 		_tcscpy(aBuf, mClipMemNowLocked);  // Caller has already ensured that aBuf is large enough.
 	}
 	else // clipboard_contains_files
@@ -164,16 +135,7 @@ size_t Clipboard::Get(LPTSTR aBuf)
 			}
 		// else aBuf has already been terminated upon entrance to this function.
 	}
-	// Fix for v1.0.37: Close() is no longer called here because it prevents the clipboard variable
-	// from being referred to more than once in a line.  For example:
-	// Msgbox %Clipboard%%Clipboard%
-	// ToolTip % StrLen(Clipboard) . Clipboard
-	// Instead, the clipboard is later closed in other places (search on CLOSE_CLIPBOARD_IF_OPEN
-	// to find them).  The alternative to fixing it this way would be to let it reopen the clipboard
-	// by means getting rid of the following lines above:
-	//if (aBuf)
-	//	return 0;
-	// However, that has the risks described in the comments above those two lines.
+	Close();
 	return mLength;
 }
 
@@ -222,13 +184,13 @@ LPTSTR Clipboard::PrepareForWrite(size_t aAllocSize)
 	// with 16-bit Windows. They are ignored.": GMEM_DDESHARE
 	if (   !(mClipMemNew = GlobalAlloc(GMEM_MOVEABLE, aAllocSize * sizeof(TCHAR)))   )
 	{
-		g_script.ScriptError(_T("GlobalAlloc"));  // Short error message since so rare.
+		MemoryError();
 		return NULL;
 	}
 	if (   !(mClipMemNewLocked = (LPTSTR)GlobalLock(mClipMemNew))   )
 	{
 		mClipMemNew = GlobalFree(mClipMemNew);  // This keeps mClipMemNew in sync with its state.
-		g_script.ScriptError(_T("GlobalLock")); // Short error message since so rare.
+		g_script.RuntimeError(ERR_INTERNAL_CALL, _T(""), FAIL);  // Generic error message since so rare.
 		return NULL;
 	}
 	mCapacity = (UINT)aAllocSize; // Keep mCapacity in sync with the state of mClipMemNewLocked.
@@ -313,7 +275,7 @@ ResultType Clipboard::AbortWrite(LPTSTR aErrorMessage)
 	if (mClipMemNew)
 		mClipMemNew = GlobalFree(mClipMemNew);
 	// Caller needs us to always return FAIL:
-	return *aErrorMessage ? g_script.ScriptError(aErrorMessage) : FAIL;
+	return *aErrorMessage ? g_script.RuntimeError(aErrorMessage) : FAIL;
 }
 
 
@@ -350,7 +312,7 @@ ResultType Clipboard::Close(LPTSTR aErrorMessage)
 	//	mClipMemNew = GlobalFree(mClipMemNew);
 	if (aErrorMessage && *aErrorMessage)
 		// Caller needs us to always return FAIL if an error was displayed:
-		return g_script.ScriptError(aErrorMessage);
+		return g_script.RuntimeError(aErrorMessage);
 
 	// Seems best not to reset mLength.  But it will quickly become out of date once
 	// the clipboard has been closed and other apps can use it.
@@ -368,7 +330,7 @@ HANDLE Clipboard::GetClipboardDataTimeout(UINT uFormat, BOOL *aNullIsOkay)
 // GetClipboardData() is unable to start a data stream from the application that actually serves up the data).
 // If cases where the first call to GetClipboardData() fails, a subsequent call will often succeed if you give
 // the owning application (such as Excel and Word) a little time to catch up.  This is especially necessary in
-// the OnClipboardChange label, where sometimes a clipboard-change notification comes in before the owning
+// the OnClipboardChange function, where sometimes a clipboard-change notification comes in before the owning
 // app has finished preparing its data for subsequent readers of the clipboard.
 {
 #ifdef DEBUG_BY_LOGGING_CLIPBOARD_FORMATS  // Provides a convenient log of clipboard formats for analysis.
@@ -437,8 +399,8 @@ HANDLE Clipboard::GetClipboardDataTimeout(UINT uFormat, BOOL *aNullIsOkay)
 #ifndef ENABLE_CLIPBOARDGETDATA_TIMEOUT
 	// v1.1.16: The timeout and retry behaviour of this function is currently disabled, since it does more
 	// harm than good.  It previously did NO GOOD WHATSOEVER, because SLEEP_WITHOUT_INTERRUPTION indirectly
-	// calls g_clip.Close() via CLOSE_CLIPBOARD_IF_OPEN, so any subsequent attempts to retrieve data by us
-	// or our caller always fail.  The main point of failure where retrying helps is OpenClipboard(), when
+	// called g_clip.Close() via CLOSE_CLIPBOARD_IF_OPEN, so any subsequent attempts to retrieve data by us
+	// or our caller always failed.  The main point of failure where retrying helps is OpenClipboard(), when
 	// another program has the clipboard open -- and that's handled elsewhere.  If the timeout is re-enabled
 	// for this function, the following format will need to be excluded to prevent unnecessary delays:
 	//  - FileContents (CSTR_FILECONTENTS): MSDN says it is used "to transfer data as if it were a file,

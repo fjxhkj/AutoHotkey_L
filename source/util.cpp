@@ -78,10 +78,11 @@ int GetISOWeekNumber(LPTSTR aBuf, int aYear, int aYDay, int aWDay)
 
 
 
-ResultType YYYYMMDDToFileTime(LPTSTR aYYYYMMDD, FILETIME &aFileTime)
+ResultType YYYYMMDDToFileTime(LPCTSTR aYYYYMMDD, FILETIME &aFileTime)
 {
 	SYSTEMTIME st;
-	YYYYMMDDToSystemTime(aYYYYMMDD, st, false);  // "false" because it's validated below.
+	if (!YYYYMMDDToSystemTime(aYYYYMMDD, st, false))  // "false" because it's validated below.
+		return FAIL;
 	// This will return failure if aYYYYMMDD contained any invalid elements, such as an
 	// explicit zero for the day of the month.  It also reports failure if st.wYear is
 	// less than 1601, which for simplicity is enforced globally throughout the program
@@ -91,9 +92,10 @@ ResultType YYYYMMDDToFileTime(LPTSTR aYYYYMMDD, FILETIME &aFileTime)
 
 
 
-DWORD YYYYMMDDToSystemTime2(LPTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime)
+DWORD YYYYMMDDToSystemTime2(LPCTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime)
 // Calls YYYYMMDDToSystemTime() to fill up to two elements of the aSystemTime array.
-// Returns a GDTR bitwise combination to indicate which of the two elements, or both, are valid.
+// Returns 0 if the parameter is empty or invalid, otherwise a GDTR bitwise combination
+// to indicate which of the two elements, or both, are present.
 // Caller must ensure that aYYYYMMDD is a modifiable string since it's temporarily altered and restored here.
 {
 	DWORD gdtr = 0;
@@ -101,16 +103,21 @@ DWORD YYYYMMDDToSystemTime2(LPTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime)
 		return gdtr;
 	if (*aYYYYMMDD != '-') // Since first char isn't a dash, there is a minimum present.
 	{
-		LPTSTR cp;
+		TCHAR temp[16];
+		tcslcpy(temp, aYYYYMMDD, _countof(temp));
+		LPCTSTR cp, first = aYYYYMMDD;
 		if (cp = _tcschr(aYYYYMMDD + 1, '-'))
-			*cp = '\0'; // Temporarily terminate in case only the leading part of the YYYYMMDD format is present.  Otherwise, the dash and other chars would be considered invalid fields.
-		if (YYYYMMDDToSystemTime(aYYYYMMDD, aSystemTime[0], true)) // Date string is valid.
+		{
+			// Temporarily terminate; otherwise, the dash and other chars would be considered invalid fields.
+			auto n = min(cp - aYYYYMMDD, _countof(temp) - 1);
+			tmemcpy(temp, aYYYYMMDD, n);
+			temp[n] = '\0';
+			first = temp;
+		}
+		if (YYYYMMDDToSystemTime(first, aSystemTime[0], true)) // Date string is valid.
 			gdtr |= GDTR_MIN; // Indicate that minimum is present.
 		if (cp)
-		{
-			*cp = '-'; // Undo the temp. termination.
 			aYYYYMMDD = cp + 1; // Set it to the maximum's position for use below.
-		}
 		else // No dash, so there is no maximum.  Indicate this by making aYYYYMMDD empty.
 			aYYYYMMDD = _T("");
 	}
@@ -120,24 +127,34 @@ DWORD YYYYMMDDToSystemTime2(LPTSTR aYYYYMMDD, SYSTEMTIME *aSystemTime)
 	{
 		if (YYYYMMDDToSystemTime(aYYYYMMDD, aSystemTime[1], true)) // Date string is valid.
 			gdtr |= GDTR_MAX; // Indicate that maximum is present.
+		else
+			gdtr = 0; // Indicate that the value is invalid.
 	}
 	return gdtr;
 }
 
 
 
-ResultType YYYYMMDDToSystemTime(LPTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool aDoValidate)
+ResultType YYYYMMDDToSystemTime(LPCTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool aValidateTimeValues)
 // Although aYYYYMMDD need not be terminated at the end of the YYYYMMDDHH24MISS string (as long as
 // the string's capacity is at least 14), it should be terminated if only the leading part
 // of the YYYYMMDDHH24MISS format is present.
-// Caller must ensure that aYYYYMMDD is non-NULL.  If aDoValidate is false, OK is always
-// returned and aSystemTime might contain invalid elements.  Otherwise, FAIL will be returned
-// if the date and time contains any invalid elements, or if the year is less than 1601
-// (Windows generally does not support earlier years).
+// Caller must ensure that aYYYYMMDD is non-NULL.  If the string's length is not an even number
+// between 4 and 14 (inclusive), FAIL is returned.  FAIL is also returned if aValidateTimeValues
+// is true and some elements of aYYYYMMDD were invalid, or if the year is less than 1601
+// (Windows generally does not support earlier years).  Otherwise OK is returned.
 {
 	// sscanf() is avoided because it adds 2 KB to the compressed EXE size.
+	// Alternative approaches were tried to further reduce size but ultimately had the opposite effect:
+	//  - Parse each sequence of digits inline; e.g. (t[0] - '0') * 10 + (t[1] - '0') ...
+	//  - Parse with istrtoi64() and use division and modulo to extract each component.
+	//  - tcslcpy() once and take each component from the right, re-terminating instead of copying each.
 	TCHAR temp[16];
 	size_t length = _tcslen(aYYYYMMDD); // Use this rather than incrementing the pointer in case there are ever partial fields such as 20051 vs. 200501.
+	
+	// Callers who check the return value expect this to be done even when !aValidateTimeValues:
+	if (length < 4 || (length & 1) || length > 14 || !IsNumeric(aYYYYMMDD, false, false))
+		return FAIL;
 
 	tcslcpy(temp, aYYYYMMDD, 5);
 	aSystemTime.wYear = _ttoi(temp);
@@ -198,13 +215,13 @@ ResultType YYYYMMDDToSystemTime(LPTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool 
 	else // Month is in-range, which is necessary for the method below to work safely.
 	{
 		// Day-of-week code by Tomohiko Sakamoto:
-		static int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+		static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
 		int y = aSystemTime.wYear;
 		y -= aSystemTime.wMonth < 3;
 		aSystemTime.wDayOfWeek = (y + y/4 - y/100 + y/400 + t[aSystemTime.wMonth-1] + aSystemTime.wDay) % 7;
 	}
 
-	if (aDoValidate)
+	if (aValidateTimeValues)
 	{
 		FILETIME ft;
 		// This will return failure if aYYYYMMDD contained any invalid elements, such as an
@@ -238,10 +255,6 @@ LPTSTR FileTimeToYYYYMMDD(LPTSTR aBuf, FILETIME &aTime, bool aConvertToLocalTime
 
 
 LPTSTR SystemTimeToYYYYMMDD(LPTSTR aBuf, SYSTEMTIME &aTime)
-// Returns aBuf.
-// Remember not to offer a "aConvertToLocalTime" option, because calling SystemTimeToTzSpecificLocalTime()
-// on Win9x apparently results in an invalid time because the function is implemented only as a stub on
-// those OSes.
 {
 	_stprintf(aBuf, _T("%04d%02d%02d") _T("%02d%02d%02d")
 		, aTime.wYear, aTime.wMonth, aTime.wDay
@@ -251,19 +264,21 @@ LPTSTR SystemTimeToYYYYMMDD(LPTSTR aBuf, SYSTEMTIME &aTime)
 
 
 
-__int64 YYYYMMDDSecondsUntil(LPTSTR aYYYYMMDDStart, LPTSTR aYYYYMMDDEnd, bool &aFailed)
+__int64 YYYYMMDDSecondsUntil(LPCTSTR aYYYYMMDDStart, LPCTSTR aYYYYMMDDEnd, FResult &aStatus)
 // Returns the number of seconds from aYYYYMMDDStart until aYYYYMMDDEnd.
 // If aYYYYMMDDStart is blank, the current time will be used in its place.
 {
-	aFailed = true;  // Set default for output parameter, in case of early return.
-	if (!aYYYYMMDDStart || !aYYYYMMDDEnd) return 0;
+	ASSERT(aYYYYMMDDStart && aYYYYMMDDEnd);
 
 	FILETIME ftStart, ftEnd, ftNowUTC;
 
 	if (*aYYYYMMDDStart)
 	{
 		if (!YYYYMMDDToFileTime(aYYYYMMDDStart, ftStart))
+		{
+			aStatus = FR_E_ARG(1);
 			return 0;
+		}
 	}
 	else // Use the current time in its place.
 	{
@@ -273,14 +288,17 @@ __int64 YYYYMMDDSecondsUntil(LPTSTR aYYYYMMDDStart, LPTSTR aYYYYMMDDEnd, bool &a
 	if (*aYYYYMMDDEnd)
 	{
 		if (!YYYYMMDDToFileTime(aYYYYMMDDEnd, ftEnd))
+		{
+			aStatus = FR_E_ARG(0);
 			return 0;
+		}
 	}
 	else // Use the current time in its place.
 	{
 		GetSystemTimeAsFileTime(&ftNowUTC);
 		FileTimeToLocalFileTime(&ftNowUTC, &ftEnd);  // Convert UTC to local time.
 	}
-	aFailed = false;  // Indicate success.
+	aStatus = OK;  // Indicate success.
 	return FileTimeSecondsUntil(&ftStart, &ftEnd);
 }
 
@@ -305,7 +323,7 @@ __int64 FileTimeSecondsUntil(FILETIME *pftStart, FILETIME *pftEnd)
 
 
 
-SymbolType IsPureNumeric(LPCTSTR aBuf, BOOL aAllowNegative, BOOL aAllowAllWhitespace
+SymbolType IsNumeric(LPCTSTR aBuf, BOOL aAllowNegative, BOOL aAllowAllWhitespace
 	, BOOL aAllowFloat, BOOL aAllowImpure)  // BOOL vs. bool might squeeze a little more performance out of this frequently-called function.
 // String can contain whitespace.
 // If aBuf doesn't contain something purely numeric, PURE_NOT_NUMERIC is returned.  The same happens if
@@ -340,6 +358,7 @@ SymbolType IsPureNumeric(LPCTSTR aBuf, BOOL aAllowNegative, BOOL aAllowAllWhites
 
 	// Set defaults:
 	BOOL has_decimal_point = false;
+	BOOL has_exponent = false;
 	BOOL has_at_least_one_digit = false; // i.e. a string consisting of only "+", "-" or "." is not considered numeric.
 	int c; // int vs. char might squeeze a little more performance out of it (it does reduce code size by 5 bytes). Probably must stay signed vs. unsigned for some of the uses below.
 
@@ -360,7 +379,7 @@ SymbolType IsPureNumeric(LPCTSTR aBuf, BOOL aAllowNegative, BOOL aAllowAllWhites
 			break; // The number qualifies as pure, so fall through to the logic at the bottom. (It would already have returned elsewhere in the loop if the number is impure).
 		if (c == '.')
 		{
-			if (!aAllowFloat || has_decimal_point || is_hex) // If aAllowFloat==false, a decimal point at the very end of the number is considered non-numeric even if aAllowImpure==true.  Some callers like "case ACT_ADD" might rely on this.
+			if (!aAllowFloat || has_decimal_point || is_hex) // If aAllowFloat==false, a decimal point at the very end of the number is considered non-numeric even if aAllowImpure==true.  Some callers might rely on this.
 				// i.e. if aBuf contains 2 decimal points, it can't be a valid number.
 				// Note that decimal points are allowed in hexadecimal strings, e.g. 0xFF.EE.
 				// But since that format doesn't seem to be supported by VC++'s atof() and probably
@@ -382,18 +401,19 @@ SymbolType IsPureNumeric(LPCTSTR aBuf, BOOL aAllowNegative, BOOL aAllowAllWhites
 				}
 				else
 				{
-					// As written below, this actually tolerates malformed scientific notation such as numbers
-					// containing two or more E's (e.g. 1.0e4e+5e-6,).  But for performance and due to rarity,
-					// it seems best not to check for them.
 					if (ctoupper(c) != 'E' // v1.0.46.11: Support scientific notation in floating point numbers.
-						|| !(has_decimal_point && has_at_least_one_digit)) // But it must have a decimal point and at least one digit to the left of the 'E'. This avoids variable names like "1e4" from being seen as sci-notation literals (for backward compatibility). Some callers rely on this check.
+						|| !has_at_least_one_digit // But it must have at least one digit to the left of the 'E'. Some callers rely on this check.
+						|| has_exponent
+						|| !aAllowFloat)
 						return PURE_NOT_NUMERIC;
 					if (aBuf[1] == '-' || aBuf[1] == '+') // The optional sign is present on the exponent.
 						++aBuf; // Omit it from further consideration so that the outer loop doesn't see it as an extra/illegal sign.
 					if (aBuf[1] < '0' || aBuf[1] > '9')
 						// Even if it is an 'e', ensure what follows it is a valid exponent.  Some callers rely
-						// on this check, such as ones that expect "0.6e" to be non-numeric (for "SetFormat Float") 
+						// on this check, such as ones that expect "0.6e" to be non-numeric.
 						return PURE_NOT_NUMERIC;
+					has_exponent = true;
+					has_decimal_point = true; // For simplicity, since a decimal point after the exponent isn't valid.
 				}
 			}
 			else // This character is a valid digit or hex-digit.
@@ -884,6 +904,173 @@ ret0:
 
 
 
+template<typename T> T digitsTo(LPCTSTR p, LPCTSTR &end)
+{
+	T i = 0;
+	for (;; ++p)
+	{
+		int c = *p;
+		if (c <= '9' && c >= '0')
+			c -= '0';
+		else
+			break;
+		i = i * 10 + c;
+	}
+	end = p;
+	return i;
+}
+
+
+template<typename T> T xdigitsTo(LPCTSTR p, LPCTSTR &end)
+{
+	T i = 0;
+	for (;; ++p)
+	{
+		int c = *p;
+		if (c <= '9' && c >= '0')
+			c -= '0';
+		else if (c <= 'F' && c >= 'A')
+			c -= 'A' - 10;
+		else if (c <= 'f' && c >= 'a')
+			c -= 'a' - 10;
+		else
+			break;
+		i = i * 16 + c;
+	}
+	end = p;
+	return i;
+}
+
+
+// istrtoi64(): like _tcstoi64, but allows wrapping overflow consistent with
+// arithmetic expressions.  Some behaviour may be unlike _tcstoi64/strtoll:
+//  - Decimal and hexadecimal are always supported; caller cannot specify base.
+//  - A leading '0' does not activate base 8, since we specifically don't want that.
+//  - Only space and tab are considered whitespace, consistent with IsNumeric().
+//  - errno is never set.
+__int64 istrtoi64(LPCTSTR buf, LPCTSTR *endptr)
+{
+	// unsigned vs. signed is unlikely to matter in practice, but only unsigned has
+	// well-defined behaviour regarding overflow (that is, it wraps but technically
+	// never "overflows" according to the standard).
+	UINT64 i;
+
+	// Skip spaces and tabs.
+	LPCTSTR p = omit_leading_whitespace(buf);
+	
+	// Determine/skip sign.
+	bool negative = *p == '-';
+	if (negative || *p == '+')
+		++p;
+
+	LPCTSTR end;
+	if (IS_HEX(p))
+	{
+		p += 2;
+		i = xdigitsTo<UINT64>(p, end);
+	}
+	else
+	{
+		i = digitsTo<UINT64>(p, end);
+	}
+	if (endptr)
+		*endptr = p == end ? buf : end; // Don't consider " -" or "-0x" numeric on its own.
+	// Casting out of range unsigned to signed has "implementation defined" behaviour;
+	// Microsoft's implementation does not change the bit pattern.
+	return negative ? -(__int64)i : (__int64)i;
+}
+
+
+// nstrtoi64(): like istrtoi64, but permits scientific notation (including a decimal
+// fraction, which may be significant in combination with the exponent).
+// This function is mostly identical to istrtoi64, so comments there also apply here.
+// Attempts to merge the two functions resulted in 300-1000 bytes larger code size due
+// to inlining, how heavily these are used, and the fact that omitted parameters are
+// actually still passed by the compiler.
+__int64 nstrtoi64(LPCTSTR buf)
+{
+	UINT64 i;
+
+	LPCTSTR p = omit_leading_whitespace(buf);
+
+	bool negative = *p == '-';
+	if (negative || *p == '+')
+		++p;
+
+	if (IS_HEX(p))
+	{
+		p += 2;
+		i = xdigitsTo<UINT64>(p, p);
+	}
+	else // Decimal.
+	{
+		i = digitsTo<UINT64>(p, p);
+
+		// Check for a decimal fraction/exponent:
+		LPCTSTR end_int = p;
+		if (*p == '.')
+		{
+			do ++p;
+			while (*p <= '9' && *p >= '0');
+		}
+		LPCTSTR end_fraction = p;
+		if (*p == 'e' || *p == 'E')
+		{
+			++p;
+			bool exp_negative = *p == '-';
+			if (exp_negative || *p == '+')
+				++p;
+			UINT64 exp = digitsTo<UINT64>(p, p); // UINT64 vs. char does not affect code size; using UINT64 ensures that unreasonably large exponents produce a consistent result.
+			if (p > end_fraction + 1) // Exponent present.
+			{
+				if (!exp_negative && *end_int == '.')
+				{
+					// Parse additional digits while simultaneously applying part of the exponentiation.
+					for (p = end_int + 1; p < end_fraction && exp; ++p, --exp) // Scan from '.' to 'e'
+						i = i * 10 + (*p - '0');
+				}
+				if (exp >= (exp_negative ? 20 : 64)) // Avoid unnecessary looping for abnormally large exponents.
+				{
+					// For n * 10**64, the low 64 bits of the result are always 0.  
+					// For n / 10**20, the result is always 0 since 10**20 > _UI16_MAX > n.
+					i = 0;
+				}
+				else
+				{
+					// This section multiplies or divides i by a power of 10 without resorting to
+					// floating-point operations.  Overflow of the result is allowed and will wrap,
+					// but to get the correct result we must not wrap the multiplier.
+					while (exp >= 20) // Implies !exp_negative.  10**20 won't fit in multiplier.
+					{
+						i *= 10000000000000000000ui64;
+						exp -= 19;
+					}
+					if (exp != 0) // An exponent of 0 is valid but does not alter the result.
+					{
+						// Perform exponentiation by squaring.
+						UINT64 multiplier = 1;
+						UINT64 bs = 10;
+						while (exp > 1)
+						{
+							if (exp & 1) multiplier *= bs;
+							exp >>= 1;
+							bs *= bs;
+						}
+						multiplier *= bs;
+						if (exp_negative)
+							i /= multiplier;
+						else
+							i *= multiplier;
+					}
+				}
+			}
+		}
+	}
+	return negative ? -(__int64)i : (__int64)i;
+}
+
+
+
 UINT StrReplace(LPTSTR aHaystack, LPTSTR aOld, LPTSTR aNew, StringCaseSenseType aStringCaseSense
 	, UINT aLimit, size_t aSizeLimit, LPTSTR *aDest, size_t *aHaystackLength)
 // Replaces all (or aLimit) occurrences of aOld with aNew in aHaystack.
@@ -1232,7 +1419,7 @@ size_t PredictReplacementSize(ptrdiff_t aLengthDelta, int aReplacementCount, int
 
 
 
-LPTSTR TranslateLFtoCRLF(LPTSTR aString)
+LPTSTR TranslateLFtoCRLF(LPCTSTR aString)
 // Can't use StrReplace() for this because any CRLFs originally present in aString are not changed (i.e. they
 // don't become CRCRLF) [there may be other reasons].
 // Translates any naked LFs in aString to CRLF.  If there are none, the original string is returned.
@@ -1241,9 +1428,8 @@ LPTSTR TranslateLFtoCRLF(LPTSTR aString)
 {
 	UINT naked_LF_count = 0;
 	size_t length = 0;
-	LPTSTR cp;
 
-	for (cp = aString; *cp; ++cp)
+	for (auto cp = aString; *cp; ++cp)
 	{
 		++length;
 		if (*cp == '\n' && (cp == aString || cp[-1] != '\r')) // Relies on short-circuit boolean order.
@@ -1251,16 +1437,16 @@ LPTSTR TranslateLFtoCRLF(LPTSTR aString)
 	}
 
 	if (!naked_LF_count)
-		return aString;  // The original string is returned, which the caller must check for (vs. new string).
+		return const_cast<LPTSTR>(aString);
 
 	// Allocate the new memory that will become the caller's responsibility:
-	LPTSTR buf = (LPTSTR)tmalloc(length + naked_LF_count + 1);  // +1 for zero terminator.
+	LPTSTR buf = tmalloc(length + naked_LF_count + 1);  // +1 for zero terminator.
 	if (!buf)
-		return NULL;
+		return nullptr;
 
 	// Now perform the translation.
 	LPTSTR dp = buf; // Destination.
-	for (cp = aString; *cp; ++cp)
+	for (auto cp = aString; *cp; ++cp)
 	{
 		if (*cp == '\n' && (cp == aString || cp[-1] != '\r')) // Relies on short-circuit boolean order.
 			*dp++ = '\r';  // Insert an extra CR here, then insert the '\n' normally below.
@@ -1273,7 +1459,7 @@ LPTSTR TranslateLFtoCRLF(LPTSTR aString)
 
 
 
-bool DoesFilePatternExist(LPTSTR aFilePattern, DWORD *aFileAttr)
+bool DoesFilePatternExist(LPCTSTR aFilePattern, DWORD *aFileAttr, DWORD aRequiredAttr)
 // Returns true if the file/folder exists or false otherwise.
 // If non-NULL, aFileAttr's DWORD is set to the attributes of the file/folder if a match is found.
 // If there is no match, its contents are undefined.
@@ -1283,13 +1469,30 @@ bool DoesFilePatternExist(LPTSTR aFilePattern, DWORD *aFileAttr)
 	// Such volume names are obtained from GetVolumeNameForVolumeMountPoint() and perhaps other functions.
 	// However, testing shows that wildcards beyond that first one should be seen as real wildcards
 	// because the wildcard match-method below does work for such volume names.
-	LPTSTR cp = _tcsncmp(aFilePattern, _T("\\\\?\\"), 4) ? aFilePattern : aFilePattern + 4;
+	auto cp = _tcsncmp(aFilePattern, _T("\\\\?\\"), 4) ? aFilePattern : aFilePattern + 4;
 	if (StrChrAny(cp, _T("?*")))
 	{
 		WIN32_FIND_DATA wfd;
 		HANDLE hFile = FindFirstFile(aFilePattern, &wfd);
 		if (hFile == INVALID_HANDLE_VALUE)
 			return false;
+		// Skip . and .., which appear to always be listed first (for dir\* and dir\*.*).
+		while (wfd.cFileName[0] == '.' && (!wfd.cFileName[1] || wfd.cFileName[1] == '.' && !wfd.cFileName[2]))
+			if (!FindNextFile(hFile, &wfd))
+			{
+				FindClose(hFile);
+				return false;
+			}
+		if (aRequiredAttr) // Caller wants to check for a file/folder with specific attributes.
+		{
+			while ((wfd.dwFileAttributes & aRequiredAttr) != aRequiredAttr)
+				if (!FindNextFile(hFile, &wfd))
+				{
+					FindClose(hFile);
+					return false;
+				}
+			// Since above didn't return, a file/folder with the required attribute was found.
+		}
 		FindClose(hFile);
 		if (aFileAttr)
 			*aFileAttr = wfd.dwFileAttributes;
@@ -1298,6 +1501,8 @@ bool DoesFilePatternExist(LPTSTR aFilePattern, DWORD *aFileAttr)
     else
 	{
 		DWORD attr = GetFileAttributes(aFilePattern);
+		if (aRequiredAttr && (attr & aRequiredAttr) != aRequiredAttr)
+			return false;
 		if (aFileAttr)
 			*aFileAttr = attr;
 		return attr != 0xFFFFFFFF;
@@ -1306,61 +1511,45 @@ bool DoesFilePatternExist(LPTSTR aFilePattern, DWORD *aFileAttr)
 
 
 
-#ifdef _DEBUG
-ResultType FileAppend(LPTSTR aFilespec, LPTSTR aLine, bool aAppendNewline)
+LPTSTR ConvertFilespecToCorrectCase(LPTSTR aFilespec, LPTSTR aBuf, size_t aBufSize, size_t &aBufLength)
+// Convert aFilespec to proper case and put the result into aBuf.
+// aFilespec and aBuf must not overlap.
+// aFilespec should be modifiable, but on return always has its original value.
+// aBufSize is the size of aBuf in WCHARs, including space for the null-terminator;
+// it should be large enough to allow expansion of short (8.3) names to long names.
+// If the final path would exceed aBufSize or if the conversion could not be completed,
+// returns NULL and leaves aBufLength unchanged; otherwise returns aBuf and sets
+// aBufLength to its length.
+// Note: GetFullPathName() doesn't perform case-correction, only string manipulation.
+// GetLongPathName() skips name components which are not 8.3-compliant.
 {
-	if (!aFilespec || !aLine) return FAIL;
-	if (!*aFilespec) return FAIL;
-	FILE *fp = _tfopen(aFilespec, _T("a"));
-	if (fp == NULL)
-		return FAIL;
-	_fputts(aLine, fp);
-	if (aAppendNewline)
-		_puttc('\n', fp);
-	fclose(fp);
-	return OK;
-}
-#endif
-
-
-
-LPTSTR ConvertFilespecToCorrectCase(LPTSTR aFullFileSpec)
-// aFullFileSpec must be a modifiable string since it will be converted to proper case.
-// Also, it should be at least MAX_PATH is size because if it contains any short (8.3)
-// components, they will be converted into their long names.
-// Returns aFullFileSpec, the contents of which have been converted to the case used by the
-// file system.  Note: The trick of changing the current directory to be that of
-// aFullFileSpec and then calling GetFullPathName() doesn't always work.  So perhaps the
-// only easy way is to call FindFirstFile() on each directory that composes aFullFileSpec,
-// which is what is done here.  I think there's another way involving some PIDL Explorer
-// function, but that might not support UNCs correctly.
-{
-	if (!aFullFileSpec || !*aFullFileSpec) return aFullFileSpec;
-	size_t length = _tcslen(aFullFileSpec);
-	if (length < 2 || length >= MAX_PATH) return aFullFileSpec;
+	ASSERT(aBufSize > 3);
+	ASSERT(aFilespec != aBuf);
+	if (!*aFilespec)
+		return NULL;
+	LPTSTR dir_start, dir_end;
+	size_t built_length;
 	// Start with something easy, the drive letter:
-	if (aFullFileSpec[1] == ':')
-		aFullFileSpec[0] = ctoupper(aFullFileSpec[0]);
-	// else it might be a UNC that has no drive letter.
-	TCHAR built_filespec[MAX_PATH], *dir_start, *dir_end;
-	if (dir_start = _tcschr(aFullFileSpec, ':'))
-		// MSDN: "To examine any directory other than a root directory, use an appropriate
-		// path to that directory, with no trailing backslash. For example, an argument of
-		// "C:\windows" will return information about the directory "C:\windows", not about
-		// any directory or file in "C:\windows". An attempt to open a search with a trailing
-		// backslash will always fail."
-		dir_start += 2; // Skip over the first backslash that goes with the drive letter.
+	if (aFilespec[1] == ':' && aFilespec[2] == '\\')
+	{
+		aBuf[0] = ctoupper(aFilespec[0]);
+		aBuf[1] = ':';
+		aBuf[2] = '\\';
+		// MSDN: "An attempt to open a search with a trailing backslash will always fail."
+		dir_start = aFilespec + 3; // Skip over the first backslash that goes with the drive letter.
+		built_length = 3;
+	}
 	else // it's probably a UNC
 	{
-		if (_tcsncmp(aFullFileSpec, _T("\\\\"), 2))
+		if (_tcsncmp(aFilespec, _T("\\\\"), 2))
 			// It doesn't appear to be a UNC either, so not sure how to deal with it.
-			return aFullFileSpec;
+			return NULL;
 		// I think MS says you can't use FindFirstFile() directly on a share name, so we
 		// want to omit both that and the server name from consideration (i.e. we don't attempt
 		// to find their proper case).  MSDN: "Similarly, on network shares, you can use an
 		// lpFileName of the form "\\server\service\*" but you cannot use an lpFileName that
 		// points to the share itself, such as "\\server\service".
-		dir_start = aFullFileSpec + 2;
+		dir_start = aFilespec + 2;
 		LPTSTR end_of_server_name = _tcschr(dir_start, '\\');
 		if (end_of_server_name)
 		{
@@ -1369,32 +1558,56 @@ LPTSTR ConvertFilespecToCorrectCase(LPTSTR aFullFileSpec)
 			if (end_of_share_name)
 				dir_start = end_of_share_name + 1;
 		}
+		built_length = dir_start - aFilespec;
+		if (built_length >= aBufSize) // Too long.
+			return NULL;
+		tmemcpy(aBuf, aFilespec, built_length);
 	}
-	// Init the new string (the filespec we're building), e.g. copy just the "c:\\" part.
-	tcslcpy(built_filespec, aFullFileSpec, dir_start - aFullFileSpec + 1);
 	WIN32_FIND_DATA found_file;
+	size_t found_length;
 	HANDLE file_search;
-	for (dir_end = dir_start; dir_end = _tcschr(dir_end, '\\'); ++dir_end)
+	for ( ; dir_end = _tcschr(dir_start, '\\'); dir_start = dir_end + 1)
 	{
 		*dir_end = '\0';  // Temporarily terminate.
-		file_search = FindFirstFile(aFullFileSpec, &found_file);
+		file_search = FindFirstFile(aFilespec, &found_file);
 		*dir_end = '\\'; // Restore it before we do anything else.
 		if (file_search == INVALID_HANDLE_VALUE)
-			return aFullFileSpec;
+			return NULL;
 		FindClose(file_search);
 		// Append the case-corrected version of this directory name:
-		sntprintfcat(built_filespec, _countof(built_filespec), _T("%s\\"), found_file.cFileName);
+		found_length = _tcslen(found_file.cFileName);
+		if (built_length + found_length + 1 > aBufSize) // Too long (+1 for the slash).
+			return NULL;
+		tmemcpy(aBuf + built_length, found_file.cFileName, found_length);
+		built_length += found_length;
+		aBuf[built_length++] = '\\';
 	}
-	// Now do the filename itself:
-	if (   (file_search = FindFirstFile(aFullFileSpec, &found_file)) == INVALID_HANDLE_VALUE   )
-		return aFullFileSpec;
-	FindClose(file_search);
-	sntprintfcat(built_filespec, _countof(built_filespec), _T("%s"), found_file.cFileName);
-	// It might be possible for the new one to be longer than the old, e.g. if some 8.3 short
-	// names were converted to long names by the process.  Thus, the caller should ensure that
-	// aFullFileSpec is large enough:
-	_tcscpy(aFullFileSpec, built_filespec);
-	return aFullFileSpec;
+	if (*dir_start) // Not a path ending in '\\'.
+	{
+		// Now do the filename itself:
+		if (   (file_search = FindFirstFile(aFilespec, &found_file)) == INVALID_HANDLE_VALUE   )
+			return NULL;
+		FindClose(file_search);
+		found_length = _tcslen(found_file.cFileName);
+		if (built_length + found_length > aBufSize) // Too long.
+			return NULL;
+		tmemcpy(aBuf + built_length, found_file.cFileName, found_length);
+		built_length += found_length;
+	}
+	aBuf[built_length] = '\0';
+	aBufLength = built_length;
+	return aBuf;
+}
+
+
+
+void ConvertFilespecToCorrectCase(LPTSTR aBuf, size_t aBufSize, size_t &aBufLength)
+{
+	TCHAR built_filespec[T_MAX_PATH];
+	if (aBufSize > _countof(built_filespec))
+		aBufSize = _countof(built_filespec);
+	if (ConvertFilespecToCorrectCase(aBuf, built_filespec, aBufSize, aBufLength))
+		tmemcpy(aBuf, built_filespec, aBufLength + 1);
 }
 
 
@@ -1422,6 +1635,8 @@ LPTSTR FileAttribToStr(LPTSTR aBuf, DWORD aAttr)
 		aBuf[length++] = 'C';
 	if (aAttr & FILE_ATTRIBUTE_TEMPORARY)
 		aBuf[length++] = 'T';
+	if (aAttr & FILE_ATTRIBUTE_REPARSE_POINT)
+		aBuf[length++] = 'L';
 	aBuf[length] = '\0';  // Perform the final termination.
 	return aBuf;
 }
@@ -1440,7 +1655,7 @@ unsigned __int64 GetFileSize64(HANDLE aFileHandle)
 
 
 
-LPTSTR GetLastErrorText(LPTSTR aBuf, int aBufSize, bool aUpdateLastError)
+LPTSTR GetWin32ErrorText(LPTSTR aBuf, DWORD aBufSize, DWORD aError)
 // aBufSize is an int to preserve any negative values the caller might pass in.
 {
 	if (aBufSize < 1)
@@ -1450,10 +1665,8 @@ LPTSTR GetLastErrorText(LPTSTR aBuf, int aBufSize, bool aUpdateLastError)
 		*aBuf = '\0';
 		return aBuf;
 	}
-	DWORD last_error = GetLastError();
-	if (aUpdateLastError)
-		g->LastError = last_error;
-	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, last_error, 0, aBuf, (DWORD)aBufSize - 1, NULL);
+	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS // Ignore inserts: https://blogs.msdn.microsoft.com/oldnewthing/20071128-00/?p=24353
+		, NULL, aError, 0, aBuf, (DWORD)aBufSize - 1, NULL);
 	return aBuf;
 }
 
@@ -1465,18 +1678,15 @@ void AssignColor(LPTSTR aColorName, COLORREF &aColor, HBRUSH &aBrush)
 // be determined, it will always be set to CLR_DEFAULT (and aBrush set to NULL to match).
 // It will never be set to CLR_NONE.
 {
-	COLORREF color;
-	if (!*aColorName)
-		color = CLR_DEFAULT;
-	else
-	{
-		color = ColorNameToBGR(aColorName);
-		if (color == CLR_NONE) // A matching color name was not found, so assume it's a hex color value.
-			// It seems strtol() automatically handles the optional leading "0x" if present:
-			color = rgb_to_bgr(_tcstol(aColorName, NULL, 16));
-			// if aColorName does not contain something hex-numeric, black (0x00) will be assumed,
-			// which seems okay given how rare such a problem would be.
-	}
+	COLORREF color = 0;
+	ColorToBGR(aColorName, color);
+	AssignColor(color, aColor, aBrush);
+}
+
+
+
+void AssignColor(COLORREF color, COLORREF &aColor, HBRUSH &aBrush)
+{
 	if (color != aColor) // It's not already the right color.
 	{
 		aColor = color; // Set default.  v1.0.44.09: Added this line to fix the inability to change to a previously selected color after having changed to the default color.
@@ -1492,7 +1702,29 @@ void AssignColor(LPTSTR aColorName, COLORREF &aColor, HBRUSH &aBrush)
 
 
 
-COLORREF ColorNameToBGR(LPTSTR aColorName)
+bool ColorToBGR(LPCTSTR aColorNameOrRGB, COLORREF &aBGR)
+{
+	if (!*aColorNameOrRGB)
+		aBGR = CLR_DEFAULT;
+	else
+	{
+		aBGR = ColorNameToBGR(aColorNameOrRGB);
+		if (aBGR == CLR_NONE) // A matching color name was not found, so assume it's a hex color value.
+		{
+			wchar_t *endptr;
+			// It seems _tcstol() automatically handles the optional leading "0x" if present:
+			aBGR = rgb_to_bgr(_tcstol(aColorNameOrRGB, &endptr, 16));
+			// If the leading part of aColorNameOrRGB was not hex-numeric, black (0x00) will be assumed.
+			// The return value will indicate whether the value was entirely a valid hex number.
+			return !*endptr;
+		}
+	}
+	return true;
+}
+
+
+
+COLORREF ColorNameToBGR(LPCTSTR aColorName)
 // These are the main HTML color names.  Returns CLR_NONE if a matching HTML color name can't be found.
 // Returns CLR_DEFAULT only if aColorName is the word Default.
 {
@@ -1624,24 +1856,8 @@ void CoordToScreen(POINT &aPoint, int aWhichMode)
 
 
 
-void GetVirtualDesktopRect(RECT &aRect)
-{
-	aRect.right = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-	if (aRect.right) // A non-zero value indicates the OS supports multiple monitors or at least SM_CXVIRTUALSCREEN.
-	{
-		aRect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);  // Might be negative or greater than zero.
-		aRect.right += aRect.left;
-		aRect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);   // Might be negative or greater than zero.
-		aRect.bottom = aRect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
-	}
-	else // Win95/NT do not support SM_CXVIRTUALSCREEN and such, so zero was returned.
-		GetWindowRect(GetDesktopWindow(), &aRect);
-}
-
-
-
 DWORD GetEnvVarReliable(LPCTSTR aEnvVarName, LPTSTR aBuf)
-// Returns the length of what has been copied into aBuf.
+// Returns the length of what has been copied into aBuf, not including the null terminator.
 // Caller has ensured that aBuf is large enough (though anything >=32767 is always large enough).
 // This function was added in v1.0.46.08 to fix a long-standing bug that was more fully revealed
 // by 1.0.46.07's reduction of DEREF_BUF_EXPAND_INCREMENT from 32 to 16K (which allowed the Win9x
@@ -1664,13 +1880,16 @@ DWORD GetEnvVarReliable(LPCTSTR aEnvVarName, LPTSTR aBuf)
 	//
 	// Don't use a size greater than 32767 because that will cause it to fail on Win95 (tested by Robert Yalkin).
 	// According to MSDN, 32767 is exactly large enough to handle the largest variable plus its zero terminator.
+	// Update in 2022: Testing on Windows 11 showed the actual limit to be much higher, perhaps only bounded by
+	// available memory.  Since this function is only used by A_ComSpec and the deprecated auto-env retrieval
+	// mechanism (and due to rarity of need), no attempt is made to support larger variables.
 	TCHAR buf[32767];
 	DWORD length = GetEnvironmentVariable(aEnvVarName, buf, _countof(buf));
 	// GetEnvironmentVariable() could be called twice, the first time to get the actual size.  But that would
 	// probably perform worse since GetEnvironmentVariable() is a very slow function.  In addition, it would
 	// add code complexity, so it seems best to fetch it into a large buffer then just copy it to dest-var.
-	if (length) // Probably always true under the conditions in effect for our callers.
-		tmemcpy(aBuf, buf, length + 1); // memcpy() usually benches a little faster than strcpy().
+	if (length && (size_t) length + 1 <= _countof(buf))
+		tmemcpy(aBuf, buf, (size_t) length + 1); // memcpy() usually benches a little faster than strcpy().
 	else // Failure. The buffer's contents might be undefined in this case.
 		*aBuf = '\0'; // Caller's buf should always have room for an empty string. So make it empty for maintainability, even if not strictly required by caller.
 	return length;
@@ -1731,13 +1950,6 @@ DWORD ReadRegString(HKEY aRootKey, LPTSTR aSubkey, LPTSTR aValueName, LPTSTR aBu
 
 
 
-#ifndef _WIN64
-// Load function dynamically to allow the program to launch on Win2k/XPSP1:
-typedef BOOL (WINAPI *PFN_IsWow64Process)(HANDLE, PBOOL);
-static PFN_IsWow64Process _IsWow64Process = (PFN_IsWow64Process)GetProcAddress(GetModuleHandle(_T("kernel32"))
-	, "IsWow64Process");
-#endif
-
 BOOL IsProcess64Bit(HANDLE aHandle)
 {
 	BOOL is32on64;
@@ -1750,22 +1962,21 @@ BOOL IsProcess64Bit(HANDLE aHandle)
 	// cause this, so for simplicity just assume the target process is 64-bit (like this one).
 	return TRUE;
 #else
-	if (_IsWow64Process && _IsWow64Process(GetCurrentProcess(), &is32on64))
+	if (IsWow64Process(GetCurrentProcess(), &is32on64))
 	{
 		if (is32on64)
 		{
 			// We're running under WOW64.  Since WOW64 only exists on 64-bit systems and on such systems
 			// 32-bit processes can run ONLY under WOW64, if the target process is also running under
 			// WOW64 it must be 32-bit; otherwise it must be 64-bit.
-			if (_IsWow64Process(aHandle, &is32on64))
+			if (IsWow64Process(aHandle, &is32on64))
 				return !is32on64;
 		}
 	}
 	// Since above didn't return, one of the following is true:
-	//  a) IsWow64Process doesn't exist, so the OS and all running processes must be 32-bit.
-	//  b) IsWow64Process failed on the first or second call.  MSDN isn't clear about what conditions
+	//  a) IsWow64Process failed on the first or second call.  MSDN isn't clear about what conditions
 	//     can cause this, so for simplicity just assume the target process is 32-bit (like this one).
-	//  c) The current process is not running under WOW64.  Since we know it is 32-bit (due to our use
+	//  b) The current process is not running under WOW64.  Since we know it is 32-bit (due to our use
 	//     of conditional compilation), the OS and all running processes must be 32-bit.
 	return FALSE;
 #endif
@@ -1779,7 +1990,7 @@ BOOL IsOS64Bit()
 #else
 	// If OS is 64-bit, this program must be running in WOW64.
 	BOOL is32on64;
-	if (_IsWow64Process && _IsWow64Process(GetCurrentProcess(), &is32on64))
+	if (IsWow64Process(GetCurrentProcess(), &is32on64))
 		return is32on64;
 	return FALSE;
 #endif
@@ -1797,7 +2008,7 @@ LPVOID AllocInterProcMem(HANDLE &aHandle, DWORD aSize, HWND aHwnd, DWORD aExtraA
 	// Even if the PID is our own, open the process anyway to simplify the code. After all, it would be
 	// pretty silly for a script to access its own ListViews via this method.
 	if (   !(aHandle = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | aExtraAccess, FALSE, pid))   )
-		return NULL; // Let ErrorLevel tell the story.
+		return NULL;
 	// Reason for using VirtualAllocEx(): When sending LVITEM structures to a control in a remote process, the
 	// structure and its pszText buffer must both be memory inside the remote process rather than in our own.
 	mem = VirtualAllocEx(aHandle, NULL, aSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -1817,8 +2028,46 @@ void FreeInterProcMem(HANDLE aHandle, LPVOID aMem)
 
 
 
-HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, int aIconNumber
-	, bool aUseGDIPlusIfAvailable)
+// Returns true if a tooltip created by ToolTip already has the given text.
+// MUST NOT call on Windows XP or earlier, due to limitations of TTM_GETTEXT there.
+bool ToolTipTextEquals(HWND aToolTipHwnd, LPCTSTR aText)
+{
+	TOOLINFO ti;
+	ti.cbSize = sizeof(ti);
+	ti.hwnd = NULL;
+	ti.uId = 0;
+	size_t len = _tcslen(aText);
+	LPTSTR buf = ti.lpszText = (LPTSTR)_malloca((len + 2) * sizeof(TCHAR));
+	if (!buf)
+		return false;
+	SendMessage(aToolTipHwnd, TTM_GETTEXT, len + 2, (LPARAM)&ti);
+	bool is_equal = !_tcscmp(aText, buf);
+	_freea(buf);
+	return is_equal;
+}
+
+
+
+int GetSystemTrayIconSize()
+{
+	// This requires Windows 10, version 1607 or later.
+	static auto GetDpiForWindow = (UINT (WINAPI *)(_In_ HWND hwnd))GetProcAddress(GetModuleHandle(_T("user32.dll")), "GetDpiForWindow");
+	// GetSystemMetrics returns values scaled to our base DPI (g_ScreenDPI).
+	int cx = GetSystemMetrics(SM_CXSMICON);
+	if (!GetDpiForWindow)
+		return cx;
+	// This should be accurate because the icons are to be displayed in Shell_TrayWnd (which is always
+	// the taskbar of the primary screen), and GetDpiForWindow uses the DPI awareness of the window.
+	// This differs from GetDpiForSystem, as it appears the "system DPI" is fixed at initial login
+	// and doesn't change after that.  Same for GetDpiForWindow(GetDesktopWindow()).
+	int dpi = GetDpiForWindow(FindWindow(_T("Shell_TrayWnd"), NULL));
+	return MulDiv(cx, dpi, g_ScreenDPI);
+}
+
+
+
+HBITMAP LoadPicture(LPCTSTR aFilespec, int aWidth, int aHeight, int &aImageType, int aIconNumber
+	, bool aUseGDIPlusIfAvailable, bool *apNoDelete, HMODULE *apModule)
 // Returns NULL on failure.
 // If aIconNumber > 0, an HICON or HCURSOR is returned (both should be interchangeable), never an HBITMAP.
 // However, aIconNumber==1 is treated as a special icon upon which LoadImage is given preference over ExtractIcon
@@ -1836,6 +2085,8 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 {
 	HBITMAP hbitmap = NULL;
 	aImageType = -1; // The type of image currently inside hbitmap.  Set default value for output parameter as "unknown".
+	if (apNoDelete)
+		*apNoDelete = false; // Set default.
 
 	if (!*aFilespec) // Allow blank filename to yield NULL bitmap (and currently, some callers do call it this way).
 		return NULL;
@@ -1843,7 +2094,34 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 	//if (aIconNumber < 0) // Allowed to be called this way by GUI and others (to avoid need for validation of user input there).
 	//	aIconNumber = 0; // Use the default behavior, which is "load icon or bitmap, whichever is most appropriate".
 
-	LPTSTR file_ext = _tcsrchr(aFilespec, '.');
+	bool script_passed_handle = false, script_owns_handle = false;
+	if (   !_tcsnicmp(aFilespec, _T("HICON:"), 6)
+		|| !_tcsnicmp(aFilespec, _T("HBITMAP:"), 8)   )
+	{
+		if (aFilespec[5] == ':') // hicon:
+		{
+			aImageType = IMAGE_ICON;
+			aFilespec += 6;
+		}
+		else
+		{
+			aImageType = IMAGE_BITMAP;
+			aFilespec += 8;
+		}
+		script_passed_handle = true;
+		script_owns_handle = (*aFilespec == '*'); // The "don't delete my icon/bitmap" flag.
+		if (script_owns_handle)
+		{
+			++aFilespec;
+			if (apNoDelete) // Caller supports conditional delete.
+				*apNoDelete = true; // May be overridden if a resized copy is created below.
+		}
+		hbitmap = (HBITMAP)(UINT_PTR)ATOI64(aFilespec);
+		if (!hbitmap)
+			return NULL;
+	}
+
+	auto file_ext = _tcsrchr(aFilespec, '.');
 	if (file_ext)
 		++file_ext;
 
@@ -1863,7 +2141,7 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 	//    said that an ICL is an "ICon Library... a renamed 16-bit Windows .DLL (an NE format executable) which
 	//    typically contains nothing but a resource section. The ICL extension seems to be used by convention."
 	// L17: Support negative numbers to mean resource IDs. These are supported by the resource extraction method directly, and by ExtractIcon if aIconNumber < -1.
-	bool ExtractIcon_was_used = aIconNumber > 1 || aIconNumber < 0 || (file_ext && (
+	bool ExtractIcon_was_used = !hbitmap && (aIconNumber > 1 || aIconNumber < 0 || (file_ext && (
 		   !_tcsicmp(file_ext, _T("exe"))
 		|| !_tcsicmp(file_ext, _T("dll"))
 		|| !_tcsicmp(file_ext, _T("icl")) // Icon library: Unofficial dll container, see notes above.
@@ -1884,14 +2162,14 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		//|| !_tcsicmp(file_ext, _T("wfx")) // Total/Windows Commander File System Plug-in
 		//|| !_tcsicmp(file_ext, _T("wcx")) // Total/Windows Commander Plug-in
 		//|| !_tcsicmp(file_ext, _T("wdx")) // Total/Windows Commander Plug-in
-		));
+		)));
 
 	if (ExtractIcon_was_used)
 	{
 		aImageType = IMAGE_ICON;
 
 		// L17: Manually extract the most appropriately sized icon resource for the best results.
-		hbitmap = (HBITMAP)ExtractIconFromExecutable(aFilespec, aIconNumber, aWidth, aHeight);
+		hbitmap = (HBITMAP)ExtractIconFromExecutable(aFilespec, aIconNumber, aWidth, aHeight, apModule);
 
 		// At this time it seems unnecessary to fall back to any of the following methods:
 		/*
@@ -1942,8 +2220,6 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			return NULL; // v1.0.44: Fixed to return NULL vs. hbitmap, since 1 is an invalid handle (perhaps rare since no known bugs caused by it).
 		//else continue on below so that the icon can be resized to the caller's specified dimensions.
 	}
-	else if (aIconNumber > 0) // Caller wanted HICON, never HBITMAP, so set type now to enforce that.
-		aImageType = IMAGE_ICON; // Should be suitable for cursors too, since they're interchangeable for the most part.
 	else if (file_ext) // Make an initial guess of the type of image if the above didn't already determine the type.
 	{
 		if (!_tcsicmp(file_ext, _T("ico")))
@@ -1999,13 +2275,13 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		//   Gui, Add, Pic, h1, bitmap 1x2.bmp
 		// And then it falls back to GDIplus, which in the particular case above appears to traumatize the
 		// parent window (or its picture control), because the GUI window hangs (but not the script) after
-		// doing a FileSelectFolder.  For example:
-		//   Gui, Add, Button,, FileSelectFile
-		//   Gui, Add, Pic, h1, bitmap 1x2.bmp  ; Causes GUI window to hang after FileSelectFolder (due to LoadImage failing then falling back to GDIplus; i.e. GDIplus is somehow triggering the problem).
+		// doing a FileSelect.  For example:
+		//   Gui, Add, Button,, FileSelect
+		//   Gui, Add, Pic, h1, bitmap 1x2.bmp  ; Causes GUI window to hang after FileSelect (due to LoadImage failing then falling back to GDIplus; i.e. GDIplus is somehow triggering the problem).
 		//   Gui, Show
 		//   return
-		//   ButtonFileSelectFile:
-		//   FileSelectFile, outputvar
+		//   ButtonFileSelect:
+		//   FileSelect, outputvar
 		//   return
 		if (hbitmap = (HBITMAP)LoadImage(NULL, aFilespec, aImageType, desired_width, desired_height
 			, LR_LOADFROMFILE | LR_CREATEDIBSECTION))
@@ -2015,7 +2291,7 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			// HCURSOR are identical for most/all Windows API uses.  Also note that LoadImage() will load
 			// an icon as a bitmap if the file contains an icon but IMAGE_BITMAP was passed in (at least
 			// on Windows XP).
-			if (!keep_aspect_ratio) // No further resizing is needed.
+			if (!keep_aspect_ratio && !aIconNumber) // No further resizing or conversion is needed.
 				return hbitmap;
 			// Otherwise, continue on so that the image can be resized via a second call to LoadImage().
 		}
@@ -2024,8 +2300,6 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		// DirectDraw in 256-color depth.
 		else if (GetFileAttributes(aFilespec) == 0xFFFFFFFF) // For simplicity, we don't check if it's a directory vs. file, since that should be too rare.
 			return NULL;
-		// v1.0.43.07: Also abort if caller wanted an HICON (not an HBITMAP), since the other methods below
-		// can't yield an HICON.
 		else if (aIconNumber > 0)
 		{
 			// UPDATE for v1.0.44: Attempt ExtractIcon in case its some extension that's
@@ -2033,11 +2307,12 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			//hbitmap = (HBITMAP)ExtractIcon(g_hInstance, aFilespec, aIconNumber - 1);
 
 			// L17: Manually extract the most appropriately sized icon resource for the best results.
-			hbitmap = (HBITMAP)ExtractIconFromExecutable(aFilespec, aIconNumber, aWidth, aHeight);
+			hbitmap = (HBITMAP)ExtractIconFromExecutable(aFilespec, aIconNumber, aWidth, aHeight, apModule);
 
 			if (hbitmap < (HBITMAP)2) // i.e. it's NULL or 1. Return value of 1 means "incorrect file type".
 				return NULL;
 			ExtractIcon_was_used = true;
+			aImageType = IMAGE_ICON;
 		}
 		//else file exists, so continue on so that the other methods are attempted in case file's contents
 		// differ from what the file extension indicates, or in case the other methods can be successful
@@ -2069,7 +2344,7 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			// LPVOID and "int" are used to avoid compiler errors caused by... namespace issues?
 			typedef int (WINAPI *GdiplusStartupType)(ULONG_PTR*, LPVOID, LPVOID);
 			typedef VOID (WINAPI *GdiplusShutdownType)(ULONG_PTR);
-			typedef int (WINGDIPAPI *GdipCreateBitmapFromFileType)(LPVOID, LPVOID);
+			typedef int (WINGDIPAPI *GdipCreateBitmapFromFileType)(LPCWSTR, LPVOID);
 			typedef int (WINGDIPAPI *GdipCreateHBITMAPFromBitmapType)(LPVOID, LPVOID, DWORD);
 			typedef int (WINGDIPAPI *GdipDisposeImageType)(LPVOID);
 			GdiplusStartupType DynGdiplusStartup = (GdiplusStartupType)GetProcAddress(hinstGDI, "GdiplusStartup");
@@ -2084,8 +2359,8 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			if (DynGdiplusStartup && DynGdiplusStartup(&token, &gdi_input, NULL) == Gdiplus::Ok)
 			{
 #ifndef UNICODE
-				WCHAR filespec_wide[MAX_PATH];
-				ToWideChar(aFilespec, filespec_wide, MAX_PATH); // Dest. size is in wchars, not bytes.
+				WCHAR filespec_wide[MAX_WIDE_PATH]; // MAX_WIDE_PATH vs. MAX_PATH allows this to work with long paths (\\?\ prefix may be required).
+				ToWideChar(aFilespec, filespec_wide, _countof(filespec_wide)); // Dest. size is in wchars, not bytes.
 				if (DynGdipCreateBitmapFromFile(filespec_wide, &pgdi_bitmap) == Gdiplus::Ok)
 #else
 				if (DynGdipCreateBitmapFromFile(aFilespec, &pgdi_bitmap) == Gdiplus::Ok)
@@ -2104,7 +2379,7 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		else // Using old picture loading method.
 		{
 			// Based on code sample at http://www.codeguru.com/Cpp/G-M/bitmap/article.php/c4935/
-			HANDLE hfile = CreateFile(aFilespec, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+			HANDLE hfile = CreateFile(aFilespec, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 			if (hfile == INVALID_HANDLE_VALUE)
 				return NULL;
 			DWORD size = GetFileSize(hfile, NULL);
@@ -2193,15 +2468,10 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 			// I haven't found any other way to retain an animated cursor's animation (and perhaps
 			// other icon/cursor attributes) when resizing the icon/cursor (CopyImage() doesn't
 			// retain animation):
-			if (!ExtractIcon_was_used)
+			if (!ExtractIcon_was_used && !script_passed_handle)
 			{
 				DestroyIcon((HICON)hbitmap); // Destroy the original HICON.
 				// Load a new one, but at the size newly calculated above.
-				// Due to an apparent bug in Windows 9x (at least Win98se), the below call will probably
-				// crash the program with a "divide error" if the specified aWidth and/or aHeight are
-				// greater than 90.  Since I don't know whether this affects all versions of Windows 9x, and
-				// all animated cursors, it seems best just to document it here and in the help file rather
-				// than limiting the dimensions of .ani (and maybe .cur) files for certain operating systems.
 				return (HBITMAP)LoadImage(NULL, aFilespec, aImageType, aWidth, aHeight, LR_LOADFROMFILE);
 			}
 		}
@@ -2224,7 +2494,9 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 	}
 	else // GDIPlus or a simple method such as LoadImage or ExtractIcon was used.
 	{
-		if (!aWidth && !aHeight) // No resizing needed.
+		if (!aWidth && !aHeight // No resizing needed.
+			&& (!script_owns_handle || apNoDelete) // No copying needed.
+			&& (aIconNumber < 1 || aImageType == IMAGE_ICON)) // No conversion to icon needed.
 			return hbitmap;
 		// The following will also handle HICON/HCURSOR correctly if aImageType == IMAGE_ICON/CURSOR.
 		// Also, LR_COPYRETURNORG|LR_COPYDELETEORG is used because it might allow the animation of
@@ -2239,7 +2511,9 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		//   Gui, Add, Pic, h1 w-1, bitmap 1x2.bmp  ; Crash (divide by zero)
 		//   Gui, Add, Pic, h1 w-1, bitmap 2x3.bmp  ; Crash (divide by zero)
 		// However, such sizes seem too rare to document or put in an exception handler for.
-		hbitmap_new = (HBITMAP)CopyImage(hbitmap, aImageType, aWidth, aHeight, LR_COPYRETURNORG | LR_COPYDELETEORG);
+		hbitmap_new = (HBITMAP)CopyImage(hbitmap, aImageType, aWidth, aHeight
+			, script_owns_handle ? (apNoDelete ? LR_COPYRETURNORG : 0) // If the script owns the original handle, never deleted it, and return it only if the caller can be told not to delete it.
+				: (LR_COPYRETURNORG | LR_COPYDELETEORG));
 		// Above's LR_COPYDELETEORG deletes the original to avoid cascading resource usage.  MSDN's
 		// LoadImage() docs say:
 		// "When you are finished using a bitmap, cursor, or icon you loaded without specifying the
@@ -2259,6 +2533,23 @@ HBITMAP LoadPicture(LPTSTR aFilespec, int aWidth, int aHeight, int &aImageType, 
 		// Otherwise, resource usage would cascade upward until the script finally terminated, at
 		// which time all such handles are freed automatically.
 	}
+	if (aIconNumber > 0 && aImageType == IMAGE_BITMAP)
+	{
+		// aIconNumber > 0 means the caller requires an icon.
+		ICONINFO iconinfo;
+		iconinfo.fIcon = TRUE;
+		iconinfo.hbmMask = hbitmap_new;
+		iconinfo.hbmColor = hbitmap_new;
+		HICON new_icon = CreateIconIndirect(&iconinfo);
+		if (!script_owns_handle)
+			DeleteObject(hbitmap_new);
+		hbitmap_new = (HBITMAP)new_icon;
+		aImageType = IMAGE_ICON;
+	}
+	if (hbitmap != hbitmap_new) // A new icon/bitmap was created above.
+		if (apNoDelete)
+			*apNoDelete = false; // Override any previously set value.
+		//else caller assumes it must take responsibility for the handle.
 	return hbitmap_new;
 }
 
@@ -2282,6 +2573,8 @@ BOOL CALLBACK ResourceIndexToIdEnumProc(HMODULE hModule, LPCTSTR lpszType, LPTST
 	return TRUE; // Continue
 }
 
+static TCHAR RESOURCE_ID_NOT_FOUND[] = {0};
+
 // L17: Find ID of resource from one-based index. i.e. IconNumber -> resource ID.
 // v1.1.22.05: Return LPTSTR since some (very few) icons have a string ID.
 LPTSTR ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex)
@@ -2289,7 +2582,11 @@ LPTSTR ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex)
 	ResourceIndexToIdEnumData enum_data;
 	enum_data.find_index = aIndex;
 	enum_data.index = 0;
-	enum_data.result = NULL; // Zero is probably not a valid integer ID; I think it would be compiled as "0" (string).
+	// NULL can't be used to indicate "not found", as any value between 0 and 0xFFFF is an
+	// integer ID, including zero, even though some compilers replace it with "0" (string).
+	// (LPTSTR)-1 or "" could be used instead, but this method should be safest, since we
+	// know the API cannot ever return a string at this address:
+	enum_data.result = RESOURCE_ID_NOT_FOUND;
 
 	EnumResourceNames(aModule, aType, &ResourceIndexToIdEnumProc, (LONG_PTR)&enum_data);
 
@@ -2297,7 +2594,7 @@ LPTSTR ResourceIndexToId(HMODULE aModule, LPCTSTR aType, int aIndex)
 }
 
 // L17: Extract icon of the appropriate size from an executable (or compatible) file.
-HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, int aHeight)
+HICON ExtractIconFromExecutable(LPCTSTR aFilespec, int aIconNumber, int aWidth, int aHeight, HMODULE *apModule)
 {
 	HICON hicon = NULL;
 
@@ -2318,7 +2615,8 @@ HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, i
 		// that the pointer returned by LockResource is valid until the *module* containing
 		// the resource is unloaded. Testing seems to indicate that unloading a module indeed
 		// unloads or invalidates any resources it contains.
-		if ((hres = FindResource(hdatafile, group_icon_id, RT_GROUP_ICON))
+		if (group_icon_id != RESOURCE_ID_NOT_FOUND
+			&& (hres = FindResource(hdatafile, group_icon_id, RT_GROUP_ICON))
 			&& (hresdata = LoadResource(hdatafile, hres))
 			&& (presdata = LockResource(hresdata)))
 		{
@@ -2352,19 +2650,31 @@ HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, i
 
 			NEWHEADER *resHead = (NEWHEADER *)presdata;
 			WORD resCount = resHead->ResCount;
-			RESDIR *resDir = (RESDIR *)(resHead + 1), *chosen = resDir; // Default to the first icon.
-			for (int i = 1; i < resCount; ++i)
+			RESDIR *resDir = (RESDIR *)(resHead + 1), *chosen = NULL;
+			int chosen_width = 0, chosen_depth = 0;
+			for (int i = 0; i < resCount; ++i)
 			{
+				int this_width = resDir[i].Icon.Width;
+				if (!this_width) // Workaround for 256x256 icons.
+					this_width = 256;
+				int this_depth = resDir[i].BitCount;
 				// Find the closest match for size, preferring the next larger icon if there's
 				// no exact match.  Normally the system will just pick the closest size, but
 				// at least for our icon, the 32x32 icon rendered at 20x20 looks much better
 				// than the 16x16 icon rendered at 20x20 (i.e. small icon size for 125% DPI).
-				if (resDir[i].Icon.Width > chosen->Icon.Width
-					? chosen->Icon.Width < aWidth // Current icon smaller than desired, so up-size.
-					: resDir[i].Icon.Width >= aWidth) // Current icon larger than desired, so down-size (without going below aWidth).
+				if (this_width > chosen_width
+					? chosen_width < aWidth // Current icon smaller than desired, so up-size.
+					: this_width < chosen_width
+					? this_width >= aWidth // This icon is closer to the desired size, so down-size.
+					: this_depth > chosen_depth) // Prioritize size, but otherwise prefer higher bit count.
+				{
 					chosen = &resDir[i];
+					chosen_width = this_width;
+					chosen_depth = this_depth;
+				}
 			}
-			if (   (hres = FindResource(hdatafile, MAKEINTRESOURCE(chosen->IconCursorId), RT_ICON))
+			if (   (chosen) // It would be NULL if there were no icons.
+				&& (hres = FindResource(hdatafile, MAKEINTRESOURCE(chosen->IconCursorId), RT_ICON))
 				&& (hresdata = LoadResource(hdatafile, hres))
 				&& (presdata = LockResource(hresdata))   )
 			{
@@ -2372,9 +2682,10 @@ HICON ExtractIconFromExecutable(LPTSTR aFilespec, int aIconNumber, int aWidth, i
 			}
 		}
 
-		// Decrements the executable module's reference count or frees the data file mapping.
-		if (aFilespec)
-			FreeLibrary(hdatafile);
+		if (apModule && hicon) // Only return the module if an icon was loaded; otherwise free it.
+			*apModule = hdatafile;
+		else if (aFilespec)
+			FreeLibrary(hdatafile); // Decrements the executable module's reference count or frees the data file mapping.
 	}
 
 	// L20: Fall back to ExtractIcon if the above method failed. This may work on some versions of Windows where
@@ -2511,7 +2822,7 @@ HBITMAP IconToBitmap32(HICON ahIcon, bool aDestroyIcon)
 					if (!has_nonzero_alpha)
 					{
 						// Get bitmap data from the icon's mask.
-						UINT *mask_bits = (UINT*)_alloca(height*width*4);
+						UINT *mask_bits = (UINT*)_malloca(height*width*4);
 						if (GetDIBits(hdc, icon_info.hbmMask, 0, height, (LPVOID)mask_bits, &bitmap_info, 0))
 						{
 							UINT *this_mask_pixel;
@@ -2530,6 +2841,7 @@ HBITMAP IconToBitmap32(HICON ahIcon, bool aDestroyIcon)
 							for (this_pixel = bits; this_pixel < bits_end; ++this_pixel)
 								*this_pixel |= 0xff000000;
 						}
+						_freea(mask_bits);
 					}
 
 					SelectObject(hdc, old_object);
@@ -2557,132 +2869,305 @@ HBITMAP IconToBitmap32(HICON ahIcon, bool aDestroyIcon)
 }
 
 
-HRESULT MySetWindowTheme(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR pszSubIdList)
+
+size_t UnescapedLength(LPCTSTR aSrc, size_t aSrcLen)
 {
-	// The library must be loaded dynamically, otherwise the app will not launch on OSes older than XP.
-	// Theme DLL is normally available only on XP+, but an attempt to load it is made unconditionally
-	// in case older OSes can ever have it.
-	HRESULT hresult = !S_OK; // Set default as "failure".
-	HINSTANCE hinstTheme = LoadLibrary(_T("uxtheme"));
-	if (hinstTheme)
-	{
-		typedef HRESULT (WINAPI *MySetWindowThemeType)(HWND, LPCWSTR, LPCWSTR);
-  		MySetWindowThemeType DynSetWindowTheme = (MySetWindowThemeType)GetProcAddress(hinstTheme, "SetWindowTheme");
-		if (DynSetWindowTheme)
-			hresult = DynSetWindowTheme(hwnd, pszSubAppName, pszSubIdList);
-		FreeLibrary(hinstTheme);
-	}
-	return hresult;
+	size_t len;
+	for (len = aSrcLen; aSrcLen > 1; --aSrcLen, ++aSrc) // > 1 because a trailing ` would be copied as-is.
+		if (*aSrc == g_EscapeChar)
+			--len, --aSrcLen, ++aSrc;
+	return len;
 }
 
 
 
-//HRESULT MyEnableThemeDialogTexture(HWND hwnd, DWORD dwFlags)
-//{
-//	// The library must be loaded dynamically, otherwise the app will not launch on OSes older than XP.
-//	// Theme DLL is normally available only on XP+, but an attempt to load it is made unconditionally
-//	// in case older OSes can ever have it.
-//	HRESULT hresult = !S_OK; // Set default as "failure".
-//	HINSTANCE hinstTheme = LoadLibrary(_T("uxtheme"));
-//	if (hinstTheme)
-//	{
-//		typedef HRESULT (WINAPI *MyEnableThemeDialogTextureType)(HWND, DWORD);
-//  		MyEnableThemeDialogTextureType DynEnableThemeDialogTexture = (MyEnableThemeDialogTextureType)GetProcAddress(hinstTheme, "EnableThemeDialogTexture");
-//		if (DynEnableThemeDialogTexture)
-//			hresult = DynEnableThemeDialogTexture(hwnd, dwFlags);
-//		FreeLibrary(hinstTheme);
-//	}
-//	return hresult;
-//}
+LPTSTR ConvertEscapeSequences(LPTSTR aDst, size_t aDstSize, LPCTSTR aSrc, size_t aSrcLen)
+// Copies aSrc to aDst, replacing any escape sequences with their reduced equivalent.
+// String will be truncated if aDstSize - 1 < UnescapedLength(aSrc, aSrcLen).
+// aSrc == aDst is permitted and should not do any unnecessary "copying".
+{
+	auto src = aSrc, src_end = aSrc + aSrcLen;
+	auto dst = aDst, dst_end = aDst + aDstSize - 1;
+	for (LPCTSTR esc;; ++dst, src = esc + 1)
+	{
+		for (esc = src; esc < src_end && *esc != g_EscapeChar; ++esc); // Find the next escape char.
+		size_t seg_len = esc - src; // Calculate length of text segment preceding esc.
+		if (dst != src) // No need to copy or check for overflow when dst == src.
+		{
+			if (dst + seg_len >= dst_end) // Avoid overflow.
+			{
+				tmemmove(dst, src, dst_end - dst); // This may truncate the string if aDstSize-1 < aSrcLen.
+				*dst_end = '\0';
+				break;
+			}
+			//else there's room for seg_len and at least one more character.
+			tmemmove(dst, src, seg_len);
+		}
+		src += seg_len;
+		dst += seg_len;
+		if (esc + 1 >= src_end) // No escape char, or just a trailing escape char.
+		{
+			*dst = '\0';
+			break;
+		}
+		esc++;
+		switch (*esc)
+		{
+			// Only lowercase is recognized for these:
+			case 'a': *dst = '\a'; break;  // alert (bell) character
+			case 'b': *dst = '\b'; break;  // backspace
+			case 'f': *dst = '\f'; break;  // formfeed
+			case 'n': *dst = '\n'; break;  // newline
+			case 'r': *dst = '\r'; break;  // carriage return
+			case 't': *dst = '\t'; break;  // horizontal tab
+			case 'v': *dst = '\v'; break;  // vertical tab
+			case 's': *dst = ' '; break;   // space
+			default: *dst = *esc; break;
+		}
+	}
+	return aDst;
+}
 
 
 
-LPTSTR ConvertEscapeSequences(LPTSTR aBuf, TCHAR aEscapeChar, bool aAllowEscapedSpace)
+LPTSTR ConvertEscapeSequences(LPTSTR aBuf)
 // Replaces any escape sequences in aBuf with their reduced equivalent.  For example, if aEscapeChar
 // is accent, Each `n would become a literal linefeed.  aBuf's length should always be the same or
 // lower than when the process started, so there is no chance of overflow.
 {
-	LPTSTR cp, cp1;
-	for (cp = aBuf; ; ++cp)  // Increment to skip over the symbol just found by the inner for().
+	size_t len = _tcslen(aBuf);
+	return ConvertEscapeSequences(aBuf, len + 1, aBuf, len);
+}
+
+
+
+LPTSTR ConvertSpaceEscapeSequences(LPTSTR aBuf)
+// Replaces the `s and `t escapes sequences with \s and \t, while leaving all other sequences.
+// In particular, `` is left as is so that a subsequent call to ConvertEscapeSequences() won't
+// interpret it as escaping the next char.
+{
+	auto src = _tcschr(aBuf, g_EscapeChar);
+	if (!src)
+		return aBuf;
+	auto dst = src;
+	for ( ; TCHAR c = *src; ++src, ++dst)
 	{
-		for (; *cp && *cp != aEscapeChar; ++cp);  // Find the next escape char.
-		if (!*cp) // end of string.
-			break;
-		cp1 = cp + 1;
-		switch (*cp1)
+		if (c == g_EscapeChar)
 		{
-			// Only lowercase is recognized for these:
-			case 'a': *cp1 = '\a'; break;  // alert (bell) character
-			case 'b': *cp1 = '\b'; break;  // backspace
-			case 'f': *cp1 = '\f'; break;  // formfeed
-			case 'n': *cp1 = '\n'; break;  // newline
-			case 'r': *cp1 = '\r'; break;  // carriage return
-			case 't': *cp1 = '\t'; break;  // horizontal tab
-			case 'v': *cp1 = '\v'; break;  // vertical tab
-			case 's': // space (not always allowed for backward compatibility reasons).
-				if (aAllowEscapedSpace)
-					*cp1 = ' ';
-				//else do nothing extra, just let the standard action for unrecognized escape sequences.
-				break;
-			// Otherwise, if it's not one of the above, the escape-char is considered to
-			// mark the next character as literal, regardless of what it is. Examples:
-			// `` -> `
-			// `:: -> :: (effectively)
-			// `; -> ;
-			// `c -> c (i.e. unknown escape sequences resolve to the char after the `)
+			switch (src[1])
+			{
+			case 's': c = ' '; ++src; break;
+			case 't': c = '\t'; ++src; break;
+			}
 		}
-		// Below has a final +1 to include the terminator:
-		tmemmove(cp, cp1, _tcslen(cp1) + 1);
+		*dst = c;
 	}
+	*dst = '\0';
 	return aBuf;
 }
 
 
 
-int FindNextDelimiter(LPCTSTR aBuf, TCHAR aDelimiter, int aStartIndex, LPCTSTR aLiteralMap)
+bool CharIsEscaped(LPCTSTR aChar, LPCTSTR aBuf)
+{
+	// Only the escape char can escape itself, so any odd number of preceding
+	// escape chars means this quote mark is escaped; e.g. `" or ```".
+	bool escaped = false;
+	while (aChar > aBuf && aChar[-1] == g_EscapeChar)
+		escaped = !escaped, --aChar;
+	return escaped;
+}
+
+
+
+int FindExprDelim(LPCTSTR aBuf, TCHAR aDelimiter, int aStartIndex)
 // Returns the index of the next delimiter, taking into account quotes, parentheses, etc.
 // If the delimiter is not found, returns the length of aBuf.
 {
-	bool in_quotes = false;
-	int open_parens = 0;
+	TCHAR close_char;
 	for (int mark = aStartIndex; ; ++mark)
 	{
-		if (aBuf[mark] == aDelimiter)
-		{
-			if (!in_quotes && open_parens <= 0 && !(aLiteralMap && aLiteralMap[mark]))
-				// A delimiting comma other than one in a sub-statement or function.
-				return mark;
-			// Otherwise, its a quoted/literal comma or one in parentheses (such as function-call).
-			continue;
-		}
+		if (aBuf[mark] == aDelimiter && (aDelimiter != ':' || aBuf[mark+1] != '='))
+			return mark;
 		switch (aBuf[mark])
 		{
-		case '"': // There are sections similar this one later below; so see them for comments.
-			in_quotes = !in_quotes;
-			break;
-		case '(': // For our purpose, "(", "[" and "{" can be treated the same.
-		case '[': // If they aren't balanced properly, a later stage will detect it.
-		case '{': //
-			if (!in_quotes) // Literal parentheses inside a quoted string should not be counted for this purpose.
-				++open_parens;
-			break;
-		case ')':
-		case ']':
-		case '}':
-			if (!in_quotes)
-				--open_parens; // If this makes it negative, validation later on will catch the syntax error.
-			break;
 		case '\0':
 			// Reached the end of the string without finding a delimiter.  Return the
 			// index of the null-terminator since that's typically what the caller wants.
 			return mark;
-		//default: some other character; just have the loop skip over it.
+		default:
+		//case '`': // May indicate an attempt to escape something, but has escape has no meaning here.
+			// Not a meaningful character; just have the loop skip over it.
+			continue;
+		case '"': 
+		case '\'':
+			mark = FindTextDelim(aBuf, aBuf[mark], mark + 1);
+			if (!aBuf[mark]) // i.e. it isn't safe to do ++mark.
+				return mark; // See case '\0' for comments.
+			continue;
+		case ')':
+		case ']':
+		case '}':
+		case g_delimiter:
+			if (aDelimiter) // Caller wants to find a specific symbol and it's not this one.
+				continue; // Unbalanced parentheses etc are caught at a later stage.
+			return mark;
+		case ':':
+			if (aDelimiter // See above.
+				|| aBuf[mark + 1] == '=')
+				continue;
+			// Since aDelimiter is zero, this colon doesn't belong to a ternary expression
+			// or object literal which is part of this sub-expression, so should effectively
+			// terminate the sub-expression (likely a fat arrow function).
+			return mark;
+		case '?':
+			if (aBuf[mark + 1] == '?') // ??
+			{
+				mark++; // Skip the second '?'.
+				continue;
+			}
+			// Otherwise, it could still be [var?], but that shouldn't need special treatment
+			// since aDelimiter should be ]/)/}, not :.
+			if (aDelimiter && aDelimiter != ':')
+				continue; // The following isn't needed in this case.
+			if (aBuf[mark + 1] == '.') // Check for ?.property (which is not ternary).
+			{
+				LPTSTR d_end;
+				auto id = aBuf + mark + 2, id_end = find_identifier_end(id);
+				_tcstod(id, &d_end); // This accounts for scientific notation.
+				if (id_end > d_end || id_end == d_end && (*id_end == '(' || *id_end == '['))
+					continue;
+			}
+			do
+				mark++;
+			while (IS_SPACE_OR_TAB(aBuf[mark]));
+			if (_tcschr(EXPR_SYMBOLS_AFTER_MAYBE, aBuf[mark]))
+			{
+				mark--; // Counter the loop's increment.
+				continue; // It's SYM_MAYBE, so don't scan for ':'.
+			}
+			// Scan for the corresponding ':' (or some other closing symbol if that's missing)
+			// so that it won't terminate the sub-expression.
+			mark = FindExprDelim(aBuf, ':', mark);
+			if (!aBuf[mark]) // i.e. it isn't safe to do ++mark.
+				return mark; // See case '\0' for comments.
+			continue; // The colon is also skipped via the loop's increment.
+		case g_DerefChar:
+			// Since the check at the top of the loop didn't "return", this is the beginning
+			// of a double-deref, not the end.
+			close_char = g_DerefChar;
+			break;
+		case '(': close_char = ')'; break;
+		case '[': close_char = ']'; break;
+		case '{': close_char = '}'; break;
+		}
+		// Since above didn't "return" or "continue":
+		mark = FindExprDelim(aBuf, close_char, mark + 1);
+		if (!aBuf[mark]) // i.e. it isn't safe to do ++mark.
+			return mark; // See case '\0' for comments.
+		// Otherwise, continue the loop.
+	} // for each character.
+}
+
+
+
+int FindTextDelim(LPCTSTR aBuf, TCHAR aDelimiter, int aStartIndex)
+{
+	for (int mark = aStartIndex; ; ++mark)
+	{
+		if (aBuf[mark] == aDelimiter)
+			return mark;
+		switch (aBuf[mark])
+		{
+		case '\0':
+			// Reached the end of the string without finding a delimiter.  Return the
+			// index of the null-terminator since that's typically what the caller wants.
+			return mark;
+		case '`':
+			// This allows g_DerefChar or aDelimiter to be escaped, but since every other non-null
+			// character has no meaning here, it doesn't need to check which character it is skipping.
+			if (aBuf[mark+1])
+				++mark;
+ 			continue;
 		}
 	}
 }
 
 
 
+int BalanceExpr(LPCTSTR aBuf, int aStartBalance, TCHAR aExpect[], TCHAR *aOpenQuote)
+{
+	TCHAR quote;
+	int balance = aStartBalance, mark = 0;
+	if (aOpenQuote && *aOpenQuote)
+	{
+		mark = FindTextDelim(aBuf, *aOpenQuote, mark);
+		if (!aBuf[mark])
+			return balance;
+		*aOpenQuote = 0;
+		++mark;
+	}
+	for (;; ++mark)
+	{
+		switch (aBuf[mark])
+		{
+		case '\0':
+			return balance;
+		default:
+		//case '`': // May indicate an attempt to escape something, but has escape has no meaning here.
+		//case g_DerefChar: // Caller does not want these balanced.
+			// Not a meaningful character; just have the loop skip over it.
+			break;
+		case '"': 
+		case '\'':
+			quote = aBuf[mark];
+			mark = FindTextDelim(aBuf, quote, mark + 1);
+			if (!aBuf[mark]) // i.e. it isn't safe to do ++mark.
+			{
+				if (aOpenQuote)
+				{
+					*aOpenQuote = quote;
+					return balance;
+				}
+				aExpect[0] = quote; // Expected
+				aExpect[1] = 0; // Found
+				return -1; // Since this quote is missing its close-quote, abort the continuation loop.
+			}
+			break;
+		case ')':
+		case ']':
+		case '}':
+			--balance;
+			if (balance < 0
+				|| balance < MAX_BALANCEEXPR_DEPTH && aBuf[mark] != aExpect[balance])
+			{
+				aExpect[0] = balance < 0 ? 0 : aExpect[balance]; // Expected
+				aExpect[1] = aBuf[mark]; // Found
+				return -1;
+			}
+			break;
+		case '(':
+		case '[':
+		case '{':
+			if (balance < MAX_BALANCEEXPR_DEPTH)
+				aExpect[balance] = (aBuf[mark] == '(' ? ')' : aBuf[mark] + 2);
+			++balance;
+			break;
+		}
+	} // for each character.
+}
+
+
+
+int BalanceExpr(LPCTSTR aBuf)
+{
+	TCHAR expect[MAX_BALANCEEXPR_DEPTH];
+	return BalanceExpr(aBuf, 0, expect);
+}
+
+
+
+#if 0 // Currently unused.
 bool IsStringInList(LPTSTR aStr, LPTSTR aList, bool aFindExactMatch)
 // Checks if aStr exists in aList (which is a comma-separated list).
 // If aStr is blank, aList must start with a delimiting comma for there to be a match.
@@ -2736,17 +3221,18 @@ bool IsStringInList(LPTSTR aStr, LPTSTR aList, bool aFindExactMatch)
 
 	return false;  // No match found.
 }
+#endif
 
 
 
-LPTSTR InStrAny(LPTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundLen)
+LPCTSTR InStrAny(LPCTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundLen)
 {
 	// For each character in aStr:
 	for ( ; *aStr; ++aStr)
 		// For each needle:
 		for (int i = 0; i < aNeedleCount; ++i)
 			// For each character in this needle:
-			for (LPTSTR needle_pos = aNeedle[i], str_pos = aStr; ; ++needle_pos, ++str_pos)
+			for (LPCTSTR needle_pos = aNeedle[i], str_pos = aStr; ; ++needle_pos, ++str_pos)
 			{
 				if (!*needle_pos)
 				{
@@ -2766,6 +3252,121 @@ LPTSTR InStrAny(LPTSTR aStr, LPTSTR aNeedle[], int aNeedleCount, size_t &aFoundL
 			}
 	// If the above loops completed without returning, no matches were found.
 	return NULL;
+}
+
+
+
+int FTOA(double aValue, LPTSTR aBuf, int aBufSize)
+// Converts aValue to a string while trying to ensure that conversion back to double will
+// produce the same value.  Trailing 0s after the decimal point are stripped for brevity, when not printed in scientific notation.
+// Numbers printed in scientific notation may not contain a decimal point.
+// Caller must ensure there is sufficient buffer size to avoid truncating the output.
+{
+	int result = sntprintf(aBuf, aBufSize, _T("%.17g"), aValue);
+	
+	// the 'g' specifier might cause the result to lack a decimal point. 
+	// If the number is not written in scientific notation, and lacks a decimal point,
+	// add ".0" to make the string look like a float.
+	size_t search_result = _tcscspn(aBuf, _T(".e")); 
+	if (search_result == result			// if true, no decimal point, '.', or 'e' was found, add ".0",
+		&& result + 3 <= aBufSize		// but only if the buffer has room for two more characters and the null terminator,
+		&& cisdigit(aBuf[result - 1]))	// and the number isn't some variation of inf or NaN.
+	{
+		aBuf[result] = '.';				// overwrites the current null terminator.
+		aBuf[result+1] = '0';
+		aBuf[result+2] = '\0';
+		result += 2;					// the result is the number of characters written, excluding the terminator.
+	}
+	return result;
+}
+
+
+
+// Caller must call CoTaskMemFree() on the result when done.
+PWSTR GetDocumentsFolder()
+{
+	PWSTR path;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DONT_VERIFY, NULL, &path)))
+		return path;
+	return nullptr;
+}
+
+
+
+int CompareVersion(LPCTSTR a, LPCTSTR b)
+{
+	while (*a || *b)
+	{
+		// 1.1-a001 < 1.1 = 1.1.0 = 1.1.0+foo = 1.1.0+123
+		LPTSTR pa, pb;
+		int ia, ib;
+		if (*a == '+') ia = 0, pa = const_cast<LPTSTR>(a); else ia = _tcstol(a, &pa, 10);
+		if (*b == '+') ib = 0, pb = const_cast<LPTSTR>(b); else ib = _tcstol(b, &pb, 10);
+		// If *pa is not in the set .-+\0, this component is non-numeric (and not empty).
+		// Treat non-numeric as greater than numeric (but assume any absent component is 0).
+		if (!_tcschr(_T(".-+"), *pa)) ia = INT_MAX; else a = pa;
+		if (!_tcschr(_T(".-+"), *pb)) ib = INT_MAX; else b = pb;
+		if (ia < ib) return -1;
+		if (ia > ib) return  1;
+		// They are either equal or both non-numeric.
+		if (*a == '.' || *b == '.')
+		{
+			if (*a == '.') ++a;
+			if (*b == '.') ++b;
+			continue; // On to the next component.
+		}
+		// Give -pre-release lower precedence.
+		if (*a == '-' && *b != '-') return -1;
+		if (*b == '-' && *a != '-') return  1;
+		for (;; ++a, ++b)
+		{
+			auto ac = *a == '+' || *a == '.' ? '\0' : *a; // Ignore any + suffix (treat as terminator).
+			auto bc = *b == '+' || *b == '.' ? '\0' : *b;
+			if (ac != bc) return ac < bc ? -1 : 1;
+			if (!ac) // End of both components.
+			{
+				if (*a == '.' || *b == '.')
+					break; // Try to compare the next component as numeric.
+				return 0; // Both reached the end; a and b are equal.
+			}
+		}
+	}
+	return 0;
+}
+
+
+
+__declspec(noinline) // Prioritize code size for this.
+int VersionSatisfies(LPCTSTR v, LPCTSTR req, bool aThreeWayDefault)
+{
+	// Support prefixes <, >, <=, >=, =; default to >= unless aThreeWayDefault.
+	bool rmap[] = { false, false, false };
+	LPCTSTR reqv = req;
+	if (*reqv == '<') ++reqv, rmap[1-1] = true;
+	if (*reqv == '>') ++reqv, rmap[1+1] = true;
+	if (*reqv == '=') ++reqv, rmap[1+0] = true;
+	bool has_op = reqv != req;
+	// Support optional v prefix.
+	if (*v == 'v') ++v;
+	if (*reqv == 'v') ++reqv;
+	// Perform the comparison.
+	int result = CompareVersion(v, reqv);
+	if (!has_op)
+	{
+		// When no operator is specified, also require that the major version matches.
+		return aThreeWayDefault ? result : result >= 0 && _ttoi(v) == _ttoi(reqv);
+	}
+	return rmap[result + 1];
+}
+
+
+
+// Fills a buffer with pseudo-random numbers.
+BOOLEAN __stdcall GenRandom(PVOID RandomBuffer, ULONG RandomBufferLength)
+// Don't change the function signature without also changing the type-cast below.
+{
+	static auto *RtlGenRandom = (decltype(&GenRandom)) GetProcAddress(GetModuleHandle(_T("Advapi32")), "SystemFunction036");
+	return RtlGenRandom && RtlGenRandom(RandomBuffer, RandomBufferLength);
 }
 
 

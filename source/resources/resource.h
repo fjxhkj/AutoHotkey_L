@@ -39,6 +39,8 @@
 #define ID_VIEW_REFRESH                 65410
 #define ID_HELP_USERMANUAL              65411
 #define ID_HELP_WEBSITE                 65412
+#define IDD_ERRORBOX                    500
+#define IDC_ERR_EDIT                    501
 
 // Next default values for new objects
 // 
@@ -50,3 +52,13 @@
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
+
+
+
+#ifdef _WIN64
+#define AHK_BIT "64-bit"
+#else
+#define AHK_BIT "32-bit"
+#endif
+
+#define AHK_DESCRIPTION "AutoHotkey " AHK_BIT
